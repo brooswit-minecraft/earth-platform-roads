@@ -1,0 +1,141 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.147'
+    id 'idea'
+}
+
+tasks.named('wrapper', Wrapper).configure {
+    distributionType = Wrapper.DistributionType.BIN
+}
+
+group = mod_group_id
+
+// Single source of truth for the shipped version is `version=` in
+// gradle.properties, the file the release gate reads. A release workflow may
+// override it with `-Pmod_version=<version>`.
+def modVersion = (findProperty("mod_version") ?: project.version) as String
+version = modVersion
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+    exclude("src/generated/**/.cache")
+}
+
+base {
+    archivesName = mod_id
+}
+
+// Mojang ships Java 21 to end users in 1.21.1, so mods target Java 21.
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = project.neo_version
+
+    parchment {
+        mappingsVersion = project.parchment_mappings_version
+        minecraftVersion = project.parchment_minecraft_version
+    }
+
+    runs {
+        client {
+            client()
+            if (project.hasProperty('quickPlay')) {
+                programArguments.addAll('--quickPlaySingleplayer', project.property('quickPlay'))
+            }
+            if (project.hasProperty('quickPlayMp')) {
+                programArguments.addAll('--quickPlayMultiplayer', project.property('quickPlayMp'))
+            }
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        server {
+            server()
+            programArgument '--nogui'
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        gameTestServer {
+            type = "gameTestServer"
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        data {
+            data()
+            programArguments.addAll '--mod', project.mod_id, '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+        }
+
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+
+    // Runs the JUnit test JVM inside the real modded game environment (registries
+    // bootstrapped, Mixins applied) rather than a bare JVM, so RoadMixinGenerationTest
+    // can construct a real EarthGenerator and read back real generated block states.
+    unitTest {
+        enable()
+        testedMod = mods."${mod_id}"
+    }
+}
+
+dependencies {
+    // Earth Platform is a required runtime dependency (declared in neoforge.mods.toml)
+    // but is not published to any Maven repository. Build it locally with
+    // scripts/build_earth_platform_dependency.sh (see docs/earth-platform-dependency.md),
+    // which drops the jar at libs/earthplatform-0.1.0-alpha.73.jar.
+    def earthPlatformJar = layout.projectDirectory.file('libs/earthplatform-0.1.0-alpha.73.jar')
+    if (!earthPlatformJar.asFile.isFile()) {
+        throw new GradleException(
+                "Missing ${earthPlatformJar.asFile}: run scripts/build_earth_platform_dependency.sh first " +
+                "(see docs/earth-platform-dependency.md).")
+    }
+    implementation files(earthPlatformJar)
+
+    testImplementation platform("org.junit:junit-bom:5.11.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+    useJUnitPlatform()
+}
+
+// Expands `${mod_version}` and friends in neoforge.mods.toml to the values
+// computed above, so the jar's file name and the version baked into the
+// built jar's mods.toml can never drift apart.
+var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : modVersion,
+    ]
+    inputs.properties replaceProperties
+    expand replaceProperties
+    from "src/main/templates"
+    into "build/generated/sources/modMetadata"
+}
+sourceSets.main.resources.srcDir generateModMetadata
+neoForge.ideSyncTask generateModMetadata
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}

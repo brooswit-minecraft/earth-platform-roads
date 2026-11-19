@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "io.github.brooswitminecraft.earthplatformroads.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EarthGeneratorRoadMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,0 +1,35 @@
+modLoader="javafml" #mandatory
+loaderVersion="${loader_version_range}" #mandatory
+
+license="${mod_license}"
+
+[[mods]] #mandatory
+modId="${mod_id}" #mandatory
+version="${mod_version}" #mandatory
+displayName="${mod_name}" #mandatory
+authors="brooswit"
+description='''Blackstone road surfaces mapped from OpenStreetMap onto Earth Platform's generated terrain.'''
+
+[[dependencies.${mod_id}]]
+    modId="neoforge"
+    type="required"
+    versionRange="[${neo_version},)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    type="required"
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="earthplatform"
+    type="required"
+    versionRange="[0.1.0-alpha.73,0.2.0)"
+    ordering="AFTER"
+    side="BOTH"
+
+[[mixins]]
+config="${mod_id}.mixins.json"
