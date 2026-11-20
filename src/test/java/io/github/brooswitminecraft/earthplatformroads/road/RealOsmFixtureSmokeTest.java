@@ -3,6 +3,7 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.gson.JsonObject;
 import com.mojang.serialization.Lifecycle;
 import com.sun.net.httpserver.HttpServer;
 import io.earthplatform.geography.globe.TerrariumTileSource;
@@ -31,15 +32,15 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Review (comment 55431) correctly flagged {@link YosemiteUnbundledSmokeTest} as using constructed
- * way/node IDs, not real-world data. This test instead serves genuine OpenStreetMap data: a real
- * bounded export from the official OSM API (api.openstreetmap.org/api/0.6/map.json, NOT Overpass --
- * that endpoint was unreachable three times earlier this session) at Southside Drive x Sentinel
+ * way/node IDs, not real-world data. This test instead serves genuine OpenStreetMap data captured
+ * from the official OSM API (api.openstreetmap.org/api/0.6/map.json) at Southside Drive x Sentinel
  * Drive, ~5km east of the bundled Yosemite extract. Provenance (capture time, attribution, SHA-256
  * of both the full raw API response and the checked-in fixture, all 27 relevant way IDs) is recorded
- * in {@code src/test/resources/fixtures/sentinel_southside_junction.provenance.json}. The fixture is
- * the raw OSM API "node"/"way" response shape (trimmed to only nodes a highway-tagged way actually
- * references) -- exactly what {@link OsmApiMapParser} resolves in production now that the default
- * fetch moved off Overpass, with no separate conversion step.
+ * in {@code src/test/resources/fixtures/sentinel_southside_junction.provenance.json}. The checked-in
+ * fixture is the raw OSM API "node"/"way" response shape (trimmed to only nodes a highway-tagged way
+ * actually references); {@link OsmApiMapParser} resolves it here into the Overpass {@code out geom}
+ * shape {@link RoadTileSource#fetchCell} now speaks again (restored for the Overpass.ch preview
+ * provider, MINECRAFT-566 comment 55446) -- a test-time conversion, not production code.
  *
  * <p>This fixture genuinely contains two real {@code bridge=yes} ways (Sentinel Bridge over the
  * Merced River) -- the first time this mod's bridge-skip behavior is checked against real tagged
@@ -93,10 +94,19 @@ class RealOsmFixtureSmokeTest {
     @Test
     void realOsmDataAtSentinelSouthsideJunctionGeneratesRoadsAndSkipsTheRealBridge(
             @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        String fixtureJson;
+        String rawFixtureJson;
         try (var in = RealOsmFixtureSmokeTest.class.getResourceAsStream("/fixtures/sentinel_southside_junction.osm_api_raw.json")) {
-            fixtureJson = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            rawFixtureJson = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
+        // Convert the raw OSM API fixture into the Overpass out:geom shape RoadTileSource.fetchCell
+        // now requests again -- the fixture itself stays the genuine, unconverted capture; only the
+        // stub's response is reshaped, at test time, to match what production code actually asks for.
+        var overpassShapedWays = OsmApiMapParser.resolveWays(rawFixtureJson);
+        var overpassElements = new com.google.gson.JsonArray();
+        overpassShapedWays.forEach(overpassElements::add);
+        var overpassShapedRoot = new JsonObject();
+        overpassShapedRoot.add("elements", overpassElements);
+        String fixtureJson = overpassShapedRoot.toString();
 
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {

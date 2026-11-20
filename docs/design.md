@@ -123,22 +123,26 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   **pending** (never fetched successfully -- a network failure leaves it here deliberately, so an
   outage can never be permanently baked in as a roadless gap; the very next access, including after
   a server restart reading the same cache root, retries).
-- **Live fetch source: the official OSM API, not Overpass.** Three public Overpass mirrors
-  (overpass-api.de, overpass.kumi.systems, overpass.openstreetmap.ru) were each unreachable in this
-  same development session -- confirmed as genuine query-endpoint overload (a direct GET to
-  overpass-api.de/ itself answers HTTP 406 in under a second; the interpreter path specifically is
-  overloaded), not a network-level block. The official OSM API's bounded `GET
-  .../api/0.6/map.json?bbox=...` export answered immediately every time instead, so `RoadTileSource`
-  now uses that as its default (and only -- its request/response shapes no longer match Overpass's
-  `out geom`) fetch source; `OsmApiMapParser` resolves its raw `"node"`/`"way"` elements (a way lists
-  only its nodes' IDs, not their coordinates) into the same way shape the rest of the pipeline
-  already expects. Overridable with `-Dearthplatformroads.osmApiEndpoint=...`. **Known caveat:** this
-  API bounds a single export to 0.25 square degrees and a server-side node-count limit; this mod's
-  `CELL_DEGREES`-sized cells are orders of magnitude under that bound, so no cell this mod requests
-  can hit it. One dropped protection from this swap: c61b2d4's Overpass-"remark" check
-  (`checkForErrorRemark`) and its two tests were removed, since that failure shape (a 200 response
-  with an embedded error) was specific to Overpass's own output format and has no code path left
-  that can reach it against this REST API, which reports real failures as real non-200 statuses.
+- **No default live source; one opt-in preview provider.** Three candidates were tried and
+  rejected as a public default: three public Overpass mirrors (overloaded), the official OSM
+  editing API (explicitly disallowed by policy as an automated game-fetch backend), and VersaTiles'
+  hosted Shortbread vector tiles (screened and rejected -- its generation profile merges road
+  geometry and can drop tags like `layer` at every zoom, which would break `RoadSegment`'s
+  ordered-node-ID junction model and the incline mixin's same-way `wayId` blending). This mod now
+  ships NO hardcoded live endpoint at all. The one sanctioned live source is an opt-in preview John
+  selected himself (MINECRAFT-566 comment 55446): a hosted Overpass provider's free/noncommercial
+  tier (Overpass.ch), gated behind `-Dearthplatformroads.previewProvider=overpass-ch` AND
+  `-Dearthplatformroads.previewEndpoint=...` (no default URL) -- see `RoadNetwork.buildDefaultTileSource`'s
+  own doc for the full property list, including the credential (`previewApiKey` property or
+  `EARTHPLATFORMROADS_PREVIEW_API_KEY` env var, never logged/hardcoded) and the conservative
+  client-side rate limit (`previewMinRequestIntervalMs`, default 5000ms) `RoadTileSource` enforces
+  alongside its existing one-in-flight-request guarantee. `RoadTileSourceTest
+  .withNoOptInPropertiesSetTheDefaultWiringNeverTouchesTheNetwork` (actually
+  `RoadNetworkProductionWiringTest`) proves zero requests happen with none of those properties set.
+  `RoadTileSource.fetchCell` speaks real Overpass QL (`out geom`) again, with `checkForErrorRemark`
+  restored (and its two tests) -- that failure shape is reachable again now that this class talks to
+  a real Overpass-protocol endpoint. This preview is explicitly live data, not the pinned/immutable
+  worldwide snapshot the separate offline SQLite-catalog pilot work is building toward.
 - **Where fetching happens, and where it never does.** `EarthGeneratorPrepareMixin` hooks Earth
   Platform's own documented "fetching data ahead of generation" entry points,
   `EarthGenerator.prepare`/`.prepareNear` (see that class's own "Reading this file" section) --

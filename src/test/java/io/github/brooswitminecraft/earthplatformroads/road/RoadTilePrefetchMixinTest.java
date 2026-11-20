@@ -70,11 +70,9 @@ class RoadTilePrefetchMixinTest {
     void prepareNearPopulatesTheCacheWithoutSurfaceEverFetching(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         AtomicInteger requests = new AtomicInteger();
         String response = """
-                {"elements":[
-                  {"type":"node","id":1,"lat":37.7240,"lon":-119.6365},
-                  {"type":"node","id":2,"lat":37.7241,"lon":-119.6366},
-                  {"type":"way","id":555002,"nodes":[1,2],
-                    "tags":{"highway":"secondary","name":"Prefetch Test Street"}}]}
+                {"elements":[{"type":"way","id":555002,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Prefetch Test Street"},
+                  "geometry":[{"lat":37.7240,"lon":-119.6365},{"lat":37.7241,"lon":-119.6366}]}]}
                 """;
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {

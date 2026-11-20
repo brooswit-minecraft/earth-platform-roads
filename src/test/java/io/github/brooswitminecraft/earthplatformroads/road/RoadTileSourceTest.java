@@ -16,12 +16,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Exercises {@link RoadTileSource} against a local HTTP stub (never the real, flaky public
- * Overpass endpoint -- this must be deterministic) covering exactly the behaviors MINECRAFT-566's
- * review named as the acceptance requirement: automatic fetch/cache, a cell staying "pinned" to
- * whatever was cached (a real restart re-reads the same cache, does not re-fetch), a genuinely
- * empty result staying confirmed-empty, and a failed/slow fetch leaving a cell retryable rather
- * than permanently marked as a roadless gap.
+ * Exercises {@link RoadTileSource} against a local HTTP stub (never a real live service -- this
+ * must be deterministic) covering exactly the behaviors MINECRAFT-566's review named as the
+ * acceptance requirement: automatic fetch/cache, a cell staying "pinned" to whatever was cached (a
+ * real restart re-reads the same cache, does not re-fetch), a genuinely empty result staying
+ * confirmed-empty, a failed/slow fetch leaving a cell retryable rather than permanently marked as a
+ * roadless gap, Overpass's HTTP-200-with-error-remark failure shape, and the Overpass.ch preview
+ * provider's own requirements (an optional credential header, a configurable minimum request
+ * interval).
  */
 class RoadTileSourceTest {
     private HttpServer server;
@@ -31,16 +33,12 @@ class RoadTileSourceTest {
         if (server != null) server.stop(0);
     }
 
-    // Shaped like the official OSM API's map export (raw "node"/"way" elements, a way listing only
-    // its nodes' IDs), not Overpass's "out geom" -- see RoadTileSource.fetchCell's javadoc for why
-    // the default production fetch moved off Overpass this pass (three public mirrors were
-    // unreachable this session; this endpoint answered immediately every time).
+    // Overpass's own "out geom" shape -- RoadTileSource.fetchCell speaks Overpass QL again as of
+    // the Overpass.ch preview provider (MINECRAFT-566 comment 55446).
     private static final String ONE_WAY_RESPONSE = """
-            {"elements":[
-              {"type":"node","id":1,"lat":40.0,"lon":-105.0},
-              {"type":"node","id":2,"lat":40.001,"lon":-105.001},
-              {"type":"way","id":555001,"nodes":[1,2],
-                "tags":{"highway":"secondary","name":"Stub Street"}}]}
+            {"elements":[{"type":"way","id":555001,"nodes":[1,2],
+              "tags":{"highway":"secondary","name":"Stub Street"},
+              "geometry":[{"lat":40.0,"lon":-105.0},{"lat":40.001,"lon":-105.001}]}]}
             """;
     private static final String EMPTY_RESPONSE = """
             {"elements":[]}
@@ -130,18 +128,93 @@ class RoadTileSourceTest {
         assertEquals(1, recoveredRequests.get());
     }
 
-    // NOTE on a removed protection: c61b2d4 added two tests here for Overpass's "remark" convention
-    // (a top-level "remark" string appearing on an otherwise-200 response to report a runtime error
-    // mid-query). That protection was specific to Overpass's response shape and its "started a 200,
-    // failed partway through" failure mode. Since the default production fetch (RoadTileSource.
-    // fetchCell) now targets the official OSM API's map export instead -- a plain REST API that
-    // reports real failures as real non-200 statuses, not an embedded "remark" on a 200 -- there is
-    // no longer a reachable code path for that specific failure shape, so checkForErrorRemark and
-    // its two tests were removed rather than left as dead, untested, misleading code. Disclosed
-    // explicitly in the MINECRAFT-566 Jira comment announcing this fetch-source change: anyone who
-    // overrides -Dearthplatformroads.osmApiEndpoint back to an Overpass URL loses that protection
-    // (and, independently, the request/response shapes no longer match Overpass's "out geom" at
-    // all, so such an override would not work correctly regardless).
+    /** Overpass's own convention: a top-level "remark" appears only when it has an error/warning to report, even inside an HTTP 200 response. */
+    private static final String REMARK_ZERO_ELEMENTS_RESPONSE = """
+            {"elements":[],"remark":"runtime error: Query timed out in \\"query\\" at line 2"}
+            """;
+    private static final String REMARK_PARTIAL_ELEMENTS_RESPONSE = """
+            {"elements":[{"type":"way","id":555002,"nodes":[1,2],
+              "tags":{"highway":"secondary","name":"Partial Street"},
+              "geometry":[{"lat":44.0,"lon":-109.0},{"lat":44.001,"lon":-109.001}]}],
+             "remark":"runtime error: Query timed out in \\"query\\" at line 2"}
+            """;
+
+    @Test
+    void anHttp200WithAnErrorRemarkAndZeroElementsStaysPendingNotConfirmedEmpty(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, REMARK_ZERO_ELEMENTS_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        var duringError = source.waysForCell(45.0, -110.0);
+        assertTrue(duringError.isEmpty(), "An error remark must not throw; the caller gets no road for this one call");
+        assertEquals(1, requests.get());
+        assertTrue(source.cachedWaysForCellOrEmpty(45.0, -110.0).isEmpty(),
+                "An HTTP 200 with a nonempty error remark and zero elements must NOT write a confirmed-empty artifact");
+
+        AtomicInteger recoveredRequests = new AtomicInteger();
+        HttpServer recoveredStub = startStub(recoveredRequests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource restartedAfterRecovery = new RoadTileSource(endpointOf(recoveredStub), cacheRoot, true, Duration.ofSeconds(5));
+        var afterRecovery = restartedAfterRecovery.waysForCell(45.0, -110.0);
+        assertEquals(1, afterRecovery.size(), "The cell left pending by the error remark must retry successfully through a fresh source over the same cache root");
+        assertEquals(1, recoveredRequests.get());
+    }
+
+    @Test
+    void anHttp200WithAnErrorRemarkAndPartialElementsStaysPendingNotReady(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, REMARK_PARTIAL_ELEMENTS_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        var duringError = source.waysForCell(46.0, -111.0);
+        assertTrue(duringError.isEmpty(), "An error remark must not throw, and must not surface the partial way either");
+        assertEquals(1, requests.get());
+        assertTrue(source.cachedWaysForCellOrEmpty(46.0, -111.0).isEmpty(),
+                "An HTTP 200 with a nonempty error remark and some elements must NOT be written as a ready (complete) artifact");
+
+        AtomicInteger recoveredRequests = new AtomicInteger();
+        HttpServer recoveredStub = startStub(recoveredRequests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource restartedAfterRecovery = new RoadTileSource(endpointOf(recoveredStub), cacheRoot, true, Duration.ofSeconds(5));
+        var afterRecovery = restartedAfterRecovery.waysForCell(46.0, -111.0);
+        assertEquals(1, afterRecovery.size(), "The cell left pending by the partial error-remark response must retry successfully through a fresh source over the same cache root");
+        assertEquals(1, recoveredRequests.get());
+    }
+
+    @Test
+    void anApiKeyIsSentAsARequestHeaderWhenProvided(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        java.util.concurrent.atomic.AtomicReference<String> seenApiKeyHeader = new java.util.concurrent.atomic.AtomicReference<>();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            seenApiKeyHeader.set(exchange.getRequestHeaders().getFirst("X-API-Key"));
+            byte[] body = ONE_WAY_RESPONSE.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        this.server = stub;
+
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), "secret-test-key-not-a-real-credential", Duration.ZERO);
+        source.waysForCell(40.0005, -105.0005);
+        assertEquals(1, requests.get());
+        assertEquals("secret-test-key-not-a-real-credential", seenApiKeyHeader.get(), "Expected the configured API key to be sent as an X-API-Key header");
+    }
+
+    @Test
+    void aMinimumRequestIntervalIsEnforcedBetweenFetches(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, EMPTY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(300));
+
+        long start = System.nanoTime();
+        source.waysForCell(50.0, -1.0); // first cell: no prior request, no wait expected
+        source.waysForCell(51.0, -2.0); // second cell: must wait out the configured interval first
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(2, requests.get());
+        assertTrue(elapsedMillis >= 300, "Expected at least the configured 300ms minimum interval between two fetches, took " + elapsedMillis + "ms");
+    }
 
     @Test
     void cachedWaysForCellOrEmptyNeverFetches(@TempDir Path cacheRoot) throws IOException {

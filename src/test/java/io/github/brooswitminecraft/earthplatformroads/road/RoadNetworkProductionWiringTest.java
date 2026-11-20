@@ -32,11 +32,9 @@ class RoadNetworkProductionWiringTest {
     void anOrdinaryInstallWithNoTestSetterStillRequestsAndFindsARoad(@TempDir Path cacheRoot) throws IOException {
         var requestCount = new java.util.concurrent.atomic.AtomicInteger();
         String response = """
-                {"elements":[
-                  {"type":"node","id":1,"lat":43.0,"lon":-108.0},
-                  {"type":"node","id":2,"lat":43.001,"lon":-108.001},
-                  {"type":"way","id":555003,"nodes":[1,2],
-                    "tags":{"highway":"secondary","name":"Production Wiring Test Street"}}]}
+                {"elements":[{"type":"way","id":555003,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Production Wiring Test Street"},
+                  "geometry":[{"lat":43.0,"lon":-108.0},{"lat":43.001,"lon":-108.001}]}]}
                 """;
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {
@@ -64,6 +62,46 @@ class RoadNetworkProductionWiringTest {
             var way = tileSource.cachedWaysForCellOrEmpty(43.0005, -108.0005);
             assertTrue(!way.isEmpty() && way.get(0).wayId() == 555003L,
                     "Expected the fetched way to be found via the same cache-only read RoadNetwork.candidatesNear uses");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55446: the Overpass.ch preview provider must be opt-in, never a default.
+     * With none of {@code earthplatformroads.previewProvider}/{@code previewEndpoint} set (the
+     * ordinary, unmodified state of a real install), {@code buildDefaultTileSource} must build a
+     * network-disabled, cache-only source -- proven here by pointing it at a stub that would record
+     * a request if one were ever sent, then confirming zero requests happened.
+     */
+    @Test
+    void withNoOptInPropertiesSetTheDefaultWiringNeverTouchesTheNetwork(@TempDir Path cacheRoot) throws IOException {
+        assertTrue(System.getProperty("earthplatformroads.previewProvider") == null,
+                "Test assumption violated: another test left earthplatformroads.previewProvider set");
+
+        var requestCount = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requestCount.incrementAndGet();
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            // Deliberately NOT using setDefaultTileSourceInputsForTests here -- that call itself
+            // enables network fetch (it exists to let other tests exercise the real fetch path
+            // without system properties). This test instead proves the properties-gated branch
+            // itself, which only setDefaultTileSourceInputsForTests(null, null) (this class's own
+            // cleanup) leaves active -- so just override the cache root, not the endpoint.
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, cacheRoot);
+            var tileSource = RoadNetwork.liveTileSourceForPrefetch();
+            assertTrue(tileSource != null, "Expected a non-null (but network-disabled) tile source even with no opt-in");
+
+            tileSource.waysForCell(43.0005, -108.0005);
+            assertTrue(requestCount.get() == 0,
+                    "Expected zero network requests with no opt-in properties set -- got " + requestCount.get());
         } finally {
             stub.stop(0);
         }

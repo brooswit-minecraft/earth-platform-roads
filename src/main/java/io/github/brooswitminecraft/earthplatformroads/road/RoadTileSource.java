@@ -57,15 +57,38 @@ public final class RoadTileSource {
     private final Path cacheRoot;
     private final boolean allowNetwork;
     private final Duration timeout;
+    private final String apiKey;
+    private final Duration minRequestInterval;
     private final HttpClient http;
     private final Object fetchLock = new Object();
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
+    private Instant lastRequestAt = Instant.EPOCH;
 
     public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout) {
+        this(endpoint, cacheRoot, allowNetwork, timeout, null, Duration.ZERO);
+    }
+
+    /**
+     * @param apiKey Optional credential for a provider that requires one (e.g. a hosted Overpass
+     *               instance's free-tier key), sent as a {@code X-API-Key} header. Never logged, never
+     *               hardcoded as a default -- callers must source it from outside version control
+     *               (a system property or environment variable read at the call site), per
+     *               MINECRAFT-566's explicit "credentials out of source, Jira, logs, and distributed
+     *               jars" requirement. {@code null} sends no credential header at all.
+     * @param minRequestInterval Minimum real-world time between the start of one fetch and the next,
+     *                           enforced inside {@link #fetchLock} (which already limits this source to
+     *                           one in-flight request at a time) -- a conservative client-side rate
+     *                           limit for an opt-in hosted provider's free tier, not a default-provider
+     *                           concern. {@code Duration.ZERO} (the single-arg constructor's default)
+     *                           means no extra delay beyond the natural one-at-a-time serialization.
+     */
+    public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout, String apiKey, Duration minRequestInterval) {
         this.endpoint = endpoint;
         this.cacheRoot = cacheRoot;
         this.allowNetwork = allowNetwork;
         this.timeout = timeout;
+        this.apiKey = apiKey;
+        this.minRequestInterval = minRequestInterval == null ? Duration.ZERO : minRequestInterval;
         this.http = HttpClient.newBuilder().connectTimeout(timeout).build();
     }
 
@@ -152,39 +175,76 @@ public final class RoadTileSource {
     }
 
     /**
-     * Fetches this cell via a plain bounded GET against the official OSM API's map export
-     * ({@code GET .../map.json?bbox=minLon,minLat,maxLon,maxLat}) rather than an Overpass QL query.
-     * See {@link RoadNetwork}'s default-endpoint doc for why: three public Overpass mirrors were
-     * unreachable in this same session, while this endpoint answered immediately every time. The
-     * response is raw, separate {@code "node"}/{@code "way"}
-     * elements (a way lists only its nodes' IDs, not their coordinates); {@link OsmApiMapParser}
-     * resolves that into the same {@code "geometry"}-bearing way shape {@link OverpassWayParser}
-     * (and the on-disk cache format) already expect, so the rest of this pipeline -- caching,
-     * {@code RoadClass} filtering, {@code RoadNetwork.parseWay} -- is unchanged.
+     * Fetches this cell via an Overpass QL {@code out geom} query against {@link #endpoint} -- an
+     * opt-in hosted Overpass provider (MINECRAFT-566: John selected Overpass.ch's free tier for a
+     * private worldwide preview), not a public default. Two earlier live sources were tried and
+     * rejected this ticket: three public Overpass mirrors were unreachable (overloaded), and the
+     * official OSM editing API was explicitly disallowed as an automated game-fetch backend by
+     * policy. A dedicated hosted Overpass provider is neither of those -- but it is still live data,
+     * not the pinned/immutable snapshot the production catalog work is for, and it requires a
+     * provisioned credential, so this constructor path must stay opt-in (see
+     * {@code RoadNetwork.buildDefaultTileSource}'s gating) and rate-limited (see
+     * {@link #waitForRateLimit}).
      */
     private List<RoadSegment> fetchCell(double minLat, double minLon, double maxLat, double maxLon)
             throws IOException, InterruptedException {
-        String bbox = minLon + "," + minLat + "," + maxLon + "," + maxLat;
-        URI requestUri = URI.create(endpoint + (endpoint.toString().contains("?") ? "&" : "?") + "bbox=" + bbox);
-        HttpRequest request = HttpRequest.newBuilder(requestUri)
+        waitForRateLimit();
+        String query = """
+                [out:json][timeout:%d];
+                (
+                  way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|service|road)$"](%f,%f,%f,%f);
+                );
+                out geom;
+                """.formatted(Math.max(1, timeout.toSeconds()), minLat, minLon, maxLat, maxLon);
+        HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(endpoint)
                 .timeout(timeout)
-                .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566; " + System.getProperty("earthplatformroads.contact", "unspecified-contact") + ")")
-                .GET()
-                .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.statusCode() != 200) {
-            throw new IOException("OSM API map export returned HTTP " + response.statusCode() + " for cell fetch");
+                .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566)")
+                .POST(HttpRequest.BodyPublishers.ofString(query, StandardCharsets.UTF_8));
+        if (apiKey != null && !apiKey.isEmpty()) {
+            requestBuilder.header("X-API-Key", apiKey); // never logged; see this field's own javadoc
         }
-        List<JsonObject> resolvedWays = OsmApiMapParser.resolveWays(response.body());
-        return OverpassWayParser.parseWays(wrapAsWaysArray(resolvedWays));
+        HttpResponse<String> response = http.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        lastRequestAt = Instant.now();
+        if (response.statusCode() != 200) {
+            throw new IOException("Overpass provider returned HTTP " + response.statusCode() + " for cell fetch");
+        }
+        checkForErrorRemark(response.body());
+        return OverpassWayParser.parseWays(response.body());
     }
 
-    private static String wrapAsWaysArray(List<JsonObject> resolvedWays) {
-        var elements = new com.google.gson.JsonArray();
-        resolvedWays.forEach(elements::add);
-        JsonObject wrapper = new JsonObject();
-        wrapper.add("elements", elements);
-        return wrapper.toString();
+    /**
+     * Enforces {@link #minRequestInterval} between the start of consecutive fetches, measured from
+     * the end of the previous request (so a slow request's own duration counts toward the gap too,
+     * rather than stacking a further delay on top of it). Called inside {@link #fetchLock}, so this
+     * also serializes with the "one in-flight request" guarantee -- there is never more than one
+     * outstanding call to a rate-limited provider from a single {@code RoadTileSource} instance.
+     */
+    private void waitForRateLimit() throws InterruptedException {
+        if (minRequestInterval.isZero()) return;
+        Duration sinceLast = Duration.between(lastRequestAt, Instant.now());
+        Duration remaining = minRequestInterval.minus(sinceLast);
+        if (remaining.isPositive()) {
+            Thread.sleep(remaining.toMillis());
+        }
+    }
+
+    /**
+     * Overpass can start an HTTP 200 response, hit a runtime error partway through (e.g. its own
+     * {@code timeout:} budget expiring mid-query), and still finish the response with a top-level
+     * {@code "remark"} string describing that failure -- see Overpass's own {@code
+     * Output_JSON::write_footer}, which only ever emits {@code "remark"} when it has an error/warning
+     * message to report. A 200 status alone is therefore not proof the body is a complete, trustworthy
+     * answer: this must be checked and treated as a failure (same as a non-200 status or a network
+     * exception) BEFORE this cell's ways are written to the ready or confirmed-empty cache.
+     * Restored (with its two tests) for the Overpass.ch preview provider, having been removed when
+     * the short-lived OSM-API-based default made this failure shape unreachable; it is reachable
+     * again now that this class speaks Overpass QL to a real Overpass-protocol endpoint.
+     */
+    private static void checkForErrorRemark(String responseBody) throws IOException {
+        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+        if (root.has("remark") && !root.get("remark").getAsString().isEmpty()) {
+            throw new IOException("Overpass reported an error remark despite HTTP 200: " + root.get("remark").getAsString());
+        }
     }
 
     private static List<RoadSegment> readCachedCell(Path readyFile) throws IOException {

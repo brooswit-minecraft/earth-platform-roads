@@ -57,13 +57,12 @@ class YosemiteUnbundledSmokeTest {
     /** Two ways sharing node 7001: a junction, both vehicular classes, near El Capitan Meadow -- not in the bundled yosemite_valley.json. */
     private static final String JUNCTION_RESPONSE = """
             {"elements":[
-              {"type":"node","id":7000,"lat":37.7215,"lon":-119.6340},
-              {"type":"node","id":7001,"lat":37.7216,"lon":-119.6342},
-              {"type":"node","id":7002,"lat":37.7217,"lon":-119.6344},
               {"type":"way","id":555010,"nodes":[7000,7001],
-                "tags":{"highway":"secondary","name":"Southside Drive"}},
+                "tags":{"highway":"secondary","name":"Southside Drive"},
+                "geometry":[{"lat":37.7215,"lon":-119.6340},{"lat":37.7216,"lon":-119.6342}]},
               {"type":"way","id":555011,"nodes":[7001,7002],
-                "tags":{"highway":"tertiary","name":"El Capitan Meadow Spur"}}
+                "tags":{"highway":"tertiary","name":"El Capitan Meadow Spur"},
+                "geometry":[{"lat":37.7216,"lon":-119.6342},{"lat":37.7217,"lon":-119.6344}]}
             ]}
             """;
 

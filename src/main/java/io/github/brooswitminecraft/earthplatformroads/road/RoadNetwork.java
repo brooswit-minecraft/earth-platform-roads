@@ -69,23 +69,32 @@ public final class RoadNetwork {
     private static volatile RoadTileSource defaultTileSource;
 
     /**
-     * Default live endpoint: the official OSM API's bounded map export, NOT Overpass.
-     *
-     * <p>Three public Overpass mirrors (overpass-api.de, overpass.kumi.systems,
-     * overpass.openstreetmap.ru) were each tried and timed out within this same development
-     * session -- confirmed as genuine query-endpoint overload (a direct GET to
-     * overpass-api.de/ itself returns HTTP 406 in under a second; the interpreter endpoint is what's
-     * overloaded), not a network-level block. The official API's {@code GET .../map.json?bbox=...}
-     * succeeded immediately on every attempt instead, so it is the default here per MINECRAFT-566
-     * review: "prioritize a real repeatable fetch... use an existing suitable service if available."
-     * Overridable with {@code -Dearthplatformroads.osmApiEndpoint=...}.
-     *
-     * <p><b>Known caveat</b>: this API bounds a single export to 0.25 square degrees and a server-
-     * side node-count limit; this mod's own {@value #CELL_DEGREES}-degree cells are several orders of
-     * magnitude smaller than that bound, so no cell this mod requests can ever hit it.
+     * There is deliberately no hardcoded default live endpoint. Earlier attempts this ticket --
+     * three public Overpass mirrors (overloaded), the official OSM editing API (policy-disallowed as
+     * an automated game-fetch backend) -- are why: this mod no longer ships ANY live backend as a
+     * public default. The one live source currently sanctioned is an opt-in preview, selected by
+     * John himself (MINECRAFT-566 comment 55446): a hosted Overpass provider's free/noncommercial
+     * evaluation tier (Overpass.ch), gated behind all of:
+     * <ul>
+     *   <li>{@code -Dearthplatformroads.previewProvider=overpass-ch} -- without this exact value, no
+     *       network fetch ever happens, regardless of the other properties below.</li>
+     *   <li>{@code -Dearthplatformroads.previewEndpoint=...} -- required, no default URL.</li>
+     *   <li>{@code -Dearthplatformroads.previewApiKey=...} or the {@code
+     *       EARTHPLATFORMROADS_PREVIEW_API_KEY} environment variable -- the credential, read at
+     *       startup and sent as a request header; never logged, never written into this cache's own
+     *       files, never hardcoded. Absent means no credential header is sent at all (some providers
+     *       may permit a limited anonymous tier; that is this provider's own policy to enforce, not
+     *       this mod's).</li>
+     *   <li>{@code -Dearthplatformroads.previewMinRequestIntervalMs=...} -- optional, defaults to
+     *       {@value #DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS}ms, a conservative client-side rate
+     *       limit appropriate for a free evaluation tier (see {@link RoadTileSource#fetchCell}'s
+     *       single-in-flight-request guarantee, which this rate limit sits on top of).</li>
+     * </ul>
+     * This is explicitly a live-data preview, not the pinned/immutable worldwide snapshot the
+     * offline SQLite-catalog pilot work is building toward -- the two are separate efforts.
      */
-    private static final String DEFAULT_OSM_API_ENDPOINT = "https://api.openstreetmap.org/api/0.6/map.json";
     private static final Duration TILE_FETCH_TIMEOUT = Duration.ofSeconds(20);
+    private static final long DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS = 5000;
 
     private static volatile RoadNetwork instance;
 
@@ -164,17 +173,13 @@ public final class RoadNetwork {
      * Builds the real production {@link RoadTileSource}: a persistent cache directory under the
      * game's own install, {@code <gamedir>/earthplatformroads/road_tiles/}.
      *
-     * <p><b>Live network fetch is temporarily disabled here ({@code allowNetwork=false}),
-     * disclosed in the MINECRAFT-566 Jira comment announcing this change.</b> This mod's own OSM
-     * API-based fetch (the previous default) is explicitly disallowed by John's course-correction
-     * comments: "No automated game fetches against the editing API, public Overpass, or unsupported
-     * hotlinks." The replacement -- a worldwide, pinned, attributed OSM-derived source (VersaTiles'
-     * hosted OSM Shortbread vector tiles at tiles.versatiles.org, which this ticket's checkpoint
-     * selected after verifying real OSM way IDs, highway classification, worldwide bounds, and
-     * version metadata in a live sample tile) -- is NOT wired yet; that is real, disclosed,
-     * remaining work, not a silent gap. Until it lands, this method returns a read-only cache (any
-     * cell already on disk from a prior fetch still answers; nothing new is ever auto-fetched), so
-     * there is no code path left that can reach a policy-disallowed live backend by default.
+     * <p>Live network fetch is enabled only when every opt-in condition this class's own field doc
+     * describes is met (provider name, endpoint, and the other preview properties); otherwise this
+     * returns a read-only cache -- any cell already on disk from a prior fetch still answers, but
+     * nothing new is ever auto-fetched, so there is no code path that can reach a live backend
+     * without an operator explicitly opting in. {@code tileEndpointOverride} (test-only) also
+     * enables network fetch directly, bypassing the opt-in properties, so tests can exercise this
+     * wiring without setting system properties.
      *
      * <p><b>Named, honest limitation</b>: this cache is scoped to the whole game install, not to
      * one save -- MINECRAFT-566's review asked for "a world pinning its source snapshot," and a
@@ -189,11 +194,21 @@ public final class RoadNetwork {
             Path cacheRoot = tileCacheRootOverride != null
                     ? tileCacheRootOverride
                     : FMLPaths.GAMEDIR.get().resolve("earthplatformroads").resolve("road_tiles");
-            URI endpoint = tileEndpointOverride != null
-                    ? tileEndpointOverride
-                    : URI.create(System.getProperty("earthplatformroads.osmApiEndpoint", DEFAULT_OSM_API_ENDPOINT));
-            boolean allowNetwork = tileEndpointOverride != null; // live fetch stays enabled only for tests that explicitly opt in via an override
-            return new RoadTileSource(endpoint, cacheRoot, allowNetwork, TILE_FETCH_TIMEOUT);
+
+            if (tileEndpointOverride != null) {
+                return new RoadTileSource(tileEndpointOverride, cacheRoot, true, TILE_FETCH_TIMEOUT);
+            }
+
+            boolean optedIntoPreview = "overpass-ch".equals(System.getProperty("earthplatformroads.previewProvider"));
+            String previewEndpointProperty = System.getProperty("earthplatformroads.previewEndpoint");
+            if (!optedIntoPreview || previewEndpointProperty == null || previewEndpointProperty.isEmpty()) {
+                return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
+            }
+            String apiKey = System.getProperty("earthplatformroads.previewApiKey",
+                    System.getenv("EARTHPLATFORMROADS_PREVIEW_API_KEY"));
+            long minIntervalMs = Long.getLong("earthplatformroads.previewMinRequestIntervalMs", DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS);
+            return new RoadTileSource(URI.create(previewEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
+                    apiKey, Duration.ofMillis(minIntervalMs));
         } catch (RuntimeException e) {
             return null;
         }
