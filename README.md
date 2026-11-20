@@ -19,18 +19,26 @@ for how to build Earth Platform as a local compile/test dependency (it is
 not published anywhere; Layered Slopes is, via GitHub releases --
 `scripts/fetch_layered_slopes_dependency.sh`).
 
-Road data is indexed and installed as data (`data/earthplatformroads/roads/regions/*.json`,
-listed by `regions/index.json`), not hard-coded: installing another region's
-pinned extract adds mapped coverage there without a Java change. As of this
-writing only Yosemite Valley's original pinned Southside Drive extract
-(~190m, one way) is bundled -- a second geographically separate fixture was
-attempted (see `docs/road-data-provenance.md`) and not obtained this pass.
+Road data is installed, not hard-coded, from two sources using the same
+versioned format: bundled regions baked into the jar
+(`data/earthplatformroads/roads/regions/*.json`, listed by `regions/index.json`)
+and external regions -- every `*.json` file dropped directly into
+`config/earthplatformroads/roads/regions/` in a real install, no index file
+needed there, no Java change, no mod rebuild. This is literal: mapped
+coverage for a new destination is installing a region file, not this mod
+shipping an ever-bigger bundled extract (see `docs/design.md`'s MINECRAFT-566
+section, and `RoadNetworkExternalRegionTest` for proof against a genuinely
+unbundled destination). As of this writing only Yosemite Valley's original
+pinned Southside Drive extract (~190m, one way) is bundled by default.
 
-**Explicit current gaps**: bridges and tunnels are tracked in the data model
-but never rendered as a crossing (no surface is drawn for them at all, rather
-than an incorrect at-grade one); the slope-to-layer heuristic
-(`RoadSurfaceLayering`) has not been verified in-game; only one region is
-bundled. See the MINECRAFT-566 ticket for the current, up-to-date status.
+**Explicit current milestone boundary** (not an open gap -- deferred by
+MINECRAFT-566's own milestone update): bridges and tunnels are tracked in the
+data model but never rendered as a crossing (no surface is drawn for them at
+all, rather than an incorrect at-grade one); correct rendering is a following
+milestone. **Explicit current gaps**: the layering heuristic
+(`RoadSurfaceLayering`) is verified against real generated data in tests but
+has not been verified in an actual playtest. See the MINECRAFT-566 ticket for
+the current, up-to-date status.
 
 ## Building
 

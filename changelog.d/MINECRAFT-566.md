@@ -2,34 +2,46 @@ bump: minor
 
 ### Added
 - Indexed, multi-region road network (`RoadNetwork`/`RoadSegment`/`RoadClass`):
-  ways are loaded from `data/earthplatformroads/roads/regions/*.json` (listed
-  by `regions/index.json`), bucketed into a spatial grid index for O(1)-ish
-  column lookups instead of a linear scan, and classified against mapped
-  vehicular `highway=*` values only (foot trails are rejected at load time).
-  Shared OSM node IDs between ways are tracked for mapped-junction detection
+  ways are classified against every mapped vehicular `highway=*` value (foot
+  trails are rejected at load time) and bucketed into a spatial grid index for
+  O(1)-ish column lookups instead of a linear scan. Shared OSM node IDs
+  between ways are tracked for mapped-junction detection
   (`RoadNetwork.junctions()`).
-- Layered-blackstone road surfaces on inclines: a dedicated compat block
-  (`LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE`, registered against
-  Layered Slopes 0.2.0's `LayeredBlock`) replaces the previous always-full
-  `POLISHED_BLACKSTONE` top surface when a column's local slope is nonzero,
-  with a matching non-full collision shape; `under()` always stays a full
-  block.
+- Installed road data, bundled AND external, using the same versioned region
+  format (`schema_version`, checked at load): bundled regions are listed by
+  `data/earthplatformroads/roads/regions/index.json`; external regions are
+  every `*.json` file dropped into `config/earthplatformroads/roads/regions/`
+  in a real install -- mapped coverage for a new destination is installing a
+  file there, not a bigger bundled extract or a Java change
+  (`RoadNetworkExternalRegionTest` proves this against a genuinely unbundled
+  destination).
+- Layered-blackstone road surfaces at a real ground-height step: a dedicated
+  compat block (`LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE`, registered
+  against Layered Slopes 0.2.0's `LayeredBlock`) replaces the previous
+  always-full `POLISHED_BLACKSTONE` top surface, decaying by Chebyshev
+  distance to the nearest same-road neighbor with lower real ground height
+  (`RoadSurfaceLayering`), with a matching non-full collision shape; `under()`
+  always stays a full block. Verified against real generated data, not a
+  synthetic slope value, including the cascade-regression case caught in
+  review (see the ticket comments for that back-and-forth).
 
 ### Changed
 - `EarthGeneratorRoadMixin` now looks up the covering `RoadSegment` through
-  the new indexed `RoadNetwork` and selects a layer count from
-  `RoadSurfaceLayering` instead of always painting a full block.
+  the indexed `RoadNetwork` and selects a layer count from distance to a real
+  lower same-road neighbor, instead of always painting a full block.
 - The pinned Southside Drive fixture moved from
   `data/earthplatformroads/roads/southside_drive_yosemite.json` to the new
   region format at `data/earthplatformroads/roads/regions/yosemite_valley.json`.
 
-### Known gaps (see the MINECRAFT-566 ticket comment for the full list)
-- Only the original pinned Southside Drive extract is bundled; a second
-  geographic fixture (Presidio Parkway) and a wider Yosemite extract
-  covering El Capitan Bridge's junctions were not ingested this pass.
-- The slope-to-layer-count mapping (`RoadSurfaceLayering`) is a first
-  heuristic, not verified in-game (no build/playtest was run to confirm the
-  rendered/collision seam).
+### Milestone boundary (not an open gap -- see the ticket's milestone update)
 - Bridges/tunnels are modeled (`RoadSegment.bridge()`/`tunnel()`/`layer()`)
-  but never rendered as a crossing; a bridge way is simply not drawn as a
-  surface, not routed along the riverbed.
+  and explicitly skipped (no surface drawn, never an at-grade crossing along
+  a riverbed); correct rendering is deferred to a following milestone by
+  the ticket's own updated scope.
+
+### Known gaps
+- Only the original pinned Southside Drive extract is bundled by default; a
+  second, bigger hand-curated geographic fixture is no longer the
+  deliverable (superseded by the external-region pipeline above).
+- The layering heuristic is verified against real generated data in tests
+  but not against an actual in-game playtest.

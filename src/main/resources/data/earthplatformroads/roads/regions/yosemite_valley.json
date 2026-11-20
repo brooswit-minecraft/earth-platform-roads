@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "region_id": "yosemite_valley",
   "source": "OpenStreetMap",
   "license": "ODbL 1.0 (https://www.openstreetmap.org/copyright)",

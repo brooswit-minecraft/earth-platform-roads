@@ -10,18 +10,33 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import net.neoforged.fml.loading.FMLPaths;
 
 /**
- * The mod's road network: every mapped way bundled in {@code data/earthplatformroads/roads/regions/}
- * (one indexed resource per region, listed by {@code regions/index.json}), loaded once from
- * resources baked into the mod jar. Nothing here makes a network request; every region's extract
- * was fetched and pinned ahead of time (see {@code docs/road-data-provenance.md}). Adding a region
- * means installing another regions/*.json resource (and listing it in index.json) -- no Java change
- * and no hard-coded coordinates, satisfying "wherever the corresponding source data is installed."
+ * The mod's road network, from two installed-data sources, both using the same versioned region
+ * format (see {@link #SUPPORTED_SCHEMA_VERSION}):
+ * <ul>
+ *   <li><b>Bundled</b> regions baked into the mod jar at
+ *       {@code data/earthplatformroads/roads/regions/}, listed by that directory's own
+ *       {@code index.json} (classpath resources have no directory listing, so an explicit index is
+ *       required here).</li>
+ *   <li><b>External</b> regions: every {@code *.json} file found directly under
+ *       {@link #externalRegionsDirectory()} (default: {@code config/earthplatformroads/roads/regions/}
+ *       in the game's own install -- a real directory on disk, so no index file is needed; every
+ *       file there is read). This is what makes "wherever the corresponding source data is
+ *       installed" literal: installing mapped coverage for a new destination is dropping a region
+ *       file into that folder, not shipping a bigger bundled extract or changing any Java code --
+ *       see MINECRAFT-566's milestone update asking for exactly this, tested against an
+ *       intentionally unbundled destination in {@code RoadNetworkExternalRegionTest}.</li>
+ * </ul>
+ * Nothing here makes a network request; every region's extract was fetched and pinned ahead of
+ * time (see {@code docs/road-data-provenance.md}).
  *
  * <p>Lookups are indexed, not a linear scan of every way: ways are bucketed into
  * {@value #CELL_DEGREES}-degree latitude/longitude grid cells ({@link #cellKey}) covering their
@@ -31,6 +46,12 @@ import java.util.Map;
 public final class RoadNetwork {
     private static final String INDEX_RESOURCE = "/data/earthplatformroads/roads/regions/index.json";
     private static final String REGION_RESOURCE_PREFIX = "/data/earthplatformroads/roads/regions/";
+
+    /** The region JSON format version this build understands; see {@link #checkSchemaVersion}. */
+    static final int SUPPORTED_SCHEMA_VERSION = 1;
+
+    /** Test-only override for {@link #externalRegionsDirectory()}; {@code null} means "use the real FML config dir". */
+    private static volatile Path externalRegionsDirectoryOverride;
 
     /** Grid cell size for the spatial index: small enough that a cell's way list stays short, large
      *  enough that even a six-lane way's half-width never crosses more than one extra cell of margin. */
@@ -52,6 +73,20 @@ public final class RoadNetwork {
         synchronized (RoadNetwork.class) {
             if (instance == null) instance = new RoadNetwork(loadAllRegions());
             return instance;
+        }
+    }
+
+    /**
+     * Test-only: force the external regions directory (or {@code null} to use the real FML config
+     * dir) and discard the cached singleton so the next access reloads from the new state. Tests
+     * that call this with a non-null directory MUST call it again with {@code null} afterward (an
+     * {@code @AfterAll}/{@code @AfterEach}), or every other test in the same JVM run will keep
+     * seeing that test's external fixture instead of a clean bundled-only network.
+     */
+    static void resetForTests(Path externalRegionsDirectoryForTests) {
+        synchronized (RoadNetwork.class) {
+            externalRegionsDirectoryOverride = externalRegionsDirectoryForTests;
+            instance = null;
         }
     }
 
@@ -136,9 +171,9 @@ public final class RoadNetwork {
     }
 
     private static List<RoadSegment> loadAllRegions() {
-        List<String> regionFiles = loadIndex();
         List<RoadSegment> all = new ArrayList<>();
-        for (String regionFile : regionFiles) all.addAll(loadRegion(regionFile));
+        for (String regionFile : loadIndex()) all.addAll(loadBundledRegion(regionFile));
+        all.addAll(loadExternalRegions());
         return all;
     }
 
@@ -154,18 +189,78 @@ public final class RoadNetwork {
         }
     }
 
-    private static List<RoadSegment> loadRegion(String fileName) {
+    private static List<RoadSegment> loadBundledRegion(String fileName) {
         String resource = REGION_RESOURCE_PREFIX + fileName;
         try (InputStream in = RoadNetwork.class.getResourceAsStream(resource)) {
             if (in == null) throw new IllegalStateException("Missing bundled resource " + resource);
             JsonObject root = JsonParser.parseReader(new InputStreamReader(in, StandardCharsets.UTF_8)).getAsJsonObject();
-            List<RoadSegment> ways = new ArrayList<>();
-            for (JsonElement wayElement : root.getAsJsonArray("ways")) {
-                ways.add(parseWay(wayElement.getAsJsonObject()));
-            }
-            return ways;
+            return parseRegionWays(root, resource);
         } catch (IOException e) {
             throw new IllegalStateException("Could not read bundled resource " + resource, e);
+        }
+    }
+
+    /**
+     * Where this install's own, external (not bundled in the jar) region files live: real files a
+     * player or server operator drops in, one destination at a time, with no mod rebuild. Every
+     * {@code *.json} file directly under this directory is read as a region; there is no index file
+     * here (unlike the bundled resources) because a real directory can simply be listed.
+     */
+    private static Path externalRegionsDirectory() {
+        if (externalRegionsDirectoryOverride != null) return externalRegionsDirectoryOverride;
+        try {
+            return FMLPaths.CONFIGDIR.get().resolve("earthplatformroads").resolve("roads").resolve("regions");
+        } catch (RuntimeException e) {
+            // FML's paths were never set up in this JVM (a context outside the real modded game) --
+            // no external regions are available, bundled-only is still correct.
+            return null;
+        }
+    }
+
+    private static List<RoadSegment> loadExternalRegions() {
+        Path directory = externalRegionsDirectory();
+        if (directory == null || !Files.isDirectory(directory)) return List.of();
+        List<RoadSegment> all = new ArrayList<>();
+        List<Path> jsonFiles;
+        try (var listing = Files.list(directory)) {
+            jsonFiles = listing.filter(p -> p.getFileName().toString().endsWith(".json")).sorted().toList();
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not list external regions directory " + directory, e);
+        }
+        for (Path path : jsonFiles) {
+            try (InputStream in = Files.newInputStream(path)) {
+                JsonObject root = JsonParser.parseReader(new InputStreamReader(in, StandardCharsets.UTF_8)).getAsJsonObject();
+                all.addAll(parseRegionWays(root, path.toString()));
+            } catch (IOException e) {
+                throw new IllegalStateException("Could not read external region file " + path, e);
+            }
+        }
+        return all;
+    }
+
+    private static List<RoadSegment> parseRegionWays(JsonObject root, String source) {
+        checkSchemaVersion(root, source);
+        List<RoadSegment> ways = new ArrayList<>();
+        for (JsonElement wayElement : root.getAsJsonArray("ways")) {
+            ways.add(parseWay(wayElement.getAsJsonObject()));
+        }
+        return ways;
+    }
+
+    /**
+     * Every region, bundled or external, must declare the schema version it was written against,
+     * checked against {@link #SUPPORTED_SCHEMA_VERSION} -- "versioned tile pipeline" per
+     * MINECRAFT-566's milestone update: a region written for a format this build does not
+     * understand must fail loudly, not silently misparse or partially load.
+     */
+    private static void checkSchemaVersion(JsonObject root, String source) {
+        if (!root.has("schema_version")) {
+            throw new IllegalStateException("Region " + source + " is missing the required \"schema_version\" field");
+        }
+        int version = root.get("schema_version").getAsInt();
+        if (version != SUPPORTED_SCHEMA_VERSION) {
+            throw new IllegalStateException("Region " + source + " has schema_version=" + version
+                    + ", but this build only supports schema_version=" + SUPPORTED_SCHEMA_VERSION);
         }
     }
 
