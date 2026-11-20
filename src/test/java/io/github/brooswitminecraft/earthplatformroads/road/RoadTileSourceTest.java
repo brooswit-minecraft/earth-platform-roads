@@ -179,8 +179,36 @@ class RoadTileSourceTest {
         assertEquals(1, recoveredRequests.get());
     }
 
+    /**
+     * {@code shouldSendApiKeyTo} is the real, exact rule {@code fetchCell} uses; tested directly
+     * (pure function, no network) per MINECRAFT-566 comment 55448's "bind credential-bearing
+     * requests to the documented https://api.overpass.ch/v1/interpreter origin/path" -- a dummy key
+     * value only, per this same comment's "keep injectable loopback stubs credential-free except
+     * dummy-header tests."
+     */
     @Test
-    void anApiKeyIsSentAsARequestHeaderWhenProvided(@TempDir Path cacheRoot) throws IOException {
+    void theApiKeyIsOnlySentToTheExactDocumentedOverpassChEndpoint() {
+        String dummyKey = "dummy-test-key-not-a-real-credential";
+        assertTrue(RoadTileSource.shouldSendApiKeyTo(RoadTileSource.CREDENTIAL_BOUND_ENDPOINT, dummyKey),
+                "Expected the key to be sent to the exact documented endpoint");
+        assertTrue(!RoadTileSource.shouldSendApiKeyTo(URI.create("http://127.0.0.1:9/"), dummyKey),
+                "Expected the key withheld from a local stub -- it is not the bound endpoint");
+        assertTrue(!RoadTileSource.shouldSendApiKeyTo(URI.create("https://api.overpass.ch/v1/interpreter/evil"), dummyKey),
+                "Expected the key withheld from a similar-looking but different path");
+        assertTrue(!RoadTileSource.shouldSendApiKeyTo(URI.create("http://api.overpass.ch/v1/interpreter"), dummyKey),
+                "Expected the key withheld over plain HTTP (not HTTPS) even with a matching host/path");
+        assertTrue(!RoadTileSource.shouldSendApiKeyTo(RoadTileSource.CREDENTIAL_BOUND_ENDPOINT, null),
+                "Expected no key sent (and no NPE) when no key is configured at all");
+    }
+
+    /**
+     * A real fetch against a non-bound endpoint (a local stub, like every other test in this class)
+     * must still work -- the binding rule only withholds the credential, it never blocks the
+     * request itself. This is what every other stub-based fetch test already implicitly exercises;
+     * this test makes the "and the key was never present" part explicit with a dummy key.
+     */
+    @Test
+    void aFetchAgainstANonBoundEndpointSucceedsWithTheKeyWithheld(@TempDir Path cacheRoot) throws IOException {
         AtomicInteger requests = new AtomicInteger();
         java.util.concurrent.atomic.AtomicReference<String> seenApiKeyHeader = new java.util.concurrent.atomic.AtomicReference<>();
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -195,10 +223,11 @@ class RoadTileSourceTest {
         stub.start();
         this.server = stub;
 
-        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), "secret-test-key-not-a-real-credential", Duration.ZERO);
-        source.waysForCell(40.0005, -105.0005);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), "dummy-test-key-not-a-real-credential", Duration.ZERO);
+        var ways = source.waysForCell(40.0005, -105.0005);
         assertEquals(1, requests.get());
-        assertEquals("secret-test-key-not-a-real-credential", seenApiKeyHeader.get(), "Expected the configured API key to be sent as an X-API-Key header");
+        assertEquals(1, ways.size(), "Expected the fetch to still succeed with the key withheld");
+        assertTrue(seenApiKeyHeader.get() == null, "Expected no X-API-Key header against a non-bound (local stub) endpoint");
     }
 
     @Test

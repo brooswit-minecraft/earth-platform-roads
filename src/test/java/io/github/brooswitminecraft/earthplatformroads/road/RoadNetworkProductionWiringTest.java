@@ -106,4 +106,44 @@ class RoadNetworkProductionWiringTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55448: "make missing key disable the live provider rather than issue
+     * an anonymous request." Sets BOTH opt-in properties (provider name and endpoint) -- the only
+     * thing missing is the credential, which this test environment genuinely has no
+     * {@code EARTHPLATFORMROADS_PREVIEW_API_KEY} set for (a real env var can't be set for a single
+     * JVM test process without a subprocess, so this test relies on that already being true, and
+     * asserts it explicitly rather than assuming). The provider must still end up disabled.
+     */
+    @Test
+    void optingIntoTheProviderWithoutAKeyStillDisablesLiveFetch(@TempDir Path cacheRoot) throws IOException {
+        assertTrue(System.getenv("EARTHPLATFORMROADS_PREVIEW_API_KEY") == null,
+                "Test assumption violated: this environment has EARTHPLATFORMROADS_PREVIEW_API_KEY set");
+
+        var requestCount = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requestCount.incrementAndGet();
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        System.setProperty("earthplatformroads.previewProvider", "overpass-ch");
+        System.setProperty("earthplatformroads.previewEndpoint", "http://127.0.0.1:" + stub.getAddress().getPort() + "/");
+        try {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, cacheRoot);
+            var tileSource = RoadNetwork.liveTileSourceForPrefetch();
+            assertTrue(tileSource != null, "Expected a non-null (but network-disabled) tile source");
+
+            tileSource.waysForCell(43.0005, -108.0005);
+            assertTrue(requestCount.get() == 0,
+                    "Expected zero network requests with provider+endpoint opted in but no key -- got " + requestCount.get());
+        } finally {
+            stub.stop(0);
+            System.clearProperty("earthplatformroads.previewProvider");
+            System.clearProperty("earthplatformroads.previewEndpoint");
+        }
+    }
 }

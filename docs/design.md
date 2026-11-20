@@ -131,14 +131,22 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   ordered-node-ID junction model and the incline mixin's same-way `wayId` blending). This mod now
   ships NO hardcoded live endpoint at all. The one sanctioned live source is an opt-in preview John
   selected himself (MINECRAFT-566 comment 55446): a hosted Overpass provider's free/noncommercial
-  tier (Overpass.ch), gated behind `-Dearthplatformroads.previewProvider=overpass-ch` AND
-  `-Dearthplatformroads.previewEndpoint=...` (no default URL) -- see `RoadNetwork.buildDefaultTileSource`'s
-  own doc for the full property list, including the credential (`previewApiKey` property or
-  `EARTHPLATFORMROADS_PREVIEW_API_KEY` env var, never logged/hardcoded) and the conservative
-  client-side rate limit (`previewMinRequestIntervalMs`, default 5000ms) `RoadTileSource` enforces
-  alongside its existing one-in-flight-request guarantee. `RoadTileSourceTest
-  .withNoOptInPropertiesSetTheDefaultWiringNeverTouchesTheNetwork` (actually
-  `RoadNetworkProductionWiringTest`) proves zero requests happen with none of those properties set.
+  tier (Overpass.ch), gated behind ALL of `-Dearthplatformroads.previewProvider=overpass-ch`,
+  `-Dearthplatformroads.previewEndpoint=...` (no default URL), and the `EARTHPLATFORMROADS_PREVIEW_API_KEY`
+  environment variable (never a `-D` system property -- those are visible in process argument
+  listings; see `RoadNetwork.buildDefaultTileSource`'s own doc) -- a missing key disables the
+  provider entirely rather than sending an anonymous request. The credential is sent (as an
+  `X-API-Key` header, verified against overpass.ch's own docs) ONLY when the configured endpoint
+  exactly equals `RoadTileSource.CREDENTIAL_BOUND_ENDPOINT`
+  (`https://api.overpass.ch/v1/interpreter`) -- a misconfigured `previewEndpoint` can disable the
+  preview but can never leak the credential elsewhere; `shouldSendApiKeyTo` is unit-tested directly
+  against that exact URI plus several near-miss decoys (wrong path, wrong scheme, no key). A 429/503
+  response's `Retry-After` header (also verified against the docs) is honored for the next fetch
+  attempt, on top of the configured `previewMinRequestIntervalMs` (default 5000ms) `RoadTileSource`
+  already enforces alongside its one-in-flight-request guarantee.
+  `RoadNetworkProductionWiringTest.withNoOptInPropertiesSetTheDefaultWiringNeverTouchesTheNetwork`
+  and `.optingIntoTheProviderWithoutAKeyStillDisablesLiveFetch` prove zero requests happen either
+  with no opt-in at all, or with the provider/endpoint opted in but no key present.
   `RoadTileSource.fetchCell` speaks real Overpass QL (`out geom`) again, with `checkForErrorRemark`
   restored (and its two tests) -- that failure shape is reachable again now that this class talks to
   a real Overpass-protocol endpoint. This preview is explicitly live data, not the pinned/immutable

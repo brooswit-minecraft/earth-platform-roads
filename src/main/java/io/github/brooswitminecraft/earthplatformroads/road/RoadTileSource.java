@@ -63,6 +63,22 @@ public final class RoadTileSource {
     private final Object fetchLock = new Object();
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
     private Instant lastRequestAt = Instant.EPOCH;
+    private volatile Duration serverRequestedDelay = Duration.ZERO;
+
+    /**
+     * The only origin+path this class will ever attach {@link #apiKey} to, regardless of what
+     * {@link #endpoint} is configured to -- MINECRAFT-566 comment 55448: "bind credential-bearing
+     * requests to the documented https://api.overpass.ch/v1/interpreter origin/path." A
+     * misconfigured (or, in principle, maliciously redirected) {@code previewEndpoint} must never
+     * cause the credential to be sent somewhere else; see {@link #fetchCell}, which checks this
+     * before adding the header rather than trusting whatever URI it was constructed with.
+     */
+    static final URI CREDENTIAL_BOUND_ENDPOINT = URI.create("https://api.overpass.ch/v1/interpreter");
+
+    /** Pulled out as its own pure function so the binding rule itself is unit-testable without a real network call to the real endpoint. */
+    static boolean shouldSendApiKeyTo(URI endpoint, String apiKey) {
+        return apiKey != null && !apiKey.isEmpty() && CREDENTIAL_BOUND_ENDPOINT.equals(endpoint);
+    }
 
     public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout) {
         this(endpoint, cacheRoot, allowNetwork, timeout, null, Duration.ZERO);
@@ -70,11 +86,16 @@ public final class RoadTileSource {
 
     /**
      * @param apiKey Optional credential for a provider that requires one (e.g. a hosted Overpass
-     *               instance's free-tier key), sent as a {@code X-API-Key} header. Never logged, never
-     *               hardcoded as a default -- callers must source it from outside version control
-     *               (a system property or environment variable read at the call site), per
-     *               MINECRAFT-566's explicit "credentials out of source, Jira, logs, and distributed
-     *               jars" requirement. {@code null} sends no credential header at all.
+     *               instance's free-tier key), sent as a {@code X-API-Key} header -- but ONLY when
+     *               {@link #endpoint} exactly equals {@link #CREDENTIAL_BOUND_ENDPOINT}; see
+     *               {@link #fetchCell}. Never logged, never hardcoded as a default -- callers must
+     *               source it from outside version control, per MINECRAFT-566's explicit
+     *               "credentials out of source, Jira, logs, and distributed jars" requirement, and
+     *               per comment 55448, from an environment variable only (never a JVM {@code -D}
+     *               system property, which is visible in process argument listings). {@code null}
+     *               sends no credential header at all and, per 55448, must disable the live provider
+     *               entirely rather than send an anonymous request -- enforced by the caller
+     *               ({@code RoadNetwork.buildDefaultTileSource}), not by this constructor itself.
      * @param minRequestInterval Minimum real-world time between the start of one fetch and the next,
      *                           enforced inside {@link #fetchLock} (which already limits this source to
      *                           one in-flight request at a time) -- a conservative client-side rate
@@ -89,7 +110,7 @@ public final class RoadTileSource {
         this.timeout = timeout;
         this.apiKey = apiKey;
         this.minRequestInterval = minRequestInterval == null ? Duration.ZERO : minRequestInterval;
-        this.http = HttpClient.newBuilder().connectTimeout(timeout).build();
+        this.http = HttpClient.newBuilder().connectTimeout(timeout).followRedirects(HttpClient.Redirect.NEVER).build();
     }
 
     /**
@@ -200,11 +221,25 @@ public final class RoadTileSource {
                 .timeout(timeout)
                 .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566)")
                 .POST(HttpRequest.BodyPublishers.ofString(query, StandardCharsets.UTF_8));
-        if (apiKey != null && !apiKey.isEmpty()) {
+        if (shouldSendApiKeyTo(endpoint, apiKey)) {
             requestBuilder.header("X-API-Key", apiKey); // never logged; see this field's own javadoc
         }
         HttpResponse<String> response = http.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         lastRequestAt = Instant.now();
+        if (response.statusCode() == 429 || response.statusCode() == 503) {
+            // overpass.ch docs (https://overpass.ch/docs, "Limits & plans"/"Errors"): both
+            // rate_limited/concurrency_limit/quota_exceeded (429) and server_busy (503) carry a
+            // Retry-After header naming the real wait. Respected for the NEXT fetch attempt from
+            // this instance, on top of (not instead of) the configured minRequestInterval.
+            response.headers().firstValue("Retry-After").ifPresent(value -> {
+                try {
+                    serverRequestedDelay = Duration.ofSeconds(Long.parseLong(value.trim()));
+                } catch (NumberFormatException ignored) {
+                    // Retry-After may also be an HTTP-date per RFC 9110; not parsed here -- the
+                    // configured minRequestInterval still applies as a floor either way.
+                }
+            });
+        }
         if (response.statusCode() != 200) {
             throw new IOException("Overpass provider returned HTTP " + response.statusCode() + " for cell fetch");
         }
@@ -215,14 +250,18 @@ public final class RoadTileSource {
     /**
      * Enforces {@link #minRequestInterval} between the start of consecutive fetches, measured from
      * the end of the previous request (so a slow request's own duration counts toward the gap too,
-     * rather than stacking a further delay on top of it). Called inside {@link #fetchLock}, so this
-     * also serializes with the "one in-flight request" guarantee -- there is never more than one
-     * outstanding call to a rate-limited provider from a single {@code RoadTileSource} instance.
+     * rather than stacking a further delay on top of it), and any {@link #serverRequestedDelay} a
+     * prior 429/503 response's {@code Retry-After} asked for (consumed once, then reset). Called
+     * inside {@link #fetchLock}, so this also serializes with the "one in-flight request" guarantee
+     * -- there is never more than one outstanding call to a rate-limited provider from a single
+     * {@code RoadTileSource} instance.
      */
     private void waitForRateLimit() throws InterruptedException {
-        if (minRequestInterval.isZero()) return;
+        Duration requiredInterval = minRequestInterval.compareTo(serverRequestedDelay) >= 0 ? minRequestInterval : serverRequestedDelay;
+        serverRequestedDelay = Duration.ZERO;
+        if (requiredInterval.isZero()) return;
         Duration sinceLast = Duration.between(lastRequestAt, Instant.now());
-        Duration remaining = minRequestInterval.minus(sinceLast);
+        Duration remaining = requiredInterval.minus(sinceLast);
         if (remaining.isPositive()) {
             Thread.sleep(remaining.toMillis());
         }

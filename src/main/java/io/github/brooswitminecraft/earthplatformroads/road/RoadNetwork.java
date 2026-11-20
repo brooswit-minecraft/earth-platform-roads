@@ -79,17 +79,23 @@ public final class RoadNetwork {
      *   <li>{@code -Dearthplatformroads.previewProvider=overpass-ch} -- without this exact value, no
      *       network fetch ever happens, regardless of the other properties below.</li>
      *   <li>{@code -Dearthplatformroads.previewEndpoint=...} -- required, no default URL.</li>
-     *   <li>{@code -Dearthplatformroads.previewApiKey=...} or the {@code
-     *       EARTHPLATFORMROADS_PREVIEW_API_KEY} environment variable -- the credential, read at
-     *       startup and sent as a request header; never logged, never written into this cache's own
-     *       files, never hardcoded. Absent means no credential header is sent at all (some providers
-     *       may permit a limited anonymous tier; that is this provider's own policy to enforce, not
-     *       this mod's).</li>
+     *   <li>The {@code EARTHPLATFORMROADS_PREVIEW_API_KEY} environment variable -- the credential,
+     *       required (comment 55448: "make missing key disable the live provider rather than issue
+     *       an anonymous request") -- without it, this method returns a network-disabled source even
+     *       if the two properties above are set. Deliberately NOT also readable from a JVM
+     *       {@code -D} system property: those appear in process argument listings (e.g. {@code ps}),
+     *       unlike an environment variable, so there is exactly one way to supply this credential.
+     *       Never logged, never written into this cache's own files, never hardcoded.</li>
      *   <li>{@code -Dearthplatformroads.previewMinRequestIntervalMs=...} -- optional, defaults to
      *       {@value #DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS}ms, a conservative client-side rate
      *       limit appropriate for a free evaluation tier (see {@link RoadTileSource#fetchCell}'s
-     *       single-in-flight-request guarantee, which this rate limit sits on top of).</li>
+     *       single-in-flight-request guarantee, which this rate limit sits on top of, and its own
+     *       {@code Retry-After} handling for 429/503 responses).</li>
      * </ul>
+     * {@link RoadTileSource#CREDENTIAL_BOUND_ENDPOINT} is the ONLY origin+path the credential is
+     * ever attached to, regardless of what {@code previewEndpoint} is configured to -- a
+     * misconfigured property can disable the preview (wrong endpoint, so Overpass.ch itself rejects
+     * the query) but can never cause the credential to be sent elsewhere.
      * This is explicitly a live-data preview, not the pinned/immutable worldwide snapshot the
      * offline SQLite-catalog pilot work is building toward -- the two are separate efforts.
      */
@@ -201,11 +207,17 @@ public final class RoadNetwork {
 
             boolean optedIntoPreview = "overpass-ch".equals(System.getProperty("earthplatformroads.previewProvider"));
             String previewEndpointProperty = System.getProperty("earthplatformroads.previewEndpoint");
-            if (!optedIntoPreview || previewEndpointProperty == null || previewEndpointProperty.isEmpty()) {
+            // Env-var only, deliberately: see this field's own javadoc on RoadTileSource.apiKey for
+            // why a -D system property is never accepted as a credential source here.
+            String apiKey = System.getenv("EARTHPLATFORMROADS_PREVIEW_API_KEY");
+            boolean fullyProvisioned = optedIntoPreview && previewEndpointProperty != null
+                    && !previewEndpointProperty.isEmpty() && apiKey != null && !apiKey.isEmpty();
+            if (!fullyProvisioned) {
+                // Comment 55448: a missing key disables the live provider entirely rather than
+                // issuing an anonymous request -- this is the single gate for that, not a special
+                // case inside RoadTileSource itself.
                 return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
             }
-            String apiKey = System.getProperty("earthplatformroads.previewApiKey",
-                    System.getenv("EARTHPLATFORMROADS_PREVIEW_API_KEY"));
             long minIntervalMs = Long.getLong("earthplatformroads.previewMinRequestIntervalMs", DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS);
             return new RoadTileSource(URI.create(previewEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
                     apiKey, Duration.ofMillis(minIntervalMs));
