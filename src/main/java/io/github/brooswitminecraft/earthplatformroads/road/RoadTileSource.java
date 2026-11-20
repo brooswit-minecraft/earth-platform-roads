@@ -87,6 +87,25 @@ public final class RoadTileSource {
     private volatile Instant nextEligibleRequestAt = Instant.EPOCH;
 
     /**
+     * Cells enqueued for best-effort, rate-limited catch-up fetching -- MINECRAFT-566 comment
+     * 55460: a road continuing as a SECOND, different OSM way ID (sharing only a node with the
+     * first) whose geometry lies entirely in a neighbor cell cannot be found by the read-side
+     * neighbor check ({@code RoadNetwork.candidatesNear}) the way a single crossing way's full
+     * geometry can -- that neighbor genuinely has to be fetched itself at some point. But fetching
+     * a whole Moore neighborhood synchronously (c7428bf, reverted in f9931a4) collides with the
+     * provider's own rate limit. So instead: {@link #enqueueLookahead} enqueues a point's Moore
+     * neighborhood (deduplicated, bounded, skipping anything already cached) and opportunistically
+     * drains AT MOST ONE entry per call -- through the exact same {@link #waysForCell} path, so it
+     * is subject to the exact same one-in-flight guarantee, {@link #nextEligibleRequestAt} deadline,
+     * and three-state (ready/confirmed-empty/pending) cache semantics as every other fetch. A cell
+     * that cannot be dequeued yet (not yet eligible) simply stays queued for a later opportunity --
+     * this never blocks, sleeps, or bursts multiple requests from one call.
+     */
+    private static final int LOOKAHEAD_QUEUE_CAPACITY = 64;
+    private final java.util.Set<Long> queuedCellKeys = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Deque<long[]> lookaheadQueue = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
+    /**
      * The only origin+path this class will ever attach {@link #apiKey} to, regardless of what
      * {@link #endpoint} is configured to -- MINECRAFT-566 comment 55448: "bind credential-bearing
      * requests to the documented https://api.overpass.ch/v1/interpreter origin/path." A
@@ -133,6 +152,27 @@ public final class RoadTileSource {
         this.apiKey = apiKey;
         this.minRequestInterval = minRequestInterval == null ? Duration.ZERO : minRequestInterval;
         this.http = HttpClient.newBuilder().connectTimeout(timeout).followRedirects(HttpClient.Redirect.NEVER).build();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55462: "add nonsecret opt-in diagnostics distinguishing covered by
+     * cached way, pending no match, and skipped by terrain/classification, rather than assuming
+     * readiness alone fixes this occurrence." This is the piece {@link #cachedWaysForCellOrEmpty}
+     * itself cannot answer -- it deliberately returns the same empty list for both a genuinely
+     * confirmed-empty cell and a merely pending one, which is correct for generation (both mean
+     * "no road to draw right now") but useless for diagnosing WHY. No credential or request detail
+     * is ever exposed here, only which of this cell's own three cache states currently applies.
+     */
+    public enum CellState { READY, CONFIRMED_EMPTY, PENDING }
+
+    /** This cell's own cache state on disk, independent of whatever may or may not be in {@link #memory} -- see {@link CellState}. */
+    public CellState cellState(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        String cellId = cellLat + "_" + cellLon;
+        if (Files.isRegularFile(cacheRoot.resolve(cellId + ".json"))) return CellState.READY;
+        if (Files.isRegularFile(cacheRoot.resolve(cellId + ".empty"))) return CellState.CONFIRMED_EMPTY;
+        return CellState.PENDING;
     }
 
     /**
@@ -212,6 +252,44 @@ public final class RoadTileSource {
             memory.put(key, fetched);
             return fetched;
         }
+    }
+
+    /**
+     * Enqueues {@code lat,lon}'s Moore neighborhood (the 8 cells sharing an edge or corner with its
+     * own) for best-effort catch-up fetching, skipping anything already cached or already queued,
+     * then opportunistically attempts to fetch AT MOST ONE queued cell through the ordinary
+     * {@link #waysForCell} path -- same one-in-flight guarantee, same {@link #nextEligibleRequestAt}
+     * deadline, same three-state cache semantics. Never blocks beyond what a single ordinary fetch
+     * attempt already would; never bursts multiple requests. See {@link #lookaheadQueue}'s own
+     * field doc for why this exists (MINECRAFT-566 comment 55460).
+     */
+    public void enqueueLookahead(double lat, double lon) {
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                double neighborLat = lat + dLat * RoadNetwork.CELL_DEGREES;
+                double neighborLon = lon + dLon * RoadNetwork.CELL_DEGREES;
+                long cellLat = (long) Math.floor(neighborLat / RoadNetwork.CELL_DEGREES);
+                long cellLon = (long) Math.floor(neighborLon / RoadNetwork.CELL_DEGREES);
+                long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+                if (memory.containsKey(key) || queuedCellKeys.contains(key)) continue;
+                String cellId = cellLat + "_" + cellLon;
+                if (Files.isRegularFile(cacheRoot.resolve(cellId + ".json")) || Files.isRegularFile(cacheRoot.resolve(cellId + ".empty"))) continue;
+                if (lookaheadQueue.size() >= LOOKAHEAD_QUEUE_CAPACITY) break; // bounded: stop enqueuing more from this one call, not an error
+                if (queuedCellKeys.add(key)) lookaheadQueue.addLast(new long[] {cellLat, cellLon});
+            }
+        }
+
+        long[] next = lookaheadQueue.pollFirst();
+        if (next == null) return;
+        queuedCellKeys.remove((next[0] << 32) ^ (next[1] & 0xFFFFFFFFL));
+        // Cell-center representative point; which exact point within the cell doesn't matter since
+        // waysForCell resolves it back to the same cell boundaries either way.
+        double representativeLat = next[0] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
+        double representativeLon = next[1] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
+        // If not yet rate-limit-eligible, waysForCell declines silently (no marker written, no
+        // exception) -- this cell is no longer queued, but a future enqueueLookahead call for an
+        // overlapping area will see it's still uncached and re-queue it then.
+        waysForCell(representativeLat, representativeLon);
     }
 
     /** Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss, not an error. */

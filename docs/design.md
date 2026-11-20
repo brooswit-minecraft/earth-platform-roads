@@ -215,6 +215,33 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   away from every cell that has ever actually been fetched can still see a transient gap -- the
   neighborhood check only extends as far as what some fetch, anywhere nearby, already happened to
   cover.
+- **A second case the read-side fix cannot carry, found live again (55460): a continuation as a
+  DIFFERENT OSM way ID, sharing only a node, whose own geometry lies entirely in a neighbor cell
+  no query has ever touched.** That neighbor's data was never returned by any fetch at all -- the
+  read-side trick only helps when a single way's geometry already crosses into an already-fetched
+  cell. Fixed by `RoadTileSource.enqueueLookahead`: a bounded (`LOOKAHEAD_QUEUE_CAPACITY`),
+  deduplicated queue of a prepare point's Moore neighborhood, drained at AT MOST one additional
+  fetch per `enqueueLookahead` call -- through the ordinary `waysForCell` path, so it is subject to
+  the same one-in-flight guarantee and rate-limit deadline as every other fetch, never bursting
+  multiple requests the way 55454's original attempt did. `EarthGeneratorPrepareMixin` calls it
+  right after its own synchronous point-cell fetch. Over several prepare calls as a player moves
+  normally, this catches up nearby cells -- including a second way's own cell -- without ever
+  exceeding the provider's rate limit. Confirmed in `RoadTilePrefetchMixinTest
+  .aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls` (two different way IDs
+  sharing a node, a real nonzero rate-limit interval, several real prepare calls over real
+  wall-clock time) and `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior` (per
+  55462's own live, read-only diagnosis: a pre-existing, install-wide-cache neighbor entry from
+  before the fresh test world even started, a multi-segment turning way, a real painted block deep
+  in the still-fully-pending own cell's interior, not just at the seam).
+- **Nonsecret, opt-in diagnostic added (55462): `RoadNetwork.diagnoseColumn`.** Distinguishes
+  `COVERED` / `EXCLUDED_BRIDGE_OR_TUNNEL` / `PENDING_NO_DATA` / `CONFIRMED_EMPTY_NO_ROAD` for one
+  column, backed by a new `RoadTileSource.CellState` (`cellState(lat,lon)`) exposing which of the
+  three on-disk cache states actually applies -- `cachedWaysForCellOrEmpty` alone cannot answer
+  this, since it deliberately returns the same empty list for "confirmed genuinely empty" and
+  "merely still pending." Exposes no credential or request detail, only which state applies.
+  Does NOT cover a mixin-level terrain skip (e.g. "under water") -- that check lives in
+  `EarthGeneratorRoadMixin`, not here. Confirmed in `RoadTilePrefetchMixinTest
+  .diagnoseColumnDistinguishesAllFourCauses` (one generator, four real cells, one cause each).
 - **Not attempted this pass, named explicitly as still-open:** separate readiness handling for
   Chunky pre-generation specifically (`ServerCubeWorld.pregenerate`/`ChunkyCompat.pregenerate` call
   `generate()` directly, off the travel/teleport path `prepareNear` covers); a real multi-way

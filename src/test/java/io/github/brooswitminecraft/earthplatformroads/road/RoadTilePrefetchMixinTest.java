@@ -97,19 +97,22 @@ class RoadTilePrefetchMixinTest {
             assertEquals(0, requests.get());
 
             // Earth Platform's own "fetch ahead of generation" entry point; the mixin taps it.
-            // This mixin fetches only the point's own cell (comment 55456: a 9-cell version was
-            // tried and found to interact badly with the provider's own rate limit -- see
-            // EarthGeneratorPrepareMixin's own class doc). The boundary-seam fix lives on the read
-            // side instead (RoadNetwork.candidatesNear), exercised by this class's other tests.
+            // This mixin fetches the point's own cell synchronously (comment 55456: a 9-cell
+            // version was tried and found to interact badly with the provider's own rate limit --
+            // see EarthGeneratorPrepareMixin's own class doc), then opportunistically fetches AT
+            // MOST ONE additional cell from its bounded lookahead queue (comment 55460) -- which
+            // this zero-interval test source makes immediately eligible too, hence 2 total requests
+            // here, not 1. (The boundary-seam-for-a-single-crossing-way fix itself lives on the read
+            // side, RoadNetwork.candidatesNear, exercised by this class's other tests.)
             generator.prepareNear(block[0], block[1]);
-            assertEquals(1, requests.get(), "Expected prepareNear to trigger exactly one road-tile fetch for this point's cell");
+            assertEquals(2, requests.get(), "Expected the point's own cell plus one opportunistic lookahead-queue fetch");
 
             // Now a cache-only lookup (what the hot surface() generation path actually uses) must
             // find the prefetched way, with no additional network request.
             var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), block[0], block[1]);
             assertTrue(covering != null && covering.wayId() == 555002L,
                     "Expected the prefetched way to be found by a cache-only lookup after prepareNear");
-            assertEquals(1, requests.get(), "The cache-only lookup after prepareNear must not trigger any further fetch");
+            assertEquals(2, requests.get(), "The cache-only lookup after prepareNear must not trigger any further fetch");
         } finally {
             stub.stop(0);
         }
@@ -283,5 +286,172 @@ class RoadTilePrefetchMixinTest {
         } finally {
             stub.stop(0);
         }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55462: his own read-only check of the real Zippy occurrence found the
+     * one ready neighbor cell actually PREDATED the fresh test world by ~44 minutes (an old,
+     * install-wide cache entry from an earlier session, not something fetched live), the player's
+     * own tile genuinely pending, and the visible gap extending well into the own tile's interior
+     * (~80 blocks), not just at the exact seam. He asked for exactly this shape of evidence instead
+     * of only a seam-center sample: a PRE-WARMED (written to disk before anything in this test
+     * runs, like a real leftover from an earlier session) neighbor cell containing a real
+     * multi-segment, TURNING way (not a simple 2-point line) that bends after crossing into the
+     * never-fetched "own" cell and continues deep into its interior. The own cell is never fetched
+     * at all in this test -- no prepareNear call for it, matching "the own tile was still pending."
+     */
+    @Test
+    void aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Neighbor cell 4004_-10530 (lat in [40.04,40.05)) gets a pre-warmed ready file, written
+        // directly to disk -- simulating a stale, pre-existing cache entry, never fetched by this
+        // test. Its way bends at (40.052,-105.2945), just after crossing into the "own" cell
+        // 4005_-10530 (lat in [40.05,40.06)), and continues to (40.058,-105.293) -- deep in that
+        // cell's interior, not at the seam.
+        java.nio.file.Files.createDirectories(roadCache);
+        String preWarmedNeighborJson = """
+                {"schema_version":1,"region_id":"pre-warmed","ways":[{"way_id":555023,
+                  "way_tags":{"highway":"secondary","name":"Turning Interior Street"},
+                  "centerline":[{"lat":40.042,"lon":-105.295},{"lat":40.052,"lon":-105.2945},{"lat":40.058,"lon":-105.293}],
+                  "node_ids":[1,2,3],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(roadCache.resolve("4004_-10530.json"), preWarmedNeighborJson);
+
+        // No HTTP stub needed at all -- this test proves the read-side neighbor check works purely
+        // from a pre-existing cache file, with the own cell never fetched (allowNetwork is
+        // irrelevant here since waysForCell for the own cell is simply never called).
+        RoadTileSource tileSource = new RoadTileSource(
+                URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+        // Confirm the own cell is genuinely pending, matching "the own tile was still pending" --
+        // not confirmed-empty, not ready.
+        assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(40.058, -105.293),
+                "Expected the own cell to be genuinely pending -- never fetched in this test");
+
+        // A column well into the interior of the own cell (not at the seam) on the bent segment.
+        int[] interiorColumn = generator.block(40.056, -105.2935);
+        var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), interiorColumn[0], interiorColumn[1]);
+        assertTrue(covering != null && covering.wayId() == 555023L,
+                "Expected the pre-warmed neighbor's turning way to be found deep in the never-fetched cell's interior. Got " + covering);
+
+        int groundY = generator.surfaceY(interiorColumn[0], interiorColumn[1]);
+        var section = generator.generate(interiorColumn[0] >> 4, groundY >> 4, interiorColumn[1] >> 4);
+        var state = section.getBlockState(interiorColumn[0] & 15, groundY & 15, interiorColumn[1] & 15);
+        assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                "Expected real generation to paint road surface deep in the interior, got " + state);
+    }
+
+    /**
+     * MINECRAFT-566 comment 55460's genuinely different case: a road continuing as a SECOND OSM
+     * way ID, sharing only a node with the first, whose own geometry lies entirely in a neighbor
+     * cell the first cell's own bbox query never touched -- the read-side trick above cannot carry
+     * this, since the second way's data was never returned by any fetch yet. Proves {@code
+     * RoadTileSource.enqueueLookahead} (via the real mixin, several simulated prepare calls, the
+     * real production-order rate limit -- never zeroed, never slept around) eventually reaches the
+     * second way's own cell and finds it, without ever bursting more than one request per call.
+     */
+    @Test
+    void aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Way A lives entirely in cell 4100_-10630 (lat in [41.00,41.01)); way B, a DIFFERENT OSM
+        // way ID sharing only node 2 with A, lives entirely in the neighbor cell 4101_-10630 (lat
+        // in [41.01,41.02)) -- a real Overpass bbox query for cell A's area would never return B at
+        // all, since B's geometry never touches A's bbox.
+        String responseA = """
+                {"elements":[{"type":"way","id":555024,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Successor Street A"},
+                  "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0095,"lon":-106.295}]}]}
+                """;
+        String responseB = """
+                {"elements":[{"type":"way","id":555025,"nodes":[2,3],
+                  "tags":{"highway":"secondary","name":"Successor Street B"},
+                  "geometry":[{"lat":41.0105,"lon":-106.295},{"lat":41.016,"lon":-106.295}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            int n = requests.incrementAndGet();
+            // First real fetch answers for cell A (the point's own cell on the first prepare call);
+            // every fetch after that is the lookahead queue catching up neighbors, eventually B's.
+            byte[] body = (n == 1 ? responseA : responseB).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            // A short, real (nonzero) interval, so several simulated prepare calls (each advancing
+            // real wall-clock time briefly) legitimately become eligible one at a time -- not the
+            // zero-interval constructor, and no Thread.sleep used to fake out a real rate limit.
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofMillis(50));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] ownBlock = generator.block(41.006, -106.295); // cell 4100_-10630, on way A
+
+            // Several real prepare calls, as a player's ordinary travel would trigger repeatedly --
+            // each one's own-cell fetch plus at most one opportunistic lookahead fetch.
+            for (int i = 0; i < 6; i++) {
+                generator.prepareNear(ownBlock[0], ownBlock[1]);
+                Thread.sleep(60); // real wall-clock gap between calls, comfortably past the 50ms interval
+            }
+            assertTrue(requests.get() >= 2, "Expected more than just way A's own single fetch across several prepare calls -- got " + requests.get());
+
+            int[] successorColumn = generator.block(41.013, -106.295); // cell 4101_-10630, on way B, never the "own" point
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), successorColumn[0], successorColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555025L,
+                    "Expected the successor way B to be found in its own cell after the lookahead queue caught up. Got " + covering);
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55462's diagnostic request: {@code RoadNetwork.diagnoseColumn} must
+     * distinguish all four causes, not just whether a road renders. One generator, four real
+     * columns, four real cells, one each.
+     */
+    @Test
+    void diagnoseColumnDistinguishesAllFourCauses(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+
+        // Cell 4200_-10730 (covered): a real, ready, non-bridge way.
+        java.nio.file.Files.writeString(roadCache.resolve("4200_-10730.json"), """
+                {"schema_version":1,"region_id":"covered","ways":[{"way_id":555026,
+                  "way_tags":{"highway":"secondary","name":"Covered Street"},
+                  "centerline":[{"lat":42.004,"lon":-107.295},{"lat":42.006,"lon":-107.295}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+        // Cell 4201_-10730 (bridge-excluded): a real, ready way, but tagged bridge=true.
+        java.nio.file.Files.writeString(roadCache.resolve("4201_-10730.json"), """
+                {"schema_version":1,"region_id":"bridge","ways":[{"way_id":555027,
+                  "way_tags":{"highway":"secondary","name":"Bridge Street"},
+                  "centerline":[{"lat":42.014,"lon":-107.295},{"lat":42.016,"lon":-107.295}],
+                  "node_ids":[3,4],"bridge":true,"tunnel":false}]}
+                """);
+        // Cell 4203_-10730 (confirmed empty): a real, ready-but-empty marker.
+        java.nio.file.Files.writeString(roadCache.resolve("4203_-10730.empty"), "");
+        // Cell 4202_-10730 (pending): no marker file at all -- never fetched.
+
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        var grid = generator.grid();
+
+        int[] coveredColumn = generator.block(42.005, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.COVERED, RoadNetwork.diagnoseColumn(grid, coveredColumn[0], coveredColumn[1]));
+
+        int[] bridgeColumn = generator.block(42.015, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.EXCLUDED_BRIDGE_OR_TUNNEL, RoadNetwork.diagnoseColumn(grid, bridgeColumn[0], bridgeColumn[1]));
+
+        int[] pendingColumn = generator.block(42.025, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.PENDING_NO_DATA, RoadNetwork.diagnoseColumn(grid, pendingColumn[0], pendingColumn[1]));
+
+        int[] confirmedEmptyColumn = generator.block(42.035, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD, RoadNetwork.diagnoseColumn(grid, confirmedEmptyColumn[0], confirmedEmptyColumn[1]));
     }
 }

@@ -262,6 +262,46 @@ public final class RoadNetwork {
         return null;
     }
 
+    /**
+     * MINECRAFT-566 comment 55462's requested diagnostic: WHY does this column have no road
+     * surface, distinguishing causes {@link #segmentCoveringColumn}/{@link #coversColumn} alone
+     * cannot -- "rather than assuming readiness alone fixes this occurrence." Nonsecret: exposes
+     * only which case applies, never a request detail or credential. Does not cover a mixin-level
+     * terrain skip (e.g. "under water") -- that check lives in {@code EarthGeneratorRoadMixin}, not
+     * here; a caller can check the real surface height against the water level itself alongside
+     * this diagnosis.
+     */
+    public enum ColumnDiagnosis {
+        /** A real, non-bridge/tunnel mapped way covers this column -- it should render. */
+        COVERED,
+        /** A mapped way covers this column, but it's a bridge or tunnel -- deliberately excluded (see {@link #excludedBridgesAndTunnels()}). */
+        EXCLUDED_BRIDGE_OR_TUNNEL,
+        /** No segment covers this column, and this column's own cell has never been successfully fetched (or no live source is configured to ask). */
+        PENDING_NO_DATA,
+        /** No segment covers this column, and this column's own cell WAS fetched and genuinely has no mapped road here. */
+        CONFIRMED_EMPTY_NO_ROAD,
+    }
+
+    public static ColumnDiagnosis diagnoseColumn(MercatorGrid grid, int x, int z) {
+        GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
+        boolean anyBridgeOrTunnelCovers = false;
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+            if (segment.coversColumn(grid, x, z)) {
+                if (segment.bridge() || segment.tunnel()) {
+                    anyBridgeOrTunnelCovers = true;
+                    continue;
+                }
+                return ColumnDiagnosis.COVERED;
+            }
+        }
+        if (anyBridgeOrTunnelCovers) return ColumnDiagnosis.EXCLUDED_BRIDGE_OR_TUNNEL;
+        RoadTileSource tiles = tileSource();
+        if (tiles == null) return ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD; // preloaded-only network; nothing found there genuinely means nothing mapped
+        return tiles.cellState(here.latitude(), here.longitude()) == RoadTileSource.CellState.PENDING
+                ? ColumnDiagnosis.PENDING_NO_DATA
+                : ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD;
+    }
+
     /** Every mapped way this mod deliberately does not render a surface for, because it is a bridge or tunnel. */
     public static List<RoadSegment> excludedBridgesAndTunnels() {
         List<RoadSegment> excluded = new ArrayList<>();

@@ -40,15 +40,28 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * multi-second {@code previewMinRequestIntervalMs}, only the first of those 9 calls could actually
  * succeed before {@code RoadTileSource}'s next-eligible deadline rejected the rest -- a problem the
  * original regression test missed entirely by using the zero-interval constructor, never
- * exercising that deadline. So this mixin stays at its original single-cell prefetch (below); the
- * real fix is on the READ side instead: {@code RoadNetwork.candidatesNear} now also checks the
- * Moore neighborhood's cached data (read-only, no fetch) when evaluating a column, since a live
- * provider's bbox response for one cell already carries the FULL geometry of any way merely
- * touching that cell -- including the portion extending into a neighbor -- so the neighbor's own
- * fetch was never actually required to carry the seam. See {@code RoadNetwork.candidatesNear}'s own
- * doc for the full reasoning, and {@code RoadTilePrefetchMixinTest
- * #theWidenedPrefetchFetchesTheNeighborSoACrossingRoadIsNotOmitted} (updated to exercise the
- * read-side fix at a realistic, nonzero request interval) for the regression.
+ * exercising that deadline. The real fix for a SINGLE way crossing a boundary is on the READ side
+ * instead: {@code RoadNetwork.candidatesNear} also checks the Moore neighborhood's cached data
+ * (read-only, no fetch) when evaluating a column, since a live provider's bbox response for one
+ * cell already carries the FULL geometry of any way merely touching that cell -- including the
+ * portion extending into a neighbor.
+ *
+ * <h2>A second way, sharing only a node, is a genuinely different case (55460)</h2>
+ * A road continuing as a SECOND, different OSM way ID (common in real OSM data -- a street
+ * changing classification or just split for editing reasons) whose own geometry lies entirely in a
+ * neighbor cell cannot be carried by the read-side trick: that neighbor's data was never returned
+ * by any query, because the first cell's bbox never touched the second way's geometry at all. That
+ * neighbor genuinely has to be fetched. So this mixin now ALSO calls {@code
+ * RoadTileSource#enqueueLookahead} after its own synchronous point-cell fetch: a bounded,
+ * deduplicated queue of the point's Moore neighborhood, drained at AT MOST one additional fetch per
+ * prepare call (never a burst, never blocking beyond one ordinary fetch attempt, subject to the
+ * exact same one-in-flight guarantee and rate-limit deadline as every other fetch). Over several
+ * prepare calls as a player moves normally, this catches up nearby cells -- including a second
+ * way's own cell -- without ever exceeding the provider's rate limit. See {@code
+ * RoadTileSource#lookaheadQueue}'s own field doc for the full design, and {@code
+ * RoadTilePrefetchMixinTest#aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls}
+ * for the regression (two different way IDs sharing a node, the second's own cell reached only
+ * through the lookahead queue, over several simulated prepare calls).
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorPrepareMixin {
@@ -68,5 +81,6 @@ public abstract class EarthGeneratorPrepareMixin {
         EarthGenerator self = (EarthGenerator) (Object) this;
         GeoPoint point = self.grid().geographic(x, z);
         tiles.waysForCell(point.latitude(), point.longitude());
+        tiles.enqueueLookahead(point.latitude(), point.longitude());
     }
 }

@@ -46,6 +46,18 @@ bump: minor
   way's full geometry is already present in whichever single cell actually got fetched. Only helps
   a fresh (not yet generated) cube's read -- an already-generated cube is never retrofitted when a
   neighbor's data arrives later.
+- A second, related omission: a road continuing as a DIFFERENT OSM way ID (sharing only a node)
+  whose own geometry lies entirely in a neighbor cell no query ever touched -- the read-side fix
+  above cannot carry that, since the neighbor's data was never fetched by anyone. Fixed by
+  `RoadTileSource.enqueueLookahead`: a bounded, deduplicated queue of a prepare point's Moore
+  neighborhood, drained at most one additional fetch per call, through the ordinary rate-limited
+  fetch path -- never bursting multiple requests. Catches up nearby cells over several prepare
+  calls as a player moves normally.
+
+### Added
+- `RoadNetwork.diagnoseColumn`: a nonsecret, opt-in diagnostic distinguishing why a column has no
+  road surface (covered/excluded-as-bridge-or-tunnel/pending/confirmed-empty), backed by a new
+  `RoadTileSource.CellState` exposing a cell's actual on-disk cache state.
 
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
