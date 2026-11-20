@@ -36,9 +36,17 @@ bump: minor
 - Bridges/tunnels are modeled and explicitly skipped (no surface drawn, never an at-grade crossing
   along a riverbed); correct rendering is deferred to a following milestone.
 
+### Fixed
+- A mapped road crossing into a neighboring, not-yet-fetched cell was silently omitted at that
+  boundary (found live on Zippy, reproduced synthetically). `EarthGeneratorPrepareMixin` now
+  prefetches the full Moore neighborhood (8 surrounding cells) around every prepare call, not just
+  the point's own cell. Only helps fresh (not yet generated) cubes -- an already-generated cube is
+  never retrofitted when a neighbor's data arrives later.
+
 ### Known gaps
-- `EarthGeneratorPrepareMixin` prefetches only the single cell a point falls in, not a
-  multi-kilometre reach matching Earth Platform's own `prepareNear`.
+- `EarthGeneratorPrepareMixin`'s widened prefetch is still one ring of cells, narrower than Earth
+  Platform's own multi-kilometre `NEAR_REACH` -- a column two or more cells away from the original
+  prepare point can still see a transient gap.
 - Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport path
   `prepareNear` covers) has no dedicated readiness handling yet.
 - `RoadNetwork.segments()`/`junctions()`/`excludedBridgesAndTunnels()` only scan the preloaded

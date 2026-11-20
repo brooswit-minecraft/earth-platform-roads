@@ -27,15 +27,38 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * whatever thread calls it, which may be the main server thread), never blocks on HTTP regardless
  * of whether this mixin has run for that area yet.
  *
- * <p><b>Known simplification</b>: Earth Platform's own {@code prepare}/{@code prepareNear} fetch a
- * reach scaled to several kilometres, across multiple zoom levels, because elevation/climate tiles
- * each cover a large area. This mixin only prefetches the single {@value
+ * <h2>Boundary gap, found live and fixed here (MINECRAFT-566 comment 55454)</h2>
+ * This mixin originally prefetched only the single cell the point itself falls in. {@code
+ * RoadNetwork.candidatesNear} only ever checks a column's OWN cell's cache, never a neighbor's --
+ * so a mapped way whose geometry crosses from an already-fetched cell into an adjacent, still-
+ * pending one was silently omitted at exactly that boundary: not a missing OSM way, not a designed
+ * bridge/tunnel omission, just a cell that genuinely had not been fetched yet. Observed live on
+ * Zippy (a road abruptly ending on bare ground at a tile seam) and reproduced synthetically in
+ * {@code RoadTilePrefetchMixinTest#aCrossingRoadIsSilentlyOmittedAtAnUnfetchedNeighborsBoundary}
+ * (direct {@code RoadTileSource.waysForCell} calls, bypassing this mixin, to exercise exactly the
+ * old narrow behavior). Fixed by widening {@link #prefetch} to also prefetch the full Moore
+ * neighborhood (the 8 surrounding cells, not just the point's own) around every prepare call --
+ * confirmed in {@code RoadTilePrefetchMixinTest#theWidenedPrefetchFetchesTheNeighborSoACrossingRoadIsNotOmitted}.
+ *
+ * <p><b>This only helps a FRESH (not yet generated) cube.</b> The widened prefetch runs at
+ * Earth Platform's own prepare-ahead-of-generation entry points, before a column's blocks are ever
+ * placed -- so for a cube generated AFTER this fix, both cells it could possibly need are already
+ * fetched by the time generation reads them. It does nothing for a cube generated BEFORE this fix
+ * landed, or one generated while a neighbor's fetch was still failing/pending for some other reason
+ * (a genuine network outage, say): once a column's blocks exist, this mod has no retrofit
+ * mechanism -- a later-arriving tile does not retroactively repair an already-generated cube. That
+ * is a distinct, harder problem (safely revising existing world data, not just prefetching further
+ * ahead) and is not attempted here; comment 55454 explicitly separates it from this fix and does
+ * not ask for it.
+ *
+ * <p><b>Still a known simplification, narrower than before but not eliminated</b>: Earth Platform's
+ * own {@code prepare}/{@code prepareNear} fetch a reach scaled to several kilometres, across
+ * multiple zoom levels. The Moore neighborhood here is still only {@value
  * io.github.brooswitminecraft.earthplatformroads.road.RoadNetwork#CELL_DEGREES}-degree (~1.1 km)
- * road-data cell the point itself falls in, not a matching multi-kilometre reach -- a column near
- * the edge of a freshly-prepared area, or one a fast-moving player reaches before this cell's own
- * fetch completes, can still see a transient gap on first visit. Widening this to prefetch
- * neighboring cells too (matching {@code prepareNear}'s own ~3.5 km {@code NEAR_REACH}) is a
- * reasonable next step, not done here.
+ * cells one deep -- a column two or more cells away from the original prepare point, or one a very
+ * fast-moving player reaches before even the widened prefetch completes, can still see a transient
+ * gap on first visit. Matching {@code prepareNear}'s own ~3.5 km {@code NEAR_REACH} exactly would
+ * need a wider ring than this; not attempted here.
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorPrepareMixin {
@@ -49,11 +72,23 @@ public abstract class EarthGeneratorPrepareMixin {
         prefetch(x, z);
     }
 
+    /**
+     * Prefetches the point's own road-data cell AND its full Moore neighborhood (the 8 cells
+     * sharing an edge or corner with it) -- see this class's own doc for why: a column can sit in
+     * any of those 9 cells by the time generation actually reaches it, and a mapped way crossing
+     * between any two of them must not be silently omitted just because only the center cell was
+     * fetched.
+     */
     private void prefetch(int x, int z) {
         var tiles = RoadNetwork.liveTileSourceForPrefetch();
         if (tiles == null) return;
         EarthGenerator self = (EarthGenerator) (Object) this;
         GeoPoint point = self.grid().geographic(x, z);
-        tiles.waysForCell(point.latitude(), point.longitude());
+        double cellDegrees = RoadNetwork.CELL_DEGREES;
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                tiles.waysForCell(point.latitude() + dLat * cellDegrees, point.longitude() + dLon * cellDegrees);
+            }
+        }
     }
 }

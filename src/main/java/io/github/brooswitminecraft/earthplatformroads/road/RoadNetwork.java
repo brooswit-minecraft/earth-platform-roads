@@ -58,7 +58,7 @@ public final class RoadNetwork {
     /** Grid cell size for the spatial index: small enough that a cell's way list stays short, large
      *  enough that even a six-lane way's half-width never crosses more than one extra cell of margin.
      *  Package-visible: {@link RoadTileSource} fetches and caches at this exact same cell granularity. */
-    static final double CELL_DEGREES = 0.01;
+    public static final double CELL_DEGREES = 0.01;
 
     /** Test-only override for the live tile source {@link #candidatesNear} also checks; {@code null} means "use the default production wiring". */
     private static volatile RoadTileSource tileSourceOverride;
