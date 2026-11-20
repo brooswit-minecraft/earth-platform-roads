@@ -1,5 +1,7 @@
 package io.github.brooswitminecraft.earthplatformroads.road;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import io.earthplatform.geography.GeoPoint;
 import io.earthplatform.geography.globe.MercatorGrid;
 import java.util.List;
@@ -102,6 +104,40 @@ public record RoadSegment(
             }
         }
         return false;
+    }
+
+    /** This way as the JSON object the versioned region/tile format uses, round-tripping through {@link RoadNetwork#parseWay}. */
+    JsonObject toWayJson() {
+        JsonObject json = new JsonObject();
+        json.addProperty("way_id", wayId);
+        JsonObject tags = new JsonObject();
+        tags.addProperty("highway", roadClass.name().toLowerCase(java.util.Locale.ROOT));
+        tags.addProperty("name", name);
+        json.add("way_tags", tags);
+        JsonArray centerlineJson = new JsonArray();
+        for (GeoPoint point : centerline) {
+            JsonObject p = new JsonObject();
+            p.addProperty("lat", point.latitude());
+            p.addProperty("lon", point.longitude());
+            centerlineJson.add(p);
+        }
+        json.add("centerline", centerlineJson);
+        if (nodeIds.length > 0) {
+            JsonArray nodeIdsJson = new JsonArray();
+            for (long id : nodeIds) nodeIdsJson.add(id);
+            json.add("node_ids", nodeIdsJson);
+        }
+        json.addProperty("bridge", bridge);
+        json.addProperty("tunnel", tunnel);
+        json.addProperty("layer", layer);
+        return json;
+    }
+
+    /** Every segment in {@code ways}, as the {@code "ways"} JSON array a region/tile file stores. */
+    static JsonArray toWaysJsonArray(List<RoadSegment> ways) {
+        JsonArray array = new JsonArray();
+        for (RoadSegment way : ways) array.add(way.toWayJson());
+        return array;
     }
 
     public static List<Long> sharedNodeIds(RoadSegment a, RoadSegment b) {

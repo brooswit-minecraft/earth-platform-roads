@@ -54,8 +54,12 @@ public final class RoadNetwork {
     private static volatile Path externalRegionsDirectoryOverride;
 
     /** Grid cell size for the spatial index: small enough that a cell's way list stays short, large
-     *  enough that even a six-lane way's half-width never crosses more than one extra cell of margin. */
-    private static final double CELL_DEGREES = 0.01;
+     *  enough that even a six-lane way's half-width never crosses more than one extra cell of margin.
+     *  Package-visible: {@link RoadTileSource} fetches and caches at this exact same cell granularity. */
+    static final double CELL_DEGREES = 0.01;
+
+    /** Test-only override for the live tile source {@link #candidatesNear} also checks; {@code null} means "none configured". */
+    private static volatile RoadTileSource tileSourceOverride;
 
     private static volatile RoadNetwork instance;
 
@@ -88,6 +92,31 @@ public final class RoadNetwork {
             externalRegionsDirectoryOverride = externalRegionsDirectoryForTests;
             instance = null;
         }
+    }
+
+    /** Test-only: install (or clear, with {@code null}) the live {@link RoadTileSource} this network's lookups also consult. */
+    static void setTileSourceForTests(RoadTileSource tileSource) {
+        tileSourceOverride = tileSource;
+    }
+
+    /**
+     * The live tile source {@link #candidatesNear} also checks, alongside the bundled/external
+     * regions preloaded into {@link #cellIndex}: {@code null} (the default outside a configured
+     * install) means no live tile source is active and lookups are bundled+external only.
+     */
+    private static RoadTileSource tileSource() {
+        return tileSourceOverride;
+    }
+
+    /**
+     * Public so {@code EarthGeneratorPrepareMixin} (a different package) can trigger a prefetch for
+     * a point ahead of generation; {@code null} when no live tile source is configured, in which
+     * case the mixin does nothing. This is the ONLY sanctioned way to obtain a reference that can
+     * call {@link RoadTileSource#waysForCell} (the fetching method) -- {@link #candidatesNear}
+     * itself only ever calls the non-fetching {@link RoadTileSource#cachedWaysForCellOrEmpty}.
+     */
+    public static RoadTileSource liveTileSourceForPrefetch() {
+        return tileSource();
     }
 
     /** Every mapped way across every installed region. */
@@ -138,9 +167,23 @@ public final class RoadNetwork {
 
     public record Junction(RoadSegment a, RoadSegment b, List<Long> sharedNodeIds) {}
 
+    /**
+     * Candidates from the preloaded bundled+external index, plus (if a live tile source is
+     * configured) whatever is already cached on disk for this cell -- a read-only cache check, never
+     * a network fetch; see {@link RoadTileSource#cachedWaysForCellOrEmpty} and the class doc there
+     * for why {@link io.github.brooswitminecraft.earthplatformroads.mixin.EarthGeneratorPrepareMixin},
+     * not this lookup, is the only place that may ever fetch.
+     */
     private static List<RoadSegment> candidatesNear(double lat, double lon) {
-        List<RoadSegment> found = instance().cellIndex.get(cellKey(lat, lon));
-        return found == null ? List.of() : found;
+        List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
+        RoadTileSource tiles = tileSource();
+        if (tiles == null) return preloaded == null ? List.of() : preloaded;
+        List<RoadSegment> fromTiles = tiles.cachedWaysForCellOrEmpty(lat, lon);
+        if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
+        if (preloaded == null || preloaded.isEmpty()) return fromTiles;
+        List<RoadSegment> merged = new ArrayList<>(preloaded);
+        merged.addAll(fromTiles);
+        return merged;
     }
 
     private static long cellKey(double lat, double lon) {
@@ -238,7 +281,8 @@ public final class RoadNetwork {
         return all;
     }
 
-    private static List<RoadSegment> parseRegionWays(JsonObject root, String source) {
+    /** Package-visible so {@link RoadTileSource} can parse a cached tile file through the exact same code. */
+    static List<RoadSegment> parseRegionWays(JsonObject root, String source) {
         checkSchemaVersion(root, source);
         List<RoadSegment> ways = new ArrayList<>();
         for (JsonElement wayElement : root.getAsJsonArray("ways")) {

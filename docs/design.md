@@ -106,11 +106,52 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   `RoadNetwork.externalRegionsDirectory()` -- by default `config/earthplatformroads/roads/regions/`
   in the real game install, a real directory needing no index file. Every region, either source,
   must declare a `schema_version` matching `RoadNetwork.SUPPORTED_SCHEMA_VERSION` or loading fails
-  loudly (`RoadNetwork.checkSchemaVersion`). This is MINECRAFT-566's milestone update taken
-  literally: John wants mapped coverage to appear "wherever he travels" by installing data, not by
-  this mod shipping an ever-bigger bundled extract -- see `RoadNetworkExternalRegionTest`, which
-  proves a genuinely unbundled destination (a region file that exists nowhere in this mod's jar)
-  loads through the exact same pipeline, alongside bundled Yosemite, with no Java change.
+  loudly (`RoadNetwork.checkSchemaVersion`). See `RoadNetworkExternalRegionTest`, which proves a
+  genuinely unbundled destination (a region file that exists nowhere in this mod's jar) loads
+  through the exact same pipeline, alongside bundled Yosemite, with no Java change.
+- **Automatic, live road-tile fetch -- `RoadTileSource`.** Review correctly rejected the two sources
+  above as the actual milestone deliverable: they both still require a player or operator to find
+  and install a region file for a destination ahead of time, not coverage that "appears
+  automatically wherever he travels." `RoadTileSource` fetches a destination's own
+  `RoadNetwork.CELL_DEGREES`-degree cell from a live Overpass-compatible endpoint the first time it
+  is needed and caches it to disk, modeled directly on
+  `io.earthplatform.geography.globe.TerrariumTileSource` -- the pattern Earth Platform's own
+  dependency already uses for this exact generation-time constraint. Three cache states
+  (`RoadTileSource`'s own class doc has the full reasoning): **ready** (fetched, cached, read every
+  time after -- this is what "pins" a world's road data to whatever it actually fetched), **confirmed
+  empty** (fetched, genuinely zero ways there -- stays empty, not re-fetched forever), and
+  **pending** (never fetched successfully -- a network failure leaves it here deliberately, so an
+  outage can never be permanently baked in as a roadless gap; the very next access, including after
+  a server restart reading the same cache root, retries).
+- **Where fetching happens, and where it never does.** `EarthGeneratorPrepareMixin` hooks Earth
+  Platform's own documented "fetching data ahead of generation" entry points,
+  `EarthGenerator.prepare`/`.prepareNear` (see that class's own "Reading this file" section) --
+  called off-thread already by Earth Platform itself (`/earth travel`'s command handler wraps its
+  call in `CompletableFuture.supplyAsync`; `ChunkyCompat` calls `prepare` once per pre-generation
+  cell) specifically so synchronous generation never waits on the network. This mixin does the same
+  for road data: it blocks (safely, in those same already-async contexts) on `RoadTileSource
+  .waysForCell` for the point's cell. `EarthGeneratorRoadMixin`'s `surface()` hook, by contrast,
+  never fetches -- `RoadNetwork.candidatesNear` only ever calls the read-only
+  `RoadTileSource.cachedWaysForCellOrEmpty`, so the hot generation path, including Earth Platform's
+  `loadNow` (explicitly synchronous on whatever thread calls it, possibly the main server thread per
+  its own doc comment), never blocks on HTTP. Verified end-to-end against a local HTTP stub (never
+  the real, demonstrably flaky public Overpass) in `RoadTileSourceTest` (fetch/cache/pending-retry/
+  confirmed-empty, each independently) and `RoadTilePrefetchMixinTest` (calling the real
+  `EarthGenerator.prepareNear` through the real mixin populates the cache; a subsequent
+  `RoadNetwork` lookup finds it with zero further fetches).
+- **Known simplification, named in `EarthGeneratorPrepareMixin`'s own class doc:** this mixin only
+  prefetches the single cell a point falls in, not a multi-kilometre reach matching Earth
+  Platform's own `prepareNear`/`NEAR_REACH` -- a column right at the edge of a freshly-prepared
+  area, or one a very fast-moving player reaches before that one fetch completes, can still see a
+  transient first-visit gap. Widening the prefetch to neighboring cells is a reasonable next step,
+  not done here.
+- **Not attempted this pass, named explicitly as still-open:** separate readiness handling for
+  Chunky pre-generation specifically (`ServerCubeWorld.pregenerate`/`ChunkyCompat.pregenerate` call
+  `generate()` directly, off the travel/teleport path `prepareNear` covers); a real multi-way
+  Yosemite extract plus a real distant-site extract with full source-vs-generated accounting
+  (class counts, connected intersections, tile boundary, documented omissions); and any
+  disposable-profile in-game visual/collision/seam demonstration, which requires an actual running
+  Minecraft client this agent's environment does not have.
 - **Junctions.** Two ways sharing a real OSM node ID are a mapped junction
   (`RoadSegment.sharesJunctionWith`, `RoadNetwork.junctions()`); crossing geometry without a shared
   node is deliberately not reported as one.
