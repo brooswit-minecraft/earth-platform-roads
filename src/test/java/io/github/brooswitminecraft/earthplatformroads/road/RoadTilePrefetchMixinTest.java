@@ -345,69 +345,128 @@ class RoadTilePrefetchMixinTest {
     }
 
     /**
-     * MINECRAFT-566 comment 55460's genuinely different case: a road continuing as a SECOND OSM
-     * way ID, sharing only a node with the first, whose own geometry lies entirely in a neighbor
-     * cell the first cell's own bbox query never touched -- the read-side trick above cannot carry
-     * this, since the second way's data was never returned by any fetch yet. Proves {@code
-     * RoadTileSource.enqueueLookahead} (via the real mixin, several simulated prepare calls, the
-     * real production-order rate limit -- never zeroed, never slept around) eventually reaches the
-     * second way's own cell and finds it, without ever bursting more than one request per call.
+     * MINECRAFT-566 comment 55464's correction to the previous version of this test: that stub
+     * ignored the actual bbox and answered by request COUNT alone (A for #1, B for every later
+     * request), so a request to the WRONG neighbor cell would still receive way B's data and the
+     * read-side neighbor scan could pass for the wrong reason -- never actually proving the
+     * lookahead queue reached cell B specifically. It also gave the shared node (id 2) two
+     * different coordinates across A's and B's geometry, which is not how OSM data works (a shared
+     * node is the same physical point everywhere it's referenced).
+     *
+     * <p>This version dispatches by the REAL bbox parsed out of each POST body: cell A's bbox gets
+     * way A alone; cell B's bbox gets BOTH A and B (A's own endpoint -- the shared node -- sits
+     * just inside B, so a real Overpass-protocol query for B's bbox would legitimately return A
+     * too, since A touches that bbox); every other cell's bbox gets a genuinely empty result. The
+     * shared node (id 2) has the exact same coordinate in both ways' geometry. Explicitly asserts a
+     * POST was made matching cell B's own bbox and that cell B ends up {@code READY} under that
+     * exact key -- not just that the read-side scan happened to find the way somewhere nearby.
+     * Uses MOVING prepare points (simulating a player actually traveling along the road, not
+     * repeatedly preparing the same stationary point) and a real, controlled production-order
+     * cadence (a short but nonzero interval, real wall-clock gaps between calls, never a sleep used
+     * to fake out the limit). Finally generates and asserts a real road-surface block PAST A's own
+     * endpoint, inside B's own continuation.
      */
     @Test
     void aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        // Way A lives entirely in cell 4100_-10630 (lat in [41.00,41.01)); way B, a DIFFERENT OSM
-        // way ID sharing only node 2 with A, lives entirely in the neighbor cell 4101_-10630 (lat
-        // in [41.01,41.02)) -- a real Overpass bbox query for cell A's area would never return B at
-        // all, since B's geometry never touches A's bbox.
-        String responseA = """
+        // Cell A: 4100_-10630, bbox [41.00,41.01) x [-106.30,-106.29). Cell B: 4101_-10630, bbox
+        // [41.01,41.02) x [-106.30,-106.29). Shared node 2 at (41.0101,-106.295) -- just inside B.
+        double aMinLat = 41.00, aMaxLat = 41.01, bMinLat = 41.01, bMaxLat = 41.02;
+        double cellMinLon = -106.30, cellMaxLon = -106.29;
+        String responseAOnly = """
                 {"elements":[{"type":"way","id":555024,"nodes":[1,2],
                   "tags":{"highway":"secondary","name":"Successor Street A"},
-                  "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0095,"lon":-106.295}]}]}
+                  "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0101,"lon":-106.295}]}]}
                 """;
-        String responseB = """
-                {"elements":[{"type":"way","id":555025,"nodes":[2,3],
-                  "tags":{"highway":"secondary","name":"Successor Street B"},
-                  "geometry":[{"lat":41.0105,"lon":-106.295},{"lat":41.016,"lon":-106.295}]}]}
+        String responseAAndB = """
+                {"elements":[
+                  {"type":"way","id":555024,"nodes":[1,2],
+                    "tags":{"highway":"secondary","name":"Successor Street A"},
+                    "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0101,"lon":-106.295}]},
+                  {"type":"way","id":555025,"nodes":[2,3],
+                    "tags":{"highway":"secondary","name":"Successor Street B"},
+                    "geometry":[{"lat":41.0101,"lon":-106.295},{"lat":41.016,"lon":-106.295}]}
+                ]}
                 """;
+        String responseEmpty = "{\"elements\":[]}";
+
         AtomicInteger requests = new AtomicInteger();
+        AtomicInteger bBboxRequests = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {
-            int n = requests.incrementAndGet();
-            // First real fetch answers for cell A (the point's own cell on the first prepare call);
-            // every fetch after that is the lookahead queue catching up neighbors, eventually B's.
-            byte[] body = (n == 1 ? responseA : responseB).getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(200, body.length);
-            exchange.getResponseBody().write(body);
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            String body;
+            if (approx(minLat, aMinLat) && approx(maxLat, aMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                body = responseAOnly;
+            } else if (approx(minLat, bMinLat) && approx(maxLat, bMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                bBboxRequests.incrementAndGet();
+                body = responseAAndB;
+            } else {
+                body = responseEmpty; // every other neighbor cell: a genuinely empty result, not fabricated
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
             exchange.close();
         });
         stub.start();
         try {
-            // A short, real (nonzero) interval, so several simulated prepare calls (each advancing
-            // real wall-clock time briefly) legitimately become eligible one at a time -- not the
-            // zero-interval constructor, and no Thread.sleep used to fake out a real rate limit.
             RoadTileSource tileSource = new RoadTileSource(
                     URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
                     null, Duration.ofMillis(50));
             RoadNetwork.setTileSourceForTests(tileSource);
 
             EarthGenerator generator = bootAndBuildGenerator(demCache);
-            int[] ownBlock = generator.block(41.006, -106.295); // cell 4100_-10630, on way A
 
-            // Several real prepare calls, as a player's ordinary travel would trigger repeatedly --
-            // each one's own-cell fetch plus at most one opportunistic lookahead fetch.
-            for (int i = 0; i < 6; i++) {
-                generator.prepareNear(ownBlock[0], ownBlock[1]);
-                Thread.sleep(60); // real wall-clock gap between calls, comfortably past the 50ms interval
+            // MOVING prepares: a sequence of different points, advancing north along the road's own
+            // line, as a player's ordinary travel would actually generate -- not the same
+            // stationary point repeated.
+            // Deliberately stays within cell A's own lat range the whole time (41.00-41.0099) --
+            // cell B must be reached ONLY through the lookahead queue catching up a Moore
+            // neighbor, never because the player's own point ever directly entered B (that would
+            // just be the ordinary single-cell fetch, not what this test is proving). Enough
+            // distinct points for the queue (one Moore-neighbor dequeue per call, after the first
+            // call's own-cell fetch consumes that call's own eligibility slot) to work through to
+            // cell B's own position in the 8-neighbor enqueue order.
+            double[] travelLats = {41.001, 41.002, 41.003, 41.004, 41.005, 41.006, 41.007, 41.008, 41.0085, 41.009};
+            for (double travelLat : travelLats) {
+                int[] block = generator.block(travelLat, -106.295);
+                generator.prepareNear(block[0], block[1]);
+                Thread.sleep(60); // real wall-clock gap, comfortably past the 50ms interval -- never a sleep substituting for the rate limit itself
             }
-            assertTrue(requests.get() >= 2, "Expected more than just way A's own single fetch across several prepare calls -- got " + requests.get());
 
-            int[] successorColumn = generator.block(41.013, -106.295); // cell 4101_-10630, on way B, never the "own" point
-            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), successorColumn[0], successorColumn[1]);
+            assertTrue(bBboxRequests.get() >= 1, "Expected at least one real POST matching cell B's own bbox, not just a nearby neighbor -- got " + requests.get() + " total requests");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(41.013, -106.295),
+                    "Expected cell B to genuinely be READY under its own key, not merely found via the read-side neighbor scan of a different cell");
+
+            // Generate and assert a real road-surface block PAST A's own endpoint, inside B's own
+            // continuation -- not at the shared node, and not a candidate-only check.
+            int[] pastAColumn = generator.block(41.013, -106.295);
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), pastAColumn[0], pastAColumn[1]);
             assertTrue(covering != null && covering.wayId() == 555025L,
-                    "Expected the successor way B to be found in its own cell after the lookahead queue caught up. Got " + covering);
+                    "Expected successor way B to cover a column past A's own endpoint. Got " + covering);
+            int groundY = generator.surfaceY(pastAColumn[0], pastAColumn[1]);
+            var section = generator.generate(pastAColumn[0] >> 4, groundY >> 4, pastAColumn[1] >> 4);
+            var state = section.getBlockState(pastAColumn[0] & 15, groundY & 15, pastAColumn[1] & 15);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                    "Expected a real road-surface block past A's endpoint, on way B's own continuation, got " + state);
         } finally {
             stub.stop(0);
         }
+    }
+
+    private static boolean approx(double a, double b) {
+        return Math.abs(a - b) < 1e-6;
     }
 
     /**
@@ -453,5 +512,65 @@ class RoadTilePrefetchMixinTest {
 
         int[] confirmedEmptyColumn = generator.block(42.035, -107.295);
         assertEquals(RoadNetwork.ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD, RoadNetwork.diagnoseColumn(grid, confirmedEmptyColumn[0], confirmedEmptyColumn[1]));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55464's explicit ask: a cooldown-declined lookahead-queue entry must
+     * stay pending/eligible for a LATER attempt (never permanently lost), repeated calls during the
+     * same cooldown window must not create duplicate queue entries or a burst of requests ("without
+     * re-enqueue overlap"), and the one-in-flight guarantee must hold throughout. With a 200ms
+     * interval: the first prepare call's own-cell fetch succeeds (request #1) and immediately sets
+     * the next-eligible deadline ~200ms out, so THAT SAME call's own opportunistic lookahead
+     * attempt is declined (too soon after the fetch that just set the deadline). Three more
+     * prepare calls at the same point, with no sleep, must add ZERO further requests (every
+     * opportunistic attempt during the cooldown is correctly declined, not duplicated or bursted).
+     * Only after sleeping past the deadline does a fifth call's lookahead attempt finally succeed
+     * (request #2) -- proving the declined cell was retained across the cooldown, not lost, and
+     * that nothing was fetched twice in the meantime. "One in-flight" and "bounded priority" are
+     * structural here (a single-threaded sequence of calls through one instance's networkLock and
+     * capacity-bounded queue), not independently re-proven by a race test.
+     */
+    @Test
+    void aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        String response = """
+                {"elements":[{"type":"way","id":555028,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Cooldown Test Street"},
+                  "geometry":[{"lat":43.004,"lon":-108.295},{"lat":43.016,"lon":-108.295}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofMillis(200));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] block = generator.block(43.006, -108.295); // cell 4300_-10830
+
+            generator.prepareNear(block[0], block[1]); // own-cell fetch succeeds (#1); the same call's own opportunistic attempt is declined (just inside the 200ms deadline it set)
+            assertEquals(1, requests.get(), "Expected only the own-cell fetch to succeed on the first call");
+
+            // Three more calls at the SAME point, no sleep -- still within the 200ms cooldown.
+            for (int i = 0; i < 3; i++) {
+                generator.prepareNear(block[0], block[1]);
+            }
+            assertEquals(1, requests.get(), "Expected zero additional requests during the cooldown -- no burst, no duplicate fetch");
+
+            Thread.sleep(250); // past the 200ms deadline
+
+            generator.prepareNear(block[0], block[1]); // the still-queued (never lost) neighbor is now eligible
+            assertEquals(2, requests.get(), "Expected exactly one more request once the cooldown genuinely elapsed -- the declined entry was retained, not lost, and not fetched more than once");
+        } finally {
+            stub.stop(0);
+        }
     }
 }

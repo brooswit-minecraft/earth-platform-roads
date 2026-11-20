@@ -227,12 +227,21 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   right after its own synchronous point-cell fetch. Over several prepare calls as a player moves
   normally, this catches up nearby cells -- including a second way's own cell -- without ever
   exceeding the provider's rate limit. Confirmed in `RoadTilePrefetchMixinTest
-  .aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls` (two different way IDs
-  sharing a node, a real nonzero rate-limit interval, several real prepare calls over real
-  wall-clock time) and `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior` (per
-  55462's own live, read-only diagnosis: a pre-existing, install-wide-cache neighbor entry from
-  before the fresh test world even started, a multi-segment turning way, a real painted block deep
-  in the still-fully-pending own cell's interior, not just at the seam).
+  .aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls` -- comment 55464 found
+  the first version of this test dispatched its stub by request COUNT, not the real bbox, so a
+  request to the WRONG neighbor cell could still receive the successor way's data and pass for the
+  wrong reason; the corrected version dispatches by the actual bbox parsed from each POST body (one
+  shared node at the SAME coordinate in both ways, placed just inside the successor's own cell),
+  asserts a POST matching that cell's exact bbox and that it ends up `READY` under that key (not
+  merely found via the neighbor scan), uses MOVING prepare points that never directly enter the
+  successor's cell (so it can only be reached through the lookahead queue), and generates a real
+  block past the first way's own endpoint. `.aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests`
+  (also 55464) proves a declined-as-not-yet-eligible queue entry is retained (fetched successfully
+  once the cooldown genuinely elapses) rather than lost, and that repeated calls during the same
+  cooldown window add zero duplicate requests. `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior`
+  (55462) matches his own live, read-only diagnosis directly: a pre-existing, install-wide-cache
+  neighbor entry from before the fresh test world even started, a multi-segment turning way, a
+  real painted block deep in the still-fully-pending own cell's interior, not just at the seam.
 - **Nonsecret, opt-in diagnostic added (55462): `RoadNetwork.diagnoseColumn`.** Distinguishes
   `COVERED` / `EXCLUDED_BRIDGE_OR_TUNNEL` / `PENDING_NO_DATA` / `CONFIRMED_EMPTY_NO_ROAD` for one
   column, backed by a new `RoadTileSource.CellState` (`cellState(lat,lon)`) exposing which of the
