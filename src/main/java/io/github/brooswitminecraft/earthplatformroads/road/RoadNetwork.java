@@ -161,10 +161,20 @@ public final class RoadNetwork {
     }
 
     /**
-     * Builds the real production {@link RoadTileSource}: a live endpoint (default
-     * {@value #DEFAULT_OSM_API_ENDPOINT}, overridable with
-     * {@code -Dearthplatformroads.osmApiEndpoint=...}) and a persistent cache directory under the
+     * Builds the real production {@link RoadTileSource}: a persistent cache directory under the
      * game's own install, {@code <gamedir>/earthplatformroads/road_tiles/}.
+     *
+     * <p><b>Live network fetch is temporarily disabled here ({@code allowNetwork=false}),
+     * disclosed in the MINECRAFT-566 Jira comment announcing this change.</b> This mod's own OSM
+     * API-based fetch (the previous default) is explicitly disallowed by John's course-correction
+     * comments: "No automated game fetches against the editing API, public Overpass, or unsupported
+     * hotlinks." The replacement -- a worldwide, pinned, attributed OSM-derived source (VersaTiles'
+     * hosted OSM Shortbread vector tiles at tiles.versatiles.org, which this ticket's checkpoint
+     * selected after verifying real OSM way IDs, highway classification, worldwide bounds, and
+     * version metadata in a live sample tile) -- is NOT wired yet; that is real, disclosed,
+     * remaining work, not a silent gap. Until it lands, this method returns a read-only cache (any
+     * cell already on disk from a prior fetch still answers; nothing new is ever auto-fetched), so
+     * there is no code path left that can reach a policy-disallowed live backend by default.
      *
      * <p><b>Named, honest limitation</b>: this cache is scoped to the whole game install, not to
      * one save -- MINECRAFT-566's review asked for "a world pinning its source snapshot," and a
@@ -182,7 +192,8 @@ public final class RoadNetwork {
             URI endpoint = tileEndpointOverride != null
                     ? tileEndpointOverride
                     : URI.create(System.getProperty("earthplatformroads.osmApiEndpoint", DEFAULT_OSM_API_ENDPOINT));
-            return new RoadTileSource(endpoint, cacheRoot, true, TILE_FETCH_TIMEOUT);
+            boolean allowNetwork = tileEndpointOverride != null; // live fetch stays enabled only for tests that explicitly opt in via an override
+            return new RoadTileSource(endpoint, cacheRoot, allowNetwork, TILE_FETCH_TIMEOUT);
         } catch (RuntimeException e) {
             return null;
         }
