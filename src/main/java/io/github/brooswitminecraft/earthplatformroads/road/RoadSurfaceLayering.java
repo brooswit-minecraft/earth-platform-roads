@@ -3,34 +3,50 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 import io.github.brooswitminecraft.layeredslopes.LayerMath;
 
 /**
- * Pure arithmetic mapping a column's local terrain steepness to a {@link LayerMath} layer count for
- * the road's top surface, free of Minecraft/Earth Platform types so it is unit-testable without
- * bootstrapping the game.
+ * Pure arithmetic mapping a road column's ground height to a {@link LayerMath} layer count for its
+ * top surface, given the ground heights of its same-road neighbors, free of Minecraft/Earth
+ * Platform types so it is unit-testable without bootstrapping the game.
  *
- * <p>{@code slope} is the raw per-column value {@code EarthGenerator.surface(int,int,int,int,int)}
- * already receives (see that method's own doc comment: "Summed block steps over two blocks each
- * way, as a rough rise per run" -- {@code steep = slope / 2.4}). On a flat column ({@code slope ==
- * 0}) this returns {@link LayerMath#MAX_LAYERS} (a full block, matching MINECRAFT-564's existing
- * flat-ground behaviour exactly). On an inclined column, layers decrease as slope increases, so the
- * road surface reads as a shallow sub-block step rather than either a full-height block repeated at
- * every differing ground height (a whole-block stair) or a single flat plane that ignores the grade.
+ * <p>A column's own single top block can only occupy its own cell ({@code [y, y+1)} in absolute
+ * block space); {@code EarthGeneratorRoadMixin} never changes {@code y} itself (no cut/fill), so a
+ * single column alone cannot represent a continuous ramp between two different integer ground
+ * heights. What it CAN do, using only {@link io.github.brooswitminecraft.layeredslopes.LayeredBlock}'s
+ * existing floor-anchored shape, is choose where within its own cell the surface sits:
+ * {@link LayerMath#MAX_LAYERS} puts it at the very top of the cell ({@code y+1}, i.e. a full block,
+ * unchanged from flat ground); {@link LayerMath#MIN_LAYERS} puts it near the very bottom
+ * ({@code y + 1/16}).
  *
- * <p>This is a first implementation of the ticket's "sub-block Layered Slopes height increments"
- * requirement: the exact divisor below is a starting heuristic, not a value verified in-game (no
- * build/playtest was run to confirm the resulting visual/collision seam looks or feels right across
- * a real inclined run) -- see the MINECRAFT-566 ticket comment recording that as an open gap.
+ * <p>So for two adjacent columns at {@code y} and {@code y+1}: giving the lower column (at
+ * {@code y}) {@link LayerMath#MAX_LAYERS} puts its top at {@code y+1} -- exactly the lower edge of
+ * the higher column's own cell. Giving the higher column (at {@code y+1}) {@link
+ * LayerMath#MIN_LAYERS} puts ITS top at {@code (y+1) + 1/16} -- a 1/16-block seam, not a full
+ * 1-block cliff. This is the fix for the MINECRAFT-566 review finding that the previous
+ * slope-magnitude heuristic rounded a single-block step's slope down to zero and painted a full
+ * block on both sides of the step, leaving the whole 1-block jump untouched.
+ *
+ * <p>This only closes a 1-block step between immediately adjacent columns. A column with both a
+ * higher and a lower same-road neighbor (a local saddle) gets a midpoint compromise, and a step
+ * larger than 1 block between immediately adjacent columns -- not expected from the real DEM's
+ * resolution in practice, see {@code docs/design.md}, but not impossible -- still leaves a
+ * residual gap this mixin does not attempt to close further without cut/fill.
  */
 public final class RoadSurfaceLayering {
-    /** Slope units per one fewer sixteenth-layer; tuned so a slope of ~1 (steep's {@code 2.4} threshold) reaches the midpoint. */
-    private static final double SLOPE_UNITS_PER_LAYER = 3.0;
-
     private RoadSurfaceLayering() {}
 
-    /** Layer count for the road's top surface at this column, clamped to {@link LayerMath}'s valid range. */
-    public static int layersForSlope(int slope) {
-        if (slope <= 0) return LayerMath.MAX_LAYERS;
-        int reduction = (int) Math.round(slope / SLOPE_UNITS_PER_LAYER);
-        int layers = LayerMath.MAX_LAYERS - reduction;
-        return Math.max(LayerMath.MIN_LAYERS, Math.min(LayerMath.MAX_LAYERS, layers));
+    /**
+     * Layer count for the road's top surface at a column with ground height {@code y}, given the
+     * ground heights of its same-road 4-connected neighbors (however many of the 4 directions are
+     * themselves covered by the same {@link RoadSegment}; an empty array means "flat", matching the
+     * original always-full behaviour).
+     */
+    public static int layersForNeighbors(int y, int[] sameRoadNeighborGroundYs) {
+        boolean hasHigher = false, hasLower = false;
+        for (int neighborY : sameRoadNeighborGroundYs) {
+            if (neighborY > y) hasHigher = true;
+            else if (neighborY < y) hasLower = true;
+        }
+        if (hasHigher && hasLower) return (LayerMath.MAX_LAYERS + LayerMath.MIN_LAYERS) / 2;
+        if (hasLower) return LayerMath.MIN_LAYERS;
+        return LayerMath.MAX_LAYERS;
     }
 }

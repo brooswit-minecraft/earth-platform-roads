@@ -9,7 +9,6 @@ import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.earth.EarthSettings;
 import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
 import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat;
-import io.github.brooswitminecraft.layeredslopes.LayerMath;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -87,7 +86,10 @@ class RoadGenerationTest {
 
     private static net.minecraft.world.level.block.state.BlockState surfaceBlockAt(double lat, double lon) {
         int[] block = generator.block(lat, lon);
-        int x = block[0], z = block[1];
+        return surfaceBlockAtXZ(block[0], block[1]);
+    }
+
+    private static net.minecraft.world.level.block.state.BlockState surfaceBlockAtXZ(int x, int z) {
         int ground = generator.surfaceY(x, z);
         int cubeX = x >> 4, cubeY = ground >> 4, cubeZ = z >> 4;
         LevelChunkSection section = generator.generate(cubeX, cubeY, cubeZ);
@@ -123,20 +125,67 @@ class RoadGenerationTest {
         assertTrue(isRoadSurface(state), "The road column must still generate as road surface above vanilla's build height, got " + state);
     }
 
+    /**
+     * Regression test for the exact MINECRAFT-566 review finding: these two adjacent columns were
+     * measured (see the ScratchProbeTest exploration this fixed-coordinate test replaces) to be a
+     * genuine, real-DEM-generated one-block step within the pinned Southside Drive band -- not a
+     * synthetic slope value. {@code HIGH_X} sits one block higher than {@code LOW_X} at the same z.
+     */
+    private static final int STEP_LOW_X = -10534017, STEP_HIGH_X = -10534018, STEP_Z = -3591018;
+    /** One column further from the step on the low side: both this and STEP_LOW_X share the same real ground height, a flat control. */
+    private static final int STEP_FLAT_CONTROL_X = -10534016;
+
     @Test
-    void anInclinedColumnUsesTheLayeredCompatBlockNotAWholeBlockStair() {
-        // Direct unit coverage of the pure slope->layers mapping (RoadSurfaceLayeringTest) already
-        // exercises the heuristic in isolation; this integration-level test additionally confirms
-        // the mixin wires that heuristic's non-full output to the registered compat block with a
-        // matching, non-full collision shape, rather than falling back to a whole full block.
-        var layers = RoadSurfaceLayering.layersForSlope(6);
-        assertTrue(layers < LayerMath.MAX_LAYERS, "Expected a slope of 6 to select fewer than the max layers");
-        var state = LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get().defaultBlockState()
-                .setValue(io.github.brooswitminecraft.layeredslopes.LayeredBlock.ANCHOR, io.github.brooswitminecraft.layeredslopes.Anchor.FLOOR)
-                .setValue(io.github.brooswitminecraft.layeredslopes.LayeredBlock.LAYERS, layers);
-        var shape = state.getCollisionShape(null, null);
-        assertEquals(layers / 16.0, shape.max(net.minecraft.core.Direction.Axis.Y), 1e-9,
-                "A " + layers + "-layer floor-anchored block's collision top must sit at layers/16, not a full block");
+    void aGeneratedOneBlockStepClosesToAOneSixteenthSeamNotAWholeBlockCliff() {
+        int lowGround = generator.surfaceY(STEP_LOW_X, STEP_Z);
+        int highGround = generator.surfaceY(STEP_HIGH_X, STEP_Z);
+        int flatControlGround = generator.surfaceY(STEP_FLAT_CONTROL_X, STEP_Z);
+        assertEquals(lowGround + 1, highGround, "Expected a measured real one-block step between these two fixed columns; "
+                + "if the real DEM changed, re-measure replacement coordinates rather than adjusting this assertion to fit");
+        assertEquals(lowGround, flatControlGround, "Expected the flat-control column to share the low column's real ground height");
+
+        var lowState = surfaceBlockAtXZ(STEP_LOW_X, STEP_Z);
+        var highState = surfaceBlockAtXZ(STEP_HIGH_X, STEP_Z);
+        var flatState = surfaceBlockAtXZ(STEP_FLAT_CONTROL_X, STEP_Z);
+
+        assertTrue(isRoadSurface(lowState), "Low side of the step must still be road surface, got " + lowState);
+        assertTrue(isRoadSurface(highState), "High side of the step must still be road surface, got " + highState);
+        assertTrue(isRoadSurface(flatState), "Flat control column must still be road surface, got " + flatState);
+
+        double lowTop = lowGround + absoluteCollisionTopFraction(lowState);
+        double highTop = highGround + absoluteCollisionTopFraction(highState);
+        double flatTop = flatControlGround + absoluteCollisionTopFraction(flatState);
+
+        // Flat control: unchanged behaviour, a full block, top exactly at ground+1.
+        assertEquals(flatControlGround + 1.0, flatTop, 1e-9, "Flat control column must be a full block");
+
+        // The regression this fixes: before, both sides of a 1-block step rounded to a full block,
+        // leaving the full 1-block gap (highTop - lowTop == 1.0) untouched. After, the low side
+        // stays full (meeting the step's base) and the high side drops to the minimum layer (sitting
+        // just above its own floor), closing the gap to one sixteenth of a block.
+        double gap = highTop - lowTop;
+        assertTrue(gap < 0.2, "Expected the step to close to roughly a 1/16-block seam, not a 1-block cliff; got gap=" + gap
+                + " (lowTop=" + lowTop + ", highTop=" + highTop + ")");
+        assertTrue(gap > 0, "The high side must still read as at least slightly higher than the low side, got gap=" + gap);
+
+        // Solid support: the block directly under each road column's top block must be a full,
+        // non-air block (never a floating layered block over a gap) -- under() is always a full
+        // block per the mixin, this confirms that holds for the real generated columns too.
+        assertSolidSupportUnder(STEP_LOW_X, STEP_Z, lowGround);
+        assertSolidSupportUnder(STEP_HIGH_X, STEP_Z, highGround);
+        assertSolidSupportUnder(STEP_FLAT_CONTROL_X, STEP_Z, flatControlGround);
+    }
+
+    /** Absolute height, in blocks above {@code ground}, that this state's collision shape reaches -- 1.0 for a full block. */
+    private static double absoluteCollisionTopFraction(BlockState state) {
+        return state.getCollisionShape(null, null).max(net.minecraft.core.Direction.Axis.Y);
+    }
+
+    private static void assertSolidSupportUnder(int x, int z, int ground) {
+        int cubeX = x >> 4, cubeY = ground >> 4, cubeZ = z >> 4;
+        LevelChunkSection section = generator.generate(cubeX, cubeY, cubeZ);
+        var under = section.getBlockState(x & 15, (ground - 1) & 15, z & 15);
+        assertTrue(!under.isAir(), "Expected a solid block directly under the road column at (" + x + "," + z + "), got " + under);
     }
 
     @Test
