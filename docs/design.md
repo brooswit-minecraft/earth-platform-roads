@@ -89,6 +89,50 @@ the real projection in use rather than for one assumed, hard-coded scale.
   (separate repo, not yet landed) and is called out here rather than assumed
   fine.
 
+## MINECRAFT-566: indexed multi-region network, junctions, and layered surfaces
+
+MINECRAFT-564 above was the scoped proof of concept, not the finished feature; this section
+records what MINECRAFT-566 actually changed and, as importantly, what it did not finish.
+
+- **Data model.** `RoadSegment` now carries a stable OSM `wayId`, a `RoadClass` (every mapped
+  vehicular `highway=*` value, explicitly excluding foot-only values -- see
+  `RoadClass.fromOsmHighway`), the way's real OSM `nodeIds` 1:1 with its centerline, and
+  `bridge`/`tunnel`/`layer` flags. `RoadNetwork` loads every region listed in
+  `data/earthplatformroads/roads/regions/index.json`, not one hard-coded resource, and buckets
+  every way into a ~1.1km latitude/longitude grid cell index so a column lookup only ever walks
+  the handful of ways near it (`RoadNetwork.candidatesNear`), not the whole network.
+- **Junctions.** Two ways sharing a real OSM node ID are a mapped junction
+  (`RoadSegment.sharesJunctionWith`, `RoadNetwork.junctions()`); crossing geometry without a shared
+  node is deliberately not reported as one.
+- **Bridges and tunnels are tracked but never rendered as a crossing.** `segmentCoveringColumn`
+  skips any way with `bridge` or `tunnel` set, so this mixin paints no surface at all for those
+  columns rather than an incorrect at-grade crossing (a road "routed along the riverbed"). Which
+  ways were excluded this way is queryable (`RoadNetwork.excludedBridgesAndTunnels()`) for
+  reporting the gap explicitly, per the ticket's "report the exact gaps" instruction. **As of this
+  change, the only bundled region (`yosemite_valley.json`) contains zero bridges or tunnels**, so
+  this exclusion path exists in code and is reasoned about above, but has no bundled fixture
+  exercising it yet -- see the MINECRAFT-566 ticket comment for the up-to-date list of what is and
+  is not covered by bundled data.
+- **Layered surfaces on inclines.** `EarthGeneratorRoadMixin` now asks `RoadSurfaceLayering` for a
+  layer count from the column's own `slope` parameter (the same value `EarthGenerator.surface`
+  already receives) and, when that is less than a full block, uses
+  `LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE` (a dedicated compat-owned
+  `LayeredBlock` over `POLISHED_BLACKSTONE`, registered in this mod's own namespace -- see
+  `compat/layeredslopes/LayeredSlopesCompat.java`) instead of always painting a full block.
+  `under()` is always a full block, never layered, matching the ticket's explicit instruction
+  (`EarthGenerator` reads `under()` at depths 1-3). **The slope-to-layers mapping
+  (`RoadSurfaceLayering.SLOPE_UNITS_PER_LAYER`) is a first heuristic verified only by its own pure
+  unit test (`RoadSurfaceLayeringTest`) and by a synthetic collision-shape check
+  (`RoadGenerationTest#anInclinedColumnUsesTheLayeredCompatBlockNotAWholeBlockStair`) -- no
+  build/playtest confirmed how it actually looks or feels across a real inclined run in-game.**
+- **Still only one bundled region.** The architecture supports installing more
+  `regions/*.json` resources without any Java change, but only Southside Drive's original pinned
+  extract is bundled as of this change -- a second, geographically separate fixture (the ticket
+  suggests Presidio Parkway) was not ingested. A live Overpass fetch attempted during this work
+  returned "502 Gateway Timeout -- at capacity" (see `docs/road-data-provenance.md`); the dated
+  Geofabrik PBF extract the ticket also suggests was not attempted (no PBF-parsing tooling exists
+  in this repo yet).
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

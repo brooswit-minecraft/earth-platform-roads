@@ -8,6 +8,8 @@ import io.earthplatform.geography.globe.TerrariumTileSource;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.earth.EarthSettings;
 import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
+import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat;
+import io.github.brooswitminecraft.layeredslopes.LayerMath;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -20,6 +22,7 @@ import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -32,17 +35,27 @@ import org.junit.jupiter.api.io.TempDir;
  * test constructing the real generator directly, run inside the modded test JVM
  * ({@code neoForge.unitTest}) so {@link EarthGeneratorRoadMixin} is actually applied.
  *
- * <p>Falsifiable claim under test: a column on the pinned Southside Drive centerline generates
- * {@link Blocks#POLISHED_BLACKSTONE} at its surface in a cube this test never touched by hand, and
- * a column 40 blocks off that centerline -- same cube column, same generator, same seed -- does
- * not. If the mixin were not applied, or the road geometry were wrong, both assertions below would
- * see the same (non-blackstone) surface block, since {@code EarthGenerator} on its own has no
- * concept of a road.
+ * <p>Falsifiable claim under test: a column on the pinned Southside Drive centerline generates a
+ * road-surface block ({@link #isRoadSurface}) at its surface in a cube this test never touched by
+ * hand, and a column 40 blocks off that centerline -- same cube column, same generator, same seed
+ * -- does not. If the mixin were not applied, or the road geometry were wrong, both assertions
+ * below would see the same (non-blackstone) surface block, since {@code EarthGenerator} on its own
+ * has no concept of a road.
+ *
+ * <p>This fixture's real DEM-derived slope at the pinned centerline was not re-measured after the
+ * MINECRAFT-566 layering change landed (no build/playtest was run); {@link #isRoadSurface} accepts
+ * either the plain full block (flat, slope == 0) or the layered compat block at any layer count, so
+ * these assertions stay valid either way without asserting which case actually occurs here.
  */
 class RoadGenerationTest {
     private static EarthGenerator generator;
-    /** A point on the pinned centerline (data/earthplatformroads/roads/southside_drive_yosemite.json), -119.6367003,37.7206145. */
+    /** A point on the pinned centerline (data/earthplatformroads/roads/regions/yosemite_valley.json), -119.6367003,37.7206145. */
     private static final double ON_ROAD_LAT = 37.7206145, ON_ROAD_LON = -119.6367003;
+
+    /** Either the original always-full polished blackstone, or MINECRAFT-566's layered compat block over the same base texture. */
+    private static boolean isRoadSurface(BlockState state) {
+        return state.is(Blocks.POLISHED_BLACKSTONE) || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get());
+    }
 
     @BeforeAll
     static void bootAndGenerate(@TempDir Path cache) throws Exception {
@@ -84,8 +97,7 @@ class RoadGenerationTest {
     @Test
     void columnOnThePinnedCenterlineGeneratesBlackstone() {
         var state = surfaceBlockAt(ON_ROAD_LAT, ON_ROAD_LON);
-        assertEquals(Blocks.POLISHED_BLACKSTONE.defaultBlockState(), state,
-                "Expected the pinned Southside Drive centerline column to generate as polished blackstone");
+        assertTrue(isRoadSurface(state), "Expected the pinned Southside Drive centerline column to generate as road surface, got " + state);
     }
 
     @Test
@@ -94,7 +106,7 @@ class RoadGenerationTest {
         var grid = generator.grid();
         var offRoadPoint = grid.geographic(onRoad[0] + 40, onRoad[1]);
         var state = surfaceBlockAt(offRoadPoint.latitude(), offRoadPoint.longitude());
-        assertTrue(!state.is(Blocks.POLISHED_BLACKSTONE),
+        assertTrue(!isRoadSurface(state),
                 "A column 40 blocks off the pinned centerline must keep its natural surface, got " + state);
     }
 
@@ -107,8 +119,24 @@ class RoadGenerationTest {
         int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
         int ground = generator.surfaceY(onRoad[0], onRoad[1]);
         assertTrue(ground > 320, "Expected the road column's ground height to be above vanilla's Y 320 build limit, got " + ground);
-        assertEquals(Blocks.POLISHED_BLACKSTONE.defaultBlockState(), surfaceBlockAt(ON_ROAD_LAT, ON_ROAD_LON),
-                "The road column must still generate as blackstone above vanilla's build height");
+        var state = surfaceBlockAt(ON_ROAD_LAT, ON_ROAD_LON);
+        assertTrue(isRoadSurface(state), "The road column must still generate as road surface above vanilla's build height, got " + state);
+    }
+
+    @Test
+    void anInclinedColumnUsesTheLayeredCompatBlockNotAWholeBlockStair() {
+        // Direct unit coverage of the pure slope->layers mapping (RoadSurfaceLayeringTest) already
+        // exercises the heuristic in isolation; this integration-level test additionally confirms
+        // the mixin wires that heuristic's non-full output to the registered compat block with a
+        // matching, non-full collision shape, rather than falling back to a whole full block.
+        var layers = RoadSurfaceLayering.layersForSlope(6);
+        assertTrue(layers < LayerMath.MAX_LAYERS, "Expected a slope of 6 to select fewer than the max layers");
+        var state = LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get().defaultBlockState()
+                .setValue(io.github.brooswitminecraft.layeredslopes.LayeredBlock.ANCHOR, io.github.brooswitminecraft.layeredslopes.Anchor.FLOOR)
+                .setValue(io.github.brooswitminecraft.layeredslopes.LayeredBlock.LAYERS, layers);
+        var shape = state.getCollisionShape(null, null);
+        assertEquals(layers / 16.0, shape.max(net.minecraft.core.Direction.Axis.Y), 1e-9,
+                "A " + layers + "-layer floor-anchored block's collision top must sit at layers/16, not a full block");
     }
 
     @Test
@@ -132,10 +160,10 @@ class RoadGenerationTest {
         assertEquals(boundaryX >> 4, (boundaryX + 1 >> 4) - 1, "Sanity: boundaryX and boundaryX+1 must actually be in different cubes");
         var last = grid.geographic(boundaryX, z);
         var first = grid.geographic(boundaryX + 1, z);
-        assertEquals(Blocks.POLISHED_BLACKSTONE.defaultBlockState(), surfaceBlockAt(last.latitude(), last.longitude()),
-                "Last column of one cube at the boundary must be road surface");
-        assertEquals(Blocks.POLISHED_BLACKSTONE.defaultBlockState(), surfaceBlockAt(first.latitude(), first.longitude()),
-                "First column of the next cube at the boundary must be road surface, with no gap");
+        var lastState = surfaceBlockAt(last.latitude(), last.longitude());
+        var firstState = surfaceBlockAt(first.latitude(), first.longitude());
+        assertTrue(isRoadSurface(lastState), "Last column of one cube at the boundary must be road surface, got " + lastState);
+        assertTrue(isRoadSurface(firstState), "First column of the next cube at the boundary must be road surface, with no gap, got " + firstState);
     }
 
     @Test
@@ -151,7 +179,7 @@ class RoadGenerationTest {
         var first = generator.generate(cubeX, cubeY, cubeZ).getBlockState(x & 15, ground & 15, z & 15);
         var second = generator.generate(cubeX, cubeY, cubeZ).getBlockState(x & 15, ground & 15, z & 15);
         assertEquals(first, second, "Regenerating the same cube must be deterministic");
-        assertEquals(Blocks.POLISHED_BLACKSTONE.defaultBlockState(), first);
+        assertTrue(isRoadSurface(first), "Expected the regenerated column to be road surface, got " + first);
 
         // Generating a neighbouring cube first (as normal generation visiting cubes in a different
         // order, or pregeneration, would) must not change the result for the road's own cube: the
@@ -175,7 +203,7 @@ class RoadGenerationTest {
         z -= 1; // one block further, past the edge rather than exactly on it
         var justOutside = grid.geographic(x, z);
         var state = surfaceBlockAt(justOutside.latitude(), justOutside.longitude());
-        assertTrue(!state.is(Blocks.POLISHED_BLACKSTONE),
+        assertTrue(!isRoadSurface(state),
                 "A column just past the half-width edge (" + x + "," + z + ") must not be road surface, got " + state);
     }
 }
