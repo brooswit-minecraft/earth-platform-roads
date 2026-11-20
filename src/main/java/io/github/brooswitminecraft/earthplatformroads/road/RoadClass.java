@@ -17,12 +17,15 @@ public enum RoadClass {
     TERTIARY(2.5),
     UNCLASSIFIED(2.0),
     RESIDENTIAL(2.0),
+    LIVING_STREET(2.0),
     MOTORWAY_LINK(3.0),
     TRUNK_LINK(3.0),
     PRIMARY_LINK(3.0),
     SECONDARY_LINK(2.5),
     TERTIARY_LINK(2.5),
-    SERVICE(1.5);
+    SERVICE(1.5),
+    /** OSM's generic "a road exists here, not yet classified" value; rare, but still a mapped vehicular way. */
+    ROAD(2.0);
 
     /** Default half-width in blocks when the way carries no usable {@code lanes} tag. */
     public final double defaultHalfWidthBlocks;
@@ -39,12 +42,14 @@ public enum RoadClass {
             Map.entry("tertiary", TERTIARY),
             Map.entry("unclassified", UNCLASSIFIED),
             Map.entry("residential", RESIDENTIAL),
+            Map.entry("living_street", LIVING_STREET),
             Map.entry("motorway_link", MOTORWAY_LINK),
             Map.entry("trunk_link", TRUNK_LINK),
             Map.entry("primary_link", PRIMARY_LINK),
             Map.entry("secondary_link", SECONDARY_LINK),
             Map.entry("tertiary_link", TERTIARY_LINK),
-            Map.entry("service", SERVICE));
+            Map.entry("service", SERVICE),
+            Map.entry("road", ROAD));
 
     /** {@code null} for any {@code highway} value this mod does not treat as a vehicular road. */
     public static RoadClass fromOsmHighway(String highway) {

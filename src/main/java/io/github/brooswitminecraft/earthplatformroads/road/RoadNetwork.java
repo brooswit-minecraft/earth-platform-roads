@@ -169,7 +169,8 @@ public final class RoadNetwork {
         }
     }
 
-    private static RoadSegment parseWay(JsonObject way) {
+    /** Package-private (not private) so {@code RoadNetworkLoaderTest} can exercise it directly against a constructed way, without a bundled resource file. */
+    static RoadSegment parseWay(JsonObject way) {
         JsonObject tags = way.getAsJsonObject("way_tags");
         String name = tags.has("name") ? tags.get("name").getAsString() : ("way " + way.get("way_id").getAsLong());
         String highway = tags.get("highway").getAsString();

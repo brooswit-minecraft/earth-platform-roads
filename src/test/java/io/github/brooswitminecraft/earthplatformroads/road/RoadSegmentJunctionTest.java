@@ -60,4 +60,19 @@ class RoadSegmentJunctionTest {
         assertEquals(RoadClass.SECONDARY, RoadClass.fromOsmHighway("secondary"));
         assertEquals(RoadClass.SERVICE, RoadClass.fromOsmHighway("service"));
     }
+
+    @Test
+    void roadClassAcceptsEveryStandardOsmVehicularHighwayValue() {
+        // Every value OSM's own wiki documents as a vehicular "Roads" highway=* value (motorway
+        // down through service, plus living_street and the generic/unclassified "road") must be
+        // accepted here, not just the handful MINECRAFT-566's first pass happened to list: a real
+        // pinned extract can legitimately use any of these, and rejecting one at load time would
+        // silently drop a mapped vehicular way as if it were a foot trail.
+        for (String highway : List.of(
+                "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
+                "living_street", "motorway_link", "trunk_link", "primary_link", "secondary_link",
+                "tertiary_link", "service", "road")) {
+            assertTrue(RoadClass.fromOsmHighway(highway) != null, "Expected highway=" + highway + " to map to a vehicular RoadClass");
+        }
+    }
 }
