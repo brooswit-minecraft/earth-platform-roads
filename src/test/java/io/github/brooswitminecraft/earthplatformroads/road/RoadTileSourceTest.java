@@ -124,6 +124,57 @@ class RoadTileSourceTest {
         assertEquals(1, recoveredRequests.get());
     }
 
+    /** Overpass's own convention: a top-level "remark" appears only when it has an error/warning to report, even inside an HTTP 200 response. */
+    private static final String REMARK_ZERO_ELEMENTS_RESPONSE = """
+            {"elements":[],"remark":"runtime error: Query timed out in \\"query\\" at line 2"}
+            """;
+    private static final String REMARK_PARTIAL_ELEMENTS_RESPONSE = """
+            {"elements":[{"type":"way","id":555002,"nodes":[1,2],
+              "tags":{"highway":"secondary","name":"Partial Street"},
+              "geometry":[{"lat":44.0,"lon":-109.0},{"lat":44.001,"lon":-109.001}]}],
+             "remark":"runtime error: Query timed out in \\"query\\" at line 2"}
+            """;
+
+    @Test
+    void anHttp200WithAnErrorRemarkAndZeroElementsStaysPendingNotConfirmedEmpty(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, REMARK_ZERO_ELEMENTS_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        var duringError = source.waysForCell(45.0, -110.0);
+        assertTrue(duringError.isEmpty(), "An error remark must not throw; the caller gets no road for this one call");
+        assertEquals(1, requests.get());
+        assertTrue(source.cachedWaysForCellOrEmpty(45.0, -110.0).isEmpty(),
+                "An HTTP 200 with a nonempty error remark and zero elements must NOT write a confirmed-empty artifact");
+
+        AtomicInteger recoveredRequests = new AtomicInteger();
+        HttpServer recoveredStub = startStub(recoveredRequests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource restartedAfterRecovery = new RoadTileSource(endpointOf(recoveredStub), cacheRoot, true, Duration.ofSeconds(5));
+        var afterRecovery = restartedAfterRecovery.waysForCell(45.0, -110.0);
+        assertEquals(1, afterRecovery.size(), "The cell left pending by the error remark must retry successfully through a fresh source over the same cache root");
+        assertEquals(1, recoveredRequests.get());
+    }
+
+    @Test
+    void anHttp200WithAnErrorRemarkAndPartialElementsStaysPendingNotReady(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, REMARK_PARTIAL_ELEMENTS_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        var duringError = source.waysForCell(46.0, -111.0);
+        assertTrue(duringError.isEmpty(), "An error remark must not throw, and must not surface the partial way either");
+        assertEquals(1, requests.get());
+        assertTrue(source.cachedWaysForCellOrEmpty(46.0, -111.0).isEmpty(),
+                "An HTTP 200 with a nonempty error remark and some elements must NOT be written as a ready (complete) artifact");
+
+        AtomicInteger recoveredRequests = new AtomicInteger();
+        HttpServer recoveredStub = startStub(recoveredRequests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource restartedAfterRecovery = new RoadTileSource(endpointOf(recoveredStub), cacheRoot, true, Duration.ofSeconds(5));
+        var afterRecovery = restartedAfterRecovery.waysForCell(46.0, -111.0);
+        assertEquals(1, afterRecovery.size(), "The cell left pending by the partial error-remark response must retry successfully through a fresh source over the same cache root");
+        assertEquals(1, recoveredRequests.get());
+    }
+
     @Test
     void cachedWaysForCellOrEmptyNeverFetches(@TempDir Path cacheRoot) throws IOException {
         AtomicInteger requests = new AtomicInteger();

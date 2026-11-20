@@ -169,7 +169,27 @@ public final class RoadTileSource {
         if (response.statusCode() != 200) {
             throw new IOException("Overpass returned HTTP " + response.statusCode() + " for cell fetch");
         }
+        checkForErrorRemark(response.body());
         return OverpassWayParser.parseWays(response.body());
+    }
+
+    /**
+     * Overpass can start an HTTP 200 response, hit a runtime error partway through (e.g. its own
+     * {@code timeout:} budget expiring mid-query), and still finish the response with a top-level
+     * {@code "remark"} string describing that failure -- see Overpass's own {@code
+     * Output_JSON::write_footer}, which only ever emits {@code "remark"} when it has an error/warning
+     * message to report. A 200 status alone is therefore not proof the body is a complete, trustworthy
+     * answer: this must be checked and treated as a failure (same as a non-200 status or a network
+     * exception) BEFORE this cell's ways are written to the ready or confirmed-empty cache -- missing
+     * this would quietly persist an incomplete fetch (zero elements as confirmed-empty forever, or
+     * fewer ways than actually exist as a wrongly "complete" ready tile) exactly where review flagged
+     * this as a real gap.
+     */
+    private static void checkForErrorRemark(String responseBody) throws IOException {
+        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+        if (root.has("remark") && !root.get("remark").getAsString().isEmpty()) {
+            throw new IOException("Overpass reported an error remark despite HTTP 200: " + root.get("remark").getAsString());
+        }
     }
 
     private static List<RoadSegment> readCachedCell(Path readyFile) throws IOException {
