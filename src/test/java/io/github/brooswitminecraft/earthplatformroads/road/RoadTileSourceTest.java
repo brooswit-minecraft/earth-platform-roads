@@ -232,17 +232,98 @@ class RoadTileSourceTest {
 
     @Test
     void aMinimumRequestIntervalIsEnforcedBetweenFetches(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        // MINECRAFT-566 comment 55450: this class never sleeps to wait out a rate limit (that
+        // blocked unrelated cached-tile reads behind it) -- a fetch attempted before the next
+        // eligible moment is declined immediately (pending, retryable), not delayed. So the second
+        // of two back-to-back fetches, too soon after the first, must come back empty right away
+        // (fast, no HTTP sent) rather than wait 300ms and then succeed.
         AtomicInteger requests = new AtomicInteger();
         HttpServer stub = startStub(requests, EMPTY_RESPONSE, 200);
         RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(300));
 
+        source.waysForCell(50.0, -1.0); // first cell: no prior request, eligible immediately
+        assertEquals(1, requests.get());
+
         long start = System.nanoTime();
-        source.waysForCell(50.0, -1.0); // first cell: no prior request, no wait expected
-        source.waysForCell(51.0, -2.0); // second cell: must wait out the configured interval first
+        var tooSoon = source.waysForCell(51.0, -2.0); // second cell: declined, not delayed
         long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
 
-        assertEquals(2, requests.get());
-        assertTrue(elapsedMillis >= 300, "Expected at least the configured 300ms minimum interval between two fetches, took " + elapsedMillis + "ms");
+        assertTrue(tooSoon.isEmpty(), "Expected the too-soon fetch to come back empty (pending), not wait and succeed");
+        assertEquals(1, requests.get(), "Expected no second HTTP request while not yet eligible");
+        assertTrue(elapsedMillis < 300, "Expected the too-soon fetch to return immediately, not block for the 300ms interval -- took " + elapsedMillis + "ms");
+
+        // After the interval genuinely elapses, the same cell becomes eligible and actually fetches.
+        Thread.sleep(300);
+        var afterInterval = source.waysForCell(51.0, -2.0);
+        assertEquals(2, requests.get(), "Expected the retry after the interval elapsed to actually request");
+        assertTrue(afterInterval.isEmpty(), "This stub always returns an empty result");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55450's core regression: a disk-cached tile must complete promptly even
+     * while a DIFFERENT cell is rate-limited/backed off, using a fresh source instance (a real
+     * restart) over a cache root seeded with one already-ready tile. Requires: the disk hit returns
+     * fast, triggers zero HTTP requests of its own, writes no fabricated empty marker, only one
+     * request is ever in flight, and the cold cell's pending miss becomes retryable only after its
+     * deadline.
+     */
+    @Test
+    void aDiskCachedTileIsNotBlockedBehindAColdCellsProviderBackoff(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        // Seed a persistent, already-ready tile directly on disk -- exactly the shape RoadTileSource
+        // itself would have written, simulating a previous run (before "a new source instance").
+        long seededCellLat = (long) Math.floor(10.0 / RoadNetwork.CELL_DEGREES);
+        long seededCellLon = (long) Math.floor(20.0 / RoadNetwork.CELL_DEGREES);
+        String seededCellId = seededCellLat + "_" + seededCellLon;
+        java.nio.file.Files.createDirectories(cacheRoot);
+        String seededTileJson = """
+                {"schema_version":1,"region_id":"seeded","ways":[{"way_id":777001,
+                  "way_tags":{"highway":"secondary","name":"Seeded Street"},
+                  "centerline":[{"lat":10.0005,"lon":20.0005},{"lat":10.0006,"lon":20.0006}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(cacheRoot.resolve(seededCellId + ".json"), seededTileJson);
+
+        // A cold, different cell whose provider returns 429 with a long Retry-After -- this is the
+        // backoff a disk hit must never wait behind.
+        AtomicInteger coldRequests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            coldRequests.incrementAndGet();
+            exchange.getResponseHeaders().add("Retry-After", "30");
+            byte[] body = "{\"error\":\"rate_limited\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(429, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        this.server = stub;
+
+        // A fresh instance over the seeded cache root -- "a new source instance", i.e. a restart.
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        var coldMiss = source.waysForCell(30.0, 40.0); // triggers the 429, sets a 30s backoff deadline
+        assertTrue(coldMiss.isEmpty(), "Expected no road from the rate-limited cold cell");
+        assertEquals(1, coldRequests.get());
+        long coldCellLat = (long) Math.floor(30.0 / RoadNetwork.CELL_DEGREES);
+        long coldCellLon = (long) Math.floor(40.0 / RoadNetwork.CELL_DEGREES);
+        assertTrue(!java.nio.file.Files.exists(cacheRoot.resolve(coldCellLat + "_" + coldCellLon + ".empty")),
+                "Expected no fabricated empty marker written for the rate-limited cell");
+
+        long start = System.nanoTime();
+        var diskHit = source.waysForCell(10.0005, 20.0005); // the seeded, already-ready, unrelated tile
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(1, diskHit.size(), "Expected the seeded tile's way to be returned from disk");
+        assertEquals(777001L, diskHit.get(0).wayId());
+        assertEquals(1, coldRequests.get(), "Expected zero additional HTTP requests for the disk hit");
+        assertTrue(elapsedMillis < 1000,
+                "Expected the disk-cached tile to complete promptly, not wait behind the cold cell's 30s backoff -- took " + elapsedMillis + "ms");
+
+        // A second attempt at the SAME cold cell, still well before its 30s deadline, must stay
+        // pending without issuing another request -- not retried early.
+        var stillBackedOff = source.waysForCell(30.0, 40.0);
+        assertTrue(stillBackedOff.isEmpty());
+        assertEquals(1, coldRequests.get(), "Expected the cold cell to stay pending (no new request) before its backoff deadline");
     }
 
     @Test

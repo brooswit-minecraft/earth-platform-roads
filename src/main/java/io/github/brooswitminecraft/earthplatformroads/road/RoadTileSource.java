@@ -60,10 +60,31 @@ public final class RoadTileSource {
     private final String apiKey;
     private final Duration minRequestInterval;
     private final HttpClient http;
-    private final Object fetchLock = new Object();
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
-    private Instant lastRequestAt = Instant.EPOCH;
-    private volatile Duration serverRequestedDelay = Duration.ZERO;
+    /**
+     * One lock object per cell ever requested from this instance, used only to deduplicate
+     * concurrent fetch attempts FOR THE SAME CELL -- deliberately NOT a single global lock (that
+     * was MINECRAFT-566 comment 55450's found bug: a global lock around disk reads meant an
+     * already-cached, no-network-needed tile could wait behind an unrelated cold cell's provider
+     * backoff). A disk-cache hit for cell A never touches cell B's lock, or {@link #networkLock}.
+     */
+    private final ConcurrentHashMap<Long, Object> cellLocks = new ConcurrentHashMap<>();
+    /**
+     * Guards only the actual outbound request: one in flight at a time, network-wide across every
+     * cell this instance might fetch (the provider's own free-tier parallel=1 limit). Never held
+     * while reading or writing this cache's disk files for a DIFFERENT cell -- see {@link #cellLocks}.
+     */
+    private final Object networkLock = new Object();
+    /**
+     * The earliest moment the next outbound request may be sent -- combines
+     * {@link #minRequestInterval}'s steady cadence and any {@code Retry-After} a 429/503 asked for.
+     * A fetch attempted before this deadline is declined immediately as a pending miss (comment
+     * 55450: "use a next-eligible deadline rather than sleeping under the global lock") -- this
+     * class never calls {@code Thread.sleep} to wait out rate limiting; a caller that hits the
+     * deadline just gets no road for that one call, exactly like any other failed fetch, and the
+     * cell stays retryable afterward.
+     */
+    private volatile Instant nextEligibleRequestAt = Instant.EPOCH;
 
     /**
      * The only origin+path this class will ever attach {@link #apiKey} to, regardless of what
@@ -96,12 +117,13 @@ public final class RoadTileSource {
      *               sends no credential header at all and, per 55448, must disable the live provider
      *               entirely rather than send an anonymous request -- enforced by the caller
      *               ({@code RoadNetwork.buildDefaultTileSource}), not by this constructor itself.
-     * @param minRequestInterval Minimum real-world time between the start of one fetch and the next,
-     *                           enforced inside {@link #fetchLock} (which already limits this source to
-     *                           one in-flight request at a time) -- a conservative client-side rate
-     *                           limit for an opt-in hosted provider's free tier, not a default-provider
-     *                           concern. {@code Duration.ZERO} (the single-arg constructor's default)
-     *                           means no extra delay beyond the natural one-at-a-time serialization.
+     * @param minRequestInterval Minimum real-world time between the start of one outbound request
+     *                           and the next, enforced via {@link #nextEligibleRequestAt} (never by
+     *                           sleeping -- see that field's own doc) -- a conservative client-side
+     *                           rate limit for an opt-in hosted provider's free tier, not a
+     *                           default-provider concern. {@code Duration.ZERO} (the single-arg
+     *                           constructor's default) means no extra delay beyond the one-in-flight
+     *                           serialization {@link #networkLock} already provides.
      */
     public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout, String apiKey, Duration minRequestInterval) {
         this.endpoint = endpoint;
@@ -142,47 +164,44 @@ public final class RoadTileSource {
         }
     }
 
-    /** Every mapped way in the cell covering {@code lat,lon}: cached if present, fetched (blocking, with this source's timeout) and cached if not. */
+    /**
+     * Every mapped way in the cell covering {@code lat,lon}: cached if present, fetched (blocking,
+     * with this source's timeout) and cached if not.
+     *
+     * <p>Disk-cache hits (below) take neither {@link #cellLocks} nor {@link #networkLock} -- they
+     * are plain, independent file reads, same as {@link #cachedWaysForCellOrEmpty}, so a cell
+     * that's already cached completes promptly no matter what any other cell's fetch is doing.
+     * Only a genuine cache miss takes this cell's own lock (to dedupe concurrent callers asking for
+     * the SAME cell) and then {@link #networkLock} (to serialize the actual outbound request).
+     */
     public List<RoadSegment> waysForCell(double lat, double lon) {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+        String cellId = cellLat + "_" + cellLon;
+        Path readyFile = cacheRoot.resolve(cellId + ".json");
+        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
 
-        List<RoadSegment> cached = memory.get(key);
-        if (cached != null) return cached;
+        List<RoadSegment> diskHit = readDiskCacheIfPresent(key, readyFile, emptyFile);
+        if (diskHit != null) return diskHit;
 
-        synchronized (fetchLock) {
-            cached = memory.get(key);
-            if (cached != null) return cached;
+        synchronized (cellLocks.computeIfAbsent(key, k -> new Object())) {
+            // Double-check: another thread may have just finished fetching this exact cell while
+            // this one was waiting for the per-cell lock.
+            diskHit = readDiskCacheIfPresent(key, readyFile, emptyFile);
+            if (diskHit != null) return diskHit;
 
-            String cellId = cellLat + "_" + cellLon;
-            Path readyFile = cacheRoot.resolve(cellId + ".json");
-            Path emptyFile = cacheRoot.resolve(cellId + ".empty");
-
-            try {
-                if (Files.isRegularFile(emptyFile)) {
-                    memory.put(key, List.of());
-                    return List.of();
-                }
-                if (Files.isRegularFile(readyFile)) {
-                    List<RoadSegment> ways = readCachedCell(readyFile);
-                    memory.put(key, ways);
-                    return ways;
-                }
-            } catch (IOException e) {
-                throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
-            }
-
-            // Pending (no marker at all): attempt a fetch now. On any failure this cell simply stays
-            // pending -- no marker is written -- so the very next access (this world's next cube, or
-            // a restarted server reading the same cache root) retries it.
+            // Pending (no marker at all): attempt a fetch now. On any failure -- including "not yet
+            // eligible per the rate limit/backoff deadline" -- this cell simply stays pending, no
+            // marker written, so the very next access (this world's next cube, or a restarted
+            // server reading the same cache root) retries it.
             if (!allowNetwork) return List.of();
             double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
             double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
             List<RoadSegment> fetched;
             try {
                 fetched = fetchCell(minLat, minLon, maxLat, maxLon);
-            } catch (IOException | InterruptedException | RuntimeException e) {
+            } catch (IOException | RuntimeException e) {
                 return List.of(); // pending stays pending; this generation call gets no road, not a permanent gap
             }
             try {
@@ -195,6 +214,29 @@ public final class RoadTileSource {
         }
     }
 
+    /** Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss, not an error. */
+    private List<RoadSegment> readDiskCacheIfPresent(long key, Path readyFile, Path emptyFile) {
+        List<RoadSegment> cached = memory.get(key);
+        if (cached != null) return cached;
+        try {
+            if (Files.isRegularFile(emptyFile)) {
+                memory.put(key, List.of());
+                return List.of();
+            }
+            if (Files.isRegularFile(readyFile)) {
+                List<RoadSegment> ways = readCachedCell(readyFile);
+                memory.put(key, ways);
+                return ways;
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
+        }
+        return null;
+    }
+
+    /** Thrown by {@link #fetchCell} when {@link #nextEligibleRequestAt} hasn't passed yet; never leaves this class. */
+    private static final class NotYetEligibleException extends RuntimeException {}
+
     /**
      * Fetches this cell via an Overpass QL {@code out geom} query against {@link #endpoint} -- an
      * opt-in hosted Overpass provider (MINECRAFT-566: John selected Overpass.ch's free tier for a
@@ -205,66 +247,67 @@ public final class RoadTileSource {
      * not the pinned/immutable snapshot the production catalog work is for, and it requires a
      * provisioned credential, so this constructor path must stay opt-in (see
      * {@code RoadNetwork.buildDefaultTileSource}'s gating) and rate-limited (see
-     * {@link #waitForRateLimit}).
+     * {@link #networkLock}/{@link #nextEligibleRequestAt}).
+     *
+     * <p>Everything here runs inside {@link #networkLock} -- the eligibility check, the one real
+     * outbound call, and updating {@link #nextEligibleRequestAt} from either the steady
+     * {@link #minRequestInterval} cadence or a 429/503's {@code Retry-After} -- so there is never
+     * more than one outstanding request to the provider from this instance, and (per comment 55450)
+     * this never sleeps: a caller that isn't yet eligible gets {@link NotYetEligibleException}
+     * immediately, not a blocked wait.
      */
     private List<RoadSegment> fetchCell(double minLat, double minLon, double maxLat, double maxLon)
-            throws IOException, InterruptedException {
-        waitForRateLimit();
-        String query = """
-                [out:json][timeout:%d];
-                (
-                  way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|service|road)$"](%f,%f,%f,%f);
-                );
-                out geom;
-                """.formatted(Math.max(1, timeout.toSeconds()), minLat, minLon, maxLat, maxLon);
-        HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(endpoint)
-                .timeout(timeout)
-                .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566)")
-                .POST(HttpRequest.BodyPublishers.ofString(query, StandardCharsets.UTF_8));
-        if (shouldSendApiKeyTo(endpoint, apiKey)) {
-            requestBuilder.header("X-API-Key", apiKey); // never logged; see this field's own javadoc
+            throws IOException {
+        String body;
+        synchronized (networkLock) {
+            if (Instant.now().isBefore(nextEligibleRequestAt)) {
+                throw new NotYetEligibleException();
+            }
+            String query = """
+                    [out:json][timeout:%d];
+                    (
+                      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|service|road)$"](%f,%f,%f,%f);
+                    );
+                    out geom;
+                    """.formatted(Math.max(1, timeout.toSeconds()), minLat, minLon, maxLat, maxLon);
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(endpoint)
+                    .timeout(timeout)
+                    .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566)")
+                    .POST(HttpRequest.BodyPublishers.ofString(query, StandardCharsets.UTF_8));
+            if (shouldSendApiKeyTo(endpoint, apiKey)) {
+                requestBuilder.header("X-API-Key", apiKey); // never logged; see this field's own javadoc
+            }
+            HttpResponse<String> response;
+            try {
+                response = http.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while fetching road tile", e);
+            }
+            Instant afterSteadyInterval = Instant.now().plus(minRequestInterval);
+            nextEligibleRequestAt = afterSteadyInterval;
+            if (response.statusCode() == 429 || response.statusCode() == 503) {
+                // overpass.ch docs (https://overpass.ch/docs, "Limits & plans"/"Errors"): both
+                // rate_limited/concurrency_limit/quota_exceeded (429) and server_busy (503) carry a
+                // Retry-After header naming the real wait. Takes effect for the NEXT fetch attempt
+                // from this instance, whichever (the steady interval or this) is later.
+                response.headers().firstValue("Retry-After").ifPresent(value -> {
+                    try {
+                        Instant afterRetryAfter = Instant.now().plusSeconds(Long.parseLong(value.trim()));
+                        if (afterRetryAfter.isAfter(nextEligibleRequestAt)) nextEligibleRequestAt = afterRetryAfter;
+                    } catch (NumberFormatException ignored) {
+                        // Retry-After may also be an HTTP-date per RFC 9110; not parsed here -- the
+                        // configured minRequestInterval still applies as a floor either way.
+                    }
+                });
+            }
+            if (response.statusCode() != 200) {
+                throw new IOException("Overpass provider returned HTTP " + response.statusCode() + " for cell fetch");
+            }
+            body = response.body();
         }
-        HttpResponse<String> response = http.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        lastRequestAt = Instant.now();
-        if (response.statusCode() == 429 || response.statusCode() == 503) {
-            // overpass.ch docs (https://overpass.ch/docs, "Limits & plans"/"Errors"): both
-            // rate_limited/concurrency_limit/quota_exceeded (429) and server_busy (503) carry a
-            // Retry-After header naming the real wait. Respected for the NEXT fetch attempt from
-            // this instance, on top of (not instead of) the configured minRequestInterval.
-            response.headers().firstValue("Retry-After").ifPresent(value -> {
-                try {
-                    serverRequestedDelay = Duration.ofSeconds(Long.parseLong(value.trim()));
-                } catch (NumberFormatException ignored) {
-                    // Retry-After may also be an HTTP-date per RFC 9110; not parsed here -- the
-                    // configured minRequestInterval still applies as a floor either way.
-                }
-            });
-        }
-        if (response.statusCode() != 200) {
-            throw new IOException("Overpass provider returned HTTP " + response.statusCode() + " for cell fetch");
-        }
-        checkForErrorRemark(response.body());
-        return OverpassWayParser.parseWays(response.body());
-    }
-
-    /**
-     * Enforces {@link #minRequestInterval} between the start of consecutive fetches, measured from
-     * the end of the previous request (so a slow request's own duration counts toward the gap too,
-     * rather than stacking a further delay on top of it), and any {@link #serverRequestedDelay} a
-     * prior 429/503 response's {@code Retry-After} asked for (consumed once, then reset). Called
-     * inside {@link #fetchLock}, so this also serializes with the "one in-flight request" guarantee
-     * -- there is never more than one outstanding call to a rate-limited provider from a single
-     * {@code RoadTileSource} instance.
-     */
-    private void waitForRateLimit() throws InterruptedException {
-        Duration requiredInterval = minRequestInterval.compareTo(serverRequestedDelay) >= 0 ? minRequestInterval : serverRequestedDelay;
-        serverRequestedDelay = Duration.ZERO;
-        if (requiredInterval.isZero()) return;
-        Duration sinceLast = Duration.between(lastRequestAt, Instant.now());
-        Duration remaining = requiredInterval.minus(sinceLast);
-        if (remaining.isPositive()) {
-            Thread.sleep(remaining.toMillis());
-        }
+        checkForErrorRemark(body);
+        return OverpassWayParser.parseWays(body);
     }
 
     /**

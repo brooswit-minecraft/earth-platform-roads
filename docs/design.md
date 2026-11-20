@@ -142,11 +142,22 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   preview but can never leak the credential elsewhere; `shouldSendApiKeyTo` is unit-tested directly
   against that exact URI plus several near-miss decoys (wrong path, wrong scheme, no key). A 429/503
   response's `Retry-After` header (also verified against the docs) is honored for the next fetch
-  attempt, on top of the configured `previewMinRequestIntervalMs` (default 5000ms) `RoadTileSource`
-  already enforces alongside its one-in-flight-request guarantee.
+  attempt, on top of the configured `previewMinRequestIntervalMs` (default 5000ms).
   `RoadNetworkProductionWiringTest.withNoOptInPropertiesSetTheDefaultWiringNeverTouchesTheNetwork`
   and `.optingIntoTheProviderWithoutAKeyStillDisablesLiveFetch` prove zero requests happen either
   with no opt-in at all, or with the provider/endpoint opted in but no key present.
+- **A disk-cache hit never waits behind a cold cell's backoff (MINECRAFT-566 comment 55450).**
+  `RoadTileSource` originally used one global lock around both disk reads and the outbound request
+  (including the rate-limit sleep) -- found, not observed as a real hang, but real: after a
+  restart, a different already-cached tile could wait behind an unrelated cell's cold request. Now
+  split into `cellLocks` (one lock per cell, dedupes concurrent fetches of the SAME cell only) and
+  `networkLock` (serializes the one actual outbound request network-wide, held only for that
+  request's own duration). Disk-cache hits in `waysForCell` take neither lock at all -- same as
+  `cachedWaysForCellOrEmpty` always has. Rate limiting no longer sleeps: `nextEligibleRequestAt`
+  is a deadline, and a fetch attempted before it is declined immediately (pending, retryable) rather
+  than blocked. `RoadTileSourceTest.aDiskCachedTileIsNotBlockedBehindAColdCellsProviderBackoff`
+  seeds a ready tile on disk, triggers a 429+`Retry-After` on a different cell through a fresh
+  instance (a restart), and asserts the seeded tile still returns promptly with zero extra HTTP.
   `RoadTileSource.fetchCell` speaks real Overpass QL (`out geom`) again, with `checkForErrorRemark`
   restored (and its two tests) -- that failure shape is reachable again now that this class talks to
   a real Overpass-protocol endpoint. This preview is explicitly live data, not the pinned/immutable
