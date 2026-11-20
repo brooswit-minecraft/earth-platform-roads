@@ -201,7 +201,12 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   neighbor, the crossing way still found) and
   `.aProductionCadenceEmptyCacheRunCarriesTheSeamThroughRealGeneration` (the real mixin, the real
   5000ms-order rate limit -- not zeroed -- through the actual prepare-to-generation path, exactly
-  one real fetch, the neighboring candidate present before generation).
+  one real fetch, the neighboring candidate present before generation). That test's synthetic
+  coordinates could fall in open ocean (where the road mixin correctly skips painting regardless of
+  this fix), so it stops at proving the candidate is present, not that a block is painted --
+  comment 55458 named that gap explicitly; `.theReadSideNeighborCheckActuallyPaintsARoadSurfaceAtTheBoundaryColumn`
+  closes it at real, unambiguously dry-land coordinates (near Boulder, Colorado), actually calling
+  `generate` at the boundary column and asserting the real road-surface block.
   **This still only helps a FRESH (not yet generated) cube's read** -- the cached data has to exist
   by the time that column is evaluated. A cube already generated before any relevant fetch
   happened is not retrofitted: this mod has no mechanism to revise an already-generated cube when

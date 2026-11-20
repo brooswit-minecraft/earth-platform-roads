@@ -223,8 +223,63 @@ class RoadTilePrefetchMixinTest {
             // where EarthGeneratorRoadMixin correctly skips painting a road underwater regardless
             // of this fix -- that would be a false failure unrelated to what this test checks. The
             // "candidate present before generation" claim is exactly what segmentCoveringColumn
-            // proves; RoadGenerationTest and RealOsmFixtureSmokeTest already cover real block
-            // painting at real, dry-land coordinates.
+            // proves; the next test closes the "not surface placement" gap named in comment 55458.
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55458's own named gap: "Production-cadence test proved cache-only
+     * lookup across the tile edge, not surface placement." This test closes it, at real,
+     * unambiguously dry-land coordinates (near Boulder, Colorado -- chosen by me, not any of
+     * John's locations) so {@code EarthGeneratorRoadMixin}'s own "skip if under water" check can
+     * never produce a false failure the way it would have at the previous test's synthetic,
+     * possibly-oceanic coordinates. Same mechanism as before (one cell fetched, its neighbor never
+     * fetched, a real production-order rate limit), but this time actually calls {@code
+     * generator.generate} at the boundary column and asserts a real road-surface block is placed.
+     */
+    @Test
+    void theReadSideNeighborCheckActuallyPaintsARoadSurfaceAtTheBoundaryColumn(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        String response = """
+                {"elements":[{"type":"way","id":555022,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Boulder Boundary Street"},
+                  "geometry":[{"lat":40.006,"lon":-105.27},{"lat":40.016,"lon":-105.27}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10),
+                    null, Duration.ofMillis(5000)); // the real production-order rate limit, not zeroed
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] southBlock = generator.block(40.008, -105.27); // cell 4000_-10527
+
+            generator.prepareNear(southBlock[0], southBlock[1]);
+            assertEquals(1, requests.get(), "Expected exactly one real fetch -- the point's own cell only");
+
+            int[] northColumn = generator.block(40.014, -105.27); // the never-fetched neighbor cell 4001_-10527, on the way's own line
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), northColumn[0], northColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555022L,
+                    "Expected the crossing way present at the neighboring column. Got " + covering);
+            assertEquals(1, requests.get(), "Expected the neighbor-cell read to trigger no additional request");
+
+            int groundY = generator.surfaceY(northColumn[0], northColumn[1]);
+            var section = generator.generate(northColumn[0] >> 4, groundY >> 4, northColumn[1] >> 4);
+            var state = section.getBlockState(northColumn[0] & 15, groundY & 15, northColumn[1] & 15);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                    "Expected real generation to paint road surface at the boundary column, got " + state);
         } finally {
             stub.stop(0);
         }
