@@ -68,8 +68,23 @@ public final class RoadNetwork {
     /** The real, lazily-built production tile source; {@code null} until first needed, or if FML paths are unavailable. */
     private static volatile RoadTileSource defaultTileSource;
 
-    /** Default live Overpass-compatible endpoint; overridable with {@code -Dearthplatformroads.overpassEndpoint=...}. */
-    private static final String DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
+    /**
+     * Default live endpoint: the official OSM API's bounded map export, NOT Overpass.
+     *
+     * <p>Three public Overpass mirrors (overpass-api.de, overpass.kumi.systems,
+     * overpass.openstreetmap.ru) were each tried and timed out within this same development
+     * session -- confirmed as genuine query-endpoint overload (a direct GET to
+     * overpass-api.de/ itself returns HTTP 406 in under a second; the interpreter endpoint is what's
+     * overloaded), not a network-level block. The official API's {@code GET .../map.json?bbox=...}
+     * succeeded immediately on every attempt instead, so it is the default here per MINECRAFT-566
+     * review: "prioritize a real repeatable fetch... use an existing suitable service if available."
+     * Overridable with {@code -Dearthplatformroads.osmApiEndpoint=...}.
+     *
+     * <p><b>Known caveat</b>: this API bounds a single export to 0.25 square degrees and a server-
+     * side node-count limit; this mod's own {@value #CELL_DEGREES}-degree cells are several orders of
+     * magnitude smaller than that bound, so no cell this mod requests can ever hit it.
+     */
+    private static final String DEFAULT_OSM_API_ENDPOINT = "https://api.openstreetmap.org/api/0.6/map.json";
     private static final Duration TILE_FETCH_TIMEOUT = Duration.ofSeconds(20);
 
     private static volatile RoadNetwork instance;
@@ -146,9 +161,9 @@ public final class RoadNetwork {
     }
 
     /**
-     * Builds the real production {@link RoadTileSource}: a live Overpass-compatible endpoint
-     * (default {@value #DEFAULT_OVERPASS_ENDPOINT}, overridable with
-     * {@code -Dearthplatformroads.overpassEndpoint=...}) and a persistent cache directory under the
+     * Builds the real production {@link RoadTileSource}: a live endpoint (default
+     * {@value #DEFAULT_OSM_API_ENDPOINT}, overridable with
+     * {@code -Dearthplatformroads.osmApiEndpoint=...}) and a persistent cache directory under the
      * game's own install, {@code <gamedir>/earthplatformroads/road_tiles/}.
      *
      * <p><b>Named, honest limitation</b>: this cache is scoped to the whole game install, not to
@@ -166,7 +181,7 @@ public final class RoadNetwork {
                     : FMLPaths.GAMEDIR.get().resolve("earthplatformroads").resolve("road_tiles");
             URI endpoint = tileEndpointOverride != null
                     ? tileEndpointOverride
-                    : URI.create(System.getProperty("earthplatformroads.overpassEndpoint", DEFAULT_OVERPASS_ENDPOINT));
+                    : URI.create(System.getProperty("earthplatformroads.osmApiEndpoint", DEFAULT_OSM_API_ENDPOINT));
             return new RoadTileSource(endpoint, cacheRoot, true, TILE_FETCH_TIMEOUT);
         } catch (RuntimeException e) {
             return null;

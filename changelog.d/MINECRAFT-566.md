@@ -10,12 +10,14 @@ bump: minor
   `data/earthplatformroads/roads/regions/index.json`; external regions are every `*.json` file
   dropped into `config/earthplatformroads/roads/regions/` in a real install.
 - `RoadTileSource`: automatic, live road-tile fetch and disk cache, modeled on Earth Platform's own
-  `TerrariumTileSource`. The first time a destination's cell is needed it is fetched from a live
-  Overpass-compatible endpoint and cached; a network failure leaves the cell retryable (never
-  permanently marked as a roadless gap); a genuine empty result stays confirmed-empty.
-  `EarthGeneratorPrepareMixin` hooks Earth Platform's own `prepare`/`prepareNear` "fetch ahead of
-  generation" entry points to trigger this off the hot generation path, so the actual `surface()`
-  hook (and therefore Earth Platform's synchronous `loadNow`) never blocks on HTTP.
+  `TerrariumTileSource`. The first time a destination's cell is needed it is fetched from the
+  official OSM API's bounded map export (not Overpass -- three public mirrors were unreachable this
+  session; this endpoint answered immediately) and cached; a network failure leaves the cell
+  retryable (never permanently marked as a roadless gap); a genuine empty result stays
+  confirmed-empty. `EarthGeneratorPrepareMixin` hooks Earth Platform's own `prepare`/`prepareNear`
+  "fetch ahead of generation" entry points to trigger this off the hot generation path, so the
+  actual `surface()` hook (and therefore Earth Platform's synchronous `loadNow`) never blocks on
+  HTTP.
 - Layered-blackstone road surfaces at a real ground-height step: a dedicated compat block
   (`LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE`) decaying by Chebyshev distance to the nearest
   same-road neighbor with lower real ground height (`RoadSurfaceLayering`), verified against real
@@ -37,7 +39,9 @@ bump: minor
   multi-kilometre reach matching Earth Platform's own `prepareNear`.
 - Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport path
   `prepareNear` covers) has no dedicated readiness handling yet.
-- No real multi-way Yosemite extract or real distant-site extract with full source-vs-generated
-  accounting (class counts, connected intersections, tile boundary, documented omissions) exists.
-- No disposable-profile in-game visual/collision/seam demonstration has been performed; this
-  requires an actual running Minecraft client, which this agent's environment does not have.
+- `RoadNetwork.segments()`/`junctions()`/`excludedBridgesAndTunnels()` only scan the preloaded
+  bundled+external region list -- they do not see live-tile-sourced ways.
+- The tile cache is scoped to the whole game install, not per-save.
+- A disposable-profile playtest on the bundled Yosemite extract confirmed the road looks smooth
+  (full Slopes/car/Flowing Fluids pack); the live-tile-fetched path (an unbundled destination) has
+  not yet had an in-game visual confirmation.

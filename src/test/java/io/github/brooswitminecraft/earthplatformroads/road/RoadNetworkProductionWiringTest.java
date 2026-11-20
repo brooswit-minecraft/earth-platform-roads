@@ -32,9 +32,11 @@ class RoadNetworkProductionWiringTest {
     void anOrdinaryInstallWithNoTestSetterStillRequestsAndFindsARoad(@TempDir Path cacheRoot) throws IOException {
         var requestCount = new java.util.concurrent.atomic.AtomicInteger();
         String response = """
-                {"elements":[{"type":"way","id":555003,"nodes":[1,2],
-                  "tags":{"highway":"secondary","name":"Production Wiring Test Street"},
-                  "geometry":[{"lat":43.0,"lon":-108.0},{"lat":43.001,"lon":-108.001}]}]}
+                {"elements":[
+                  {"type":"node","id":1,"lat":43.0,"lon":-108.0},
+                  {"type":"node","id":2,"lat":43.001,"lon":-108.001},
+                  {"type":"way","id":555003,"nodes":[1,2],
+                    "tags":{"highway":"secondary","name":"Production Wiring Test Street"}}]}
                 """;
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {

@@ -12,7 +12,9 @@
   "attribution": "http://www.openstreetmap.org/copyright",
   "license": "http://opendatacommons.org/licenses/odbl/1-0/",
   "source_file_sha256": "c5bba9ad6d7e45a60a9b6cb8cfefbdf64f5c155184fb1663497057517886906f",
-  "derived_overpass_shaped_file_sha256": "a113e0905ae3c1fff37fc52039dcf38337ae297f0c7c7cc2792747d93276fbaf",
+  "fixture_file": "sentinel_southside_junction.osm_api_raw.json",
+  "fixture_file_sha256": "297f1e36fac056f2ff49f6ae947967a518a8110eada54fd9ed722506aaca15b7",
+  "fixture_shape_note": "As of the RoadTileSource fetch-source swap off Overpass, this fixture is the raw OSM API node/way shape trimmed to only nodes referenced by a highway-tagged way, with no geometry-resolution conversion step -- it is exactly what OsmApiMapParser consumes in production, not a derived/reshaped copy. The superseded 'overpass_shaped' fixture (converted for the old Overpass-shaped OverpassWayParser-only fetch path) is removed.",
   "way_count_converted": 27,
   "way_ids": [
     10424289,

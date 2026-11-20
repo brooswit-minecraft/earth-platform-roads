@@ -35,11 +35,11 @@ import org.junit.jupiter.api.io.TempDir;
  * bounded export from the official OSM API (api.openstreetmap.org/api/0.6/map.json, NOT Overpass --
  * that endpoint was unreachable three times earlier this session) at Southside Drive x Sentinel
  * Drive, ~5km east of the bundled Yosemite extract. Provenance (capture time, attribution, SHA-256
- * of both the raw API response and the derived Overpass-shaped fixture, all 27 converted way IDs)
- * is recorded in {@code src/test/resources/fixtures/sentinel_southside_junction.provenance.json}.
- * The real OSM "nodes" + "ways" response was resolved into the Overpass-shaped {@code "geometry"}
- * array {@code OverpassWayParser} expects by {@code /tmp/convert_osm_to_overpass_shape.py}
- * (not checked in -- a one-off conversion script, not part of this mod).
+ * of both the full raw API response and the checked-in fixture, all 27 relevant way IDs) is recorded
+ * in {@code src/test/resources/fixtures/sentinel_southside_junction.provenance.json}. The fixture is
+ * the raw OSM API "node"/"way" response shape (trimmed to only nodes a highway-tagged way actually
+ * references) -- exactly what {@link OsmApiMapParser} resolves in production now that the default
+ * fetch moved off Overpass, with no separate conversion step.
  *
  * <p>This fixture genuinely contains two real {@code bridge=yes} ways (Sentinel Bridge over the
  * Merced River) -- the first time this mod's bridge-skip behavior is checked against real tagged
@@ -94,7 +94,7 @@ class RealOsmFixtureSmokeTest {
     void realOsmDataAtSentinelSouthsideJunctionGeneratesRoadsAndSkipsTheRealBridge(
             @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         String fixtureJson;
-        try (var in = RealOsmFixtureSmokeTest.class.getResourceAsStream("/fixtures/sentinel_southside_junction.overpass_shaped.json")) {
+        try (var in = RealOsmFixtureSmokeTest.class.getResourceAsStream("/fixtures/sentinel_southside_junction.osm_api_raw.json")) {
             fixtureJson = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
 

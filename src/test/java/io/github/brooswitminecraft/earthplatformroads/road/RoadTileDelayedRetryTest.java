@@ -88,9 +88,11 @@ class RoadTileDelayedRetryTest {
     @Test
     void aHeldBackTileGeneratesNoRoadThenAFreshInstanceAfterReleaseDoes(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         String response = """
-                {"elements":[{"type":"way","id":555004,"nodes":[1,2],
-                  "tags":{"highway":"secondary","name":"Delayed Retry Test Street"},
-                  "geometry":[{"lat":37.7240,"lon":-119.6365},{"lat":37.7241,"lon":-119.6366}]}]}
+                {"elements":[
+                  {"type":"node","id":1,"lat":37.7240,"lon":-119.6365},
+                  {"type":"node","id":2,"lat":37.7241,"lon":-119.6366},
+                  {"type":"way","id":555004,"nodes":[1,2],
+                    "tags":{"highway":"secondary","name":"Delayed Retry Test Street"}}]}
                 """;
 
         // Phase 1: the tile is held back -- every fetch attempt fails.

@@ -113,8 +113,8 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   above as the actual milestone deliverable: they both still require a player or operator to find
   and install a region file for a destination ahead of time, not coverage that "appears
   automatically wherever he travels." `RoadTileSource` fetches a destination's own
-  `RoadNetwork.CELL_DEGREES`-degree cell from a live Overpass-compatible endpoint the first time it
-  is needed and caches it to disk, modeled directly on
+  `RoadNetwork.CELL_DEGREES`-degree cell from a live endpoint the first time it is needed and caches
+  it to disk, modeled directly on
   `io.earthplatform.geography.globe.TerrariumTileSource` -- the pattern Earth Platform's own
   dependency already uses for this exact generation-time constraint. Three cache states
   (`RoadTileSource`'s own class doc has the full reasoning): **ready** (fetched, cached, read every
@@ -123,6 +123,22 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   **pending** (never fetched successfully -- a network failure leaves it here deliberately, so an
   outage can never be permanently baked in as a roadless gap; the very next access, including after
   a server restart reading the same cache root, retries).
+- **Live fetch source: the official OSM API, not Overpass.** Three public Overpass mirrors
+  (overpass-api.de, overpass.kumi.systems, overpass.openstreetmap.ru) were each unreachable in this
+  same development session -- confirmed as genuine query-endpoint overload (a direct GET to
+  overpass-api.de/ itself answers HTTP 406 in under a second; the interpreter path specifically is
+  overloaded), not a network-level block. The official OSM API's bounded `GET
+  .../api/0.6/map.json?bbox=...` export answered immediately every time instead, so `RoadTileSource`
+  now uses that as its default (and only -- its request/response shapes no longer match Overpass's
+  `out geom`) fetch source; `OsmApiMapParser` resolves its raw `"node"`/`"way"` elements (a way lists
+  only its nodes' IDs, not their coordinates) into the same way shape the rest of the pipeline
+  already expects. Overridable with `-Dearthplatformroads.osmApiEndpoint=...`. **Known caveat:** this
+  API bounds a single export to 0.25 square degrees and a server-side node-count limit; this mod's
+  `CELL_DEGREES`-sized cells are orders of magnitude under that bound, so no cell this mod requests
+  can hit it. One dropped protection from this swap: c61b2d4's Overpass-"remark" check
+  (`checkForErrorRemark`) and its two tests were removed, since that failure shape (a 200 response
+  with an embedded error) was specific to Overpass's own output format and has no code path left
+  that can reach it against this REST API, which reports real failures as real non-200 statuses.
 - **Where fetching happens, and where it never does.** `EarthGeneratorPrepareMixin` hooks Earth
   Platform's own documented "fetching data ahead of generation" entry points,
   `EarthGenerator.prepare`/`.prepareNear` (see that class's own "Reading this file" section) --
@@ -134,8 +150,8 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   never fetches -- `RoadNetwork.candidatesNear` only ever calls the read-only
   `RoadTileSource.cachedWaysForCellOrEmpty`, so the hot generation path, including Earth Platform's
   `loadNow` (explicitly synchronous on whatever thread calls it, possibly the main server thread per
-  its own doc comment), never blocks on HTTP. Verified end-to-end against a local HTTP stub (never
-  the real, demonstrably flaky public Overpass) in `RoadTileSourceTest` (fetch/cache/pending-retry/
+  its own doc comment), never blocks on HTTP. Verified end-to-end against a local HTTP stub (never a
+  real live service, deterministically) in `RoadTileSourceTest` (fetch/cache/pending-retry/
   confirmed-empty, each independently) and `RoadTilePrefetchMixinTest` (calling the real
   `EarthGenerator.prepareNear` through the real mixin populates the cache; a subsequent
   `RoadNetwork` lookup finds it with zero further fetches).
@@ -176,11 +192,15 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   namespace -- see `compat/layeredslopes/LayeredSlopesCompat.java`) instead of always painting a
   full block.
   `under()` is always a full block, never layered, matching the ticket's explicit instruction
-  (`EarthGenerator` reads `under()` at depths 1-3). **The slope-to-layers mapping
-  (`RoadSurfaceLayering.SLOPE_UNITS_PER_LAYER`) is a first heuristic verified only by its own pure
-  unit test (`RoadSurfaceLayeringTest`) and by a synthetic collision-shape check
-  (`RoadGenerationTest#anInclinedColumnUsesTheLayeredCompatBlockNotAWholeBlockStair`) -- no
-  build/playtest confirmed how it actually looks or feels across a real inclined run in-game.**
+  (`EarthGenerator` reads `under()` at depths 1-3). The distance-to-layers decay
+  (`RoadSurfaceLayering.layersForNearestLowerNeighbor`) is verified by its own pure unit test
+  (`RoadSurfaceLayeringTest`) and against real measured generated data
+  (`RoadGenerationTest#aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff`,
+  `RealOsmFixtureSmokeTest`). **Updated:** a disposable-profile playtest on the captured Yosemite
+  slice (the bundled `yosemite_valley.json` extract) confirmed the road looks smooth with the full
+  Slopes/car/Flowing Fluids pack -- the first real in-game visual confirmation of this layering
+  behavior, not just a synthetic collision-shape check. That preview build is left intact; it is not
+  evidence about the live-tile-fetched path, which still has no in-game visual confirmation.
 - **Still only one bundled region.** Only Southside Drive's original pinned extract is bundled as
   of this change. A second, geographically separate, bigger hand-curated extract (the ticket
   originally suggested Presidio Parkway) is no longer the milestone's deliverable: John's

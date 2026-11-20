@@ -53,7 +53,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * </ul>
  */
 public final class RoadTileSource {
-    private final URI overpassEndpoint;
+    private final URI endpoint;
     private final Path cacheRoot;
     private final boolean allowNetwork;
     private final Duration timeout;
@@ -61,8 +61,8 @@ public final class RoadTileSource {
     private final Object fetchLock = new Object();
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
 
-    public RoadTileSource(URI overpassEndpoint, Path cacheRoot, boolean allowNetwork, Duration timeout) {
-        this.overpassEndpoint = overpassEndpoint;
+    public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout) {
+        this.endpoint = endpoint;
         this.cacheRoot = cacheRoot;
         this.allowNetwork = allowNetwork;
         this.timeout = timeout;
@@ -151,45 +151,40 @@ public final class RoadTileSource {
         }
     }
 
+    /**
+     * Fetches this cell via a plain bounded GET against the official OSM API's map export
+     * ({@code GET .../map.json?bbox=minLon,minLat,maxLon,maxLat}) rather than an Overpass QL query.
+     * See {@link RoadNetwork}'s default-endpoint doc for why: three public Overpass mirrors were
+     * unreachable in this same session, while this endpoint answered immediately every time. The
+     * response is raw, separate {@code "node"}/{@code "way"}
+     * elements (a way lists only its nodes' IDs, not their coordinates); {@link OsmApiMapParser}
+     * resolves that into the same {@code "geometry"}-bearing way shape {@link OverpassWayParser}
+     * (and the on-disk cache format) already expect, so the rest of this pipeline -- caching,
+     * {@code RoadClass} filtering, {@code RoadNetwork.parseWay} -- is unchanged.
+     */
     private List<RoadSegment> fetchCell(double minLat, double minLon, double maxLat, double maxLon)
             throws IOException, InterruptedException {
-        String query = """
-                [out:json][timeout:%d];
-                (
-                  way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|service|road)$"](%f,%f,%f,%f);
-                );
-                out geom;
-                """.formatted(Math.max(1, timeout.toSeconds()), minLat, minLon, maxLat, maxLon);
-        HttpRequest request = HttpRequest.newBuilder(overpassEndpoint)
+        String bbox = minLon + "," + minLat + "," + maxLon + "," + maxLat;
+        URI requestUri = URI.create(endpoint + (endpoint.toString().contains("?") ? "&" : "?") + "bbox=" + bbox);
+        HttpRequest request = HttpRequest.newBuilder(requestUri)
                 .timeout(timeout)
-                .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566)")
-                .POST(HttpRequest.BodyPublishers.ofString(query, StandardCharsets.UTF_8))
+                .header("User-Agent", "earth-platform-roads/0.1 (MINECRAFT-566; " + System.getProperty("earthplatformroads.contact", "unspecified-contact") + ")")
+                .GET()
                 .build();
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() != 200) {
-            throw new IOException("Overpass returned HTTP " + response.statusCode() + " for cell fetch");
+            throw new IOException("OSM API map export returned HTTP " + response.statusCode() + " for cell fetch");
         }
-        checkForErrorRemark(response.body());
-        return OverpassWayParser.parseWays(response.body());
+        List<JsonObject> resolvedWays = OsmApiMapParser.resolveWays(response.body());
+        return OverpassWayParser.parseWays(wrapAsWaysArray(resolvedWays));
     }
 
-    /**
-     * Overpass can start an HTTP 200 response, hit a runtime error partway through (e.g. its own
-     * {@code timeout:} budget expiring mid-query), and still finish the response with a top-level
-     * {@code "remark"} string describing that failure -- see Overpass's own {@code
-     * Output_JSON::write_footer}, which only ever emits {@code "remark"} when it has an error/warning
-     * message to report. A 200 status alone is therefore not proof the body is a complete, trustworthy
-     * answer: this must be checked and treated as a failure (same as a non-200 status or a network
-     * exception) BEFORE this cell's ways are written to the ready or confirmed-empty cache -- missing
-     * this would quietly persist an incomplete fetch (zero elements as confirmed-empty forever, or
-     * fewer ways than actually exist as a wrongly "complete" ready tile) exactly where review flagged
-     * this as a real gap.
-     */
-    private static void checkForErrorRemark(String responseBody) throws IOException {
-        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
-        if (root.has("remark") && !root.get("remark").getAsString().isEmpty()) {
-            throw new IOException("Overpass reported an error remark despite HTTP 200: " + root.get("remark").getAsString());
-        }
+    private static String wrapAsWaysArray(List<JsonObject> resolvedWays) {
+        var elements = new com.google.gson.JsonArray();
+        resolvedWays.forEach(elements::add);
+        JsonObject wrapper = new JsonObject();
+        wrapper.add("elements", elements);
+        return wrapper.toString();
     }
 
     private static List<RoadSegment> readCachedCell(Path readyFile) throws IOException {
