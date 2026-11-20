@@ -178,26 +178,38 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   confirmed-empty, each independently) and `RoadTilePrefetchMixinTest` (calling the real
   `EarthGenerator.prepareNear` through the real mixin populates the cache; a subsequent
   `RoadNetwork` lookup finds it with zero further fetches).
-- **A road crossing an unfetched neighbor's boundary was silently omitted -- found live, fixed
-  (MINECRAFT-566 comment 55454).** John saw a real road abruptly end on bare ground on Zippy; his
-  own read of the cache found the player's tile and 7/8 of its neighbors with no ready/empty
-  marker. `RoadNetwork.candidatesNear` only ever checks a column's OWN cell -- the mixin originally
-  prefetched only the single cell a point falls in, so a mapped way crossing into an adjacent,
-  still-pending cell had nowhere to be found at that boundary: not a missing way, not a bridge/
-  tunnel omission, just a genuinely unfetched neighbor. Reproduced synthetically (per "not the
-  user's destination") in `RoadTilePrefetchMixinTest
-  .aCrossingRoadIsSilentlyOmittedAtAnUnfetchedNeighborsBoundary` (bypassing the mixin, calling
-  `RoadTileSource.waysForCell` directly for only one cell, exactly the old narrow behavior). Fixed
-  by widening `EarthGeneratorPrepareMixin.prefetch` to also fetch the full Moore neighborhood (the
-  8 surrounding cells) around every prepare call, confirmed in `.theWidenedPrefetchFetchesTheNeighborSoACrossingRoadIsNotOmitted`.
-  **This only helps a FRESH (not yet generated) cube** -- it runs before generation, at prepare
-  time. A cube already generated before this fix, or before a neighbor's fetch happened to
-  succeed, is not retrofitted: this mod has no mechanism to revise an already-generated cube when
-  road data arrives later, and comment 55454 explicitly separates that (a harder, different
-  problem) from this fix and does not ask for it. Still a known simplification even with the
-  widening: one ring of neighbor cells is still narrower than Earth Platform's own multi-kilometre
-  `NEAR_REACH`, so a column two or more cells away from the original prepare point can still see a
-  transient gap.
+- **A road crossing an unfetched neighbor's boundary was silently omitted -- found live, fixed on
+  the read side (MINECRAFT-566 comments 55454/55456).** John saw a real road abruptly end on bare
+  ground on Zippy; his own read of the cache found the player's tile and 7/8 of its neighbors with
+  no ready/empty marker. `RoadNetwork.candidatesNear` originally only ever checked a column's OWN
+  cell -- a mapped way crossing into an adjacent, still-pending cell had nowhere to be found at
+  that boundary: not a missing way, not a bridge/tunnel omission, just a genuinely unfetched
+  neighbor.
+  **First fix attempt, found broken under real conditions (55456):** widening
+  `EarthGeneratorPrepareMixin.prefetch` itself to issue up to 9 sequential `waysForCell` calls (the
+  point's cell plus its 8 Moore neighbors). With a realistic multi-second
+  `previewMinRequestIntervalMs`, only the first of those 9 calls could succeed before the
+  next-eligible deadline rejected the rest -- the regression test had used the zero-interval
+  constructor and never caught this.
+  **Actual fix:** `RoadNetwork.candidatesNear` now checks the Moore neighborhood's CACHED data
+  (read-only, no fetch) when evaluating a column, not just its own cell. A live provider's bbox
+  response for one cell already carries the full geometry of any way merely touching that cell,
+  including the portion crossing into a neighbor -- so the neighbor's own fetch was never actually
+  required to carry the seam; `EarthGeneratorPrepareMixin` stays at its original single-cell
+  prefetch. Confirmed in `RoadTilePrefetchMixinTest
+  .aSingleFetchCarriesACrossingRoadIntoItsNeverFetchedNeighbor` (one fetched cell, one never-fetched
+  neighbor, the crossing way still found) and
+  `.aProductionCadenceEmptyCacheRunCarriesTheSeamThroughRealGeneration` (the real mixin, the real
+  5000ms-order rate limit -- not zeroed -- through the actual prepare-to-generation path, exactly
+  one real fetch, the neighboring candidate present before generation).
+  **This still only helps a FRESH (not yet generated) cube's read** -- the cached data has to exist
+  by the time that column is evaluated. A cube already generated before any relevant fetch
+  happened is not retrofitted: this mod has no mechanism to revise an already-generated cube when
+  road data arrives later, and 55454/55456 explicitly separate that (a harder, different problem)
+  from this fix and do not ask for it. Still a known simplification: a column two or more cells
+  away from every cell that has ever actually been fetched can still see a transient gap -- the
+  neighborhood check only extends as far as what some fetch, anywhere nearby, already happened to
+  cover.
 - **Not attempted this pass, named explicitly as still-open:** separate readiness handling for
   Chunky pre-generation specifically (`ServerCubeWorld.pregenerate`/`ChunkyCompat.pregenerate` call
   `generate()` directly, off the travel/teleport path `prepareNear` covers); a real multi-way

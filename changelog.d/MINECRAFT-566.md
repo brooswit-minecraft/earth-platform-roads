@@ -38,15 +38,19 @@ bump: minor
 
 ### Fixed
 - A mapped road crossing into a neighboring, not-yet-fetched cell was silently omitted at that
-  boundary (found live on Zippy, reproduced synthetically). `EarthGeneratorPrepareMixin` now
-  prefetches the full Moore neighborhood (8 surrounding cells) around every prepare call, not just
-  the point's own cell. Only helps fresh (not yet generated) cubes -- an already-generated cube is
-  never retrofitted when a neighbor's data arrives later.
+  boundary (found live on Zippy, reproduced synthetically). A first fix attempt (widening the
+  prefetch mixin itself to issue up to 9 requests) was found broken under a realistic rate limit --
+  only the first of those 9 could succeed before the next-eligible deadline rejected the rest.
+  Fixed instead on the read side: `RoadNetwork.candidatesNear` now also checks the Moore
+  neighborhood's already-cached data (no extra fetch) when evaluating a column, since a crossing
+  way's full geometry is already present in whichever single cell actually got fetched. Only helps
+  a fresh (not yet generated) cube's read -- an already-generated cube is never retrofitted when a
+  neighbor's data arrives later.
 
 ### Known gaps
-- `EarthGeneratorPrepareMixin`'s widened prefetch is still one ring of cells, narrower than Earth
-  Platform's own multi-kilometre `NEAR_REACH` -- a column two or more cells away from the original
-  prepare point can still see a transient gap.
+- The neighborhood read-side check only extends as far as some cell that has actually been
+  fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
+  transient gap.
 - Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport path
   `prepareNear` covers) has no dedicated readiness handling yet.
 - `RoadNetwork.segments()`/`junctions()`/`excludedBridgesAndTunnels()` only scan the preloaded

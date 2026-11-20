@@ -287,16 +287,39 @@ public final class RoadNetwork {
 
     /**
      * Candidates from the preloaded bundled+external index, plus (if a live tile source is
-     * configured) whatever is already cached on disk for this cell -- a read-only cache check, never
-     * a network fetch; see {@link RoadTileSource#cachedWaysForCellOrEmpty} and the class doc there
-     * for why {@link io.github.brooswitminecraft.earthplatformroads.mixin.EarthGeneratorPrepareMixin},
-     * not this lookup, is the only place that may ever fetch.
+     * configured) whatever is already cached on disk for this cell AND its Moore neighborhood (the
+     * 8 cells sharing an edge or corner with it) -- all read-only cache checks, never a network
+     * fetch; see {@link RoadTileSource#cachedWaysForCellOrEmpty} and the class doc there for why
+     * {@link io.github.brooswitminecraft.earthplatformroads.mixin.EarthGeneratorPrepareMixin}, not
+     * this lookup, is the only place that may ever fetch.
+     *
+     * <p><b>Why the neighborhood, and why this carries a seam without extra fetches</b>
+     * (MINECRAFT-566 comment 55456, correcting 55454's original fix): a live provider's bbox query
+     * for one cell returns the FULL geometry of any way that merely touches that cell's bbox,
+     * including whatever portion extends into a neighboring cell -- the same way the real Overpass
+     * protocol has always worked here (see {@code OverpassWayParser}). So a crossing way's complete
+     * geometry is typically already sitting in whichever single cell actually got fetched; a column
+     * in the cell next door can find it by reading that neighbor's cache too, without this mod ever
+     * needing to fetch the neighbor itself. This replaces 55454's original fix, which instead issued
+     * up to 9 sequential {@code waysForCell} calls from {@code EarthGeneratorPrepareMixin} -- found
+     * (55456) to interact badly with the provider's own rate limit: with a realistic multi-second
+     * {@code previewMinRequestIntervalMs}, only the first of those 9 calls could actually succeed
+     * before the next-eligible deadline rejected the rest, so the fix did not reliably hold in the
+     * real production profile, only in a test that (by using the simple, zero-interval constructor)
+     * never exercised that deadline. This version needs no additional network calls at all, so it
+     * cannot run into that problem.
      */
     private static List<RoadSegment> candidatesNear(double lat, double lon) {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
-        List<RoadSegment> fromTiles = tiles.cachedWaysForCellOrEmpty(lat, lon);
+
+        List<RoadSegment> fromTiles = new ArrayList<>();
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+            }
+        }
         if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
         if (preloaded == null || preloaded.isEmpty()) return fromTiles;
         List<RoadSegment> merged = new ArrayList<>(preloaded);

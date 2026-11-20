@@ -27,38 +27,28 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * whatever thread calls it, which may be the main server thread), never blocks on HTTP regardless
  * of whether this mixin has run for that area yet.
  *
- * <h2>Boundary gap, found live and fixed here (MINECRAFT-566 comment 55454)</h2>
- * This mixin originally prefetched only the single cell the point itself falls in. {@code
- * RoadNetwork.candidatesNear} only ever checks a column's OWN cell's cache, never a neighbor's --
- * so a mapped way whose geometry crosses from an already-fetched cell into an adjacent, still-
- * pending one was silently omitted at exactly that boundary: not a missing OSM way, not a designed
- * bridge/tunnel omission, just a cell that genuinely had not been fetched yet. Observed live on
- * Zippy (a road abruptly ending on bare ground at a tile seam) and reproduced synthetically in
- * {@code RoadTilePrefetchMixinTest#aCrossingRoadIsSilentlyOmittedAtAnUnfetchedNeighborsBoundary}
- * (direct {@code RoadTileSource.waysForCell} calls, bypassing this mixin, to exercise exactly the
- * old narrow behavior). Fixed by widening {@link #prefetch} to also prefetch the full Moore
- * neighborhood (the 8 surrounding cells, not just the point's own) around every prepare call --
- * confirmed in {@code RoadTilePrefetchMixinTest#theWidenedPrefetchFetchesTheNeighborSoACrossingRoadIsNotOmitted}.
+ * <h2>Boundary gap, found live (MINECRAFT-566 comment 55454), fixed on the read side (55456)</h2>
+ * A mapped way whose geometry crosses from an already-fetched cell into an adjacent, still-pending
+ * one was silently omitted at exactly that boundary: not a missing OSM way, not a designed bridge/
+ * tunnel omission, just a cell that genuinely had not been fetched yet. Observed live on Zippy (a
+ * road abruptly ending on bare ground at a tile seam) and reproduced synthetically in {@code
+ * RoadTilePrefetchMixinTest#aCrossingRoadIsSilentlyOmittedAtAnUnfetchedNeighborsBoundary}.
  *
- * <p><b>This only helps a FRESH (not yet generated) cube.</b> The widened prefetch runs at
- * Earth Platform's own prepare-ahead-of-generation entry points, before a column's blocks are ever
- * placed -- so for a cube generated AFTER this fix, both cells it could possibly need are already
- * fetched by the time generation reads them. It does nothing for a cube generated BEFORE this fix
- * landed, or one generated while a neighbor's fetch was still failing/pending for some other reason
- * (a genuine network outage, say): once a column's blocks exist, this mod has no retrofit
- * mechanism -- a later-arriving tile does not retroactively repair an already-generated cube. That
- * is a distinct, harder problem (safely revising existing world data, not just prefetching further
- * ahead) and is not attempted here; comment 55454 explicitly separates it from this fix and does
- * not ask for it.
- *
- * <p><b>Still a known simplification, narrower than before but not eliminated</b>: Earth Platform's
- * own {@code prepare}/{@code prepareNear} fetch a reach scaled to several kilometres, across
- * multiple zoom levels. The Moore neighborhood here is still only {@value
- * io.github.brooswitminecraft.earthplatformroads.road.RoadNetwork#CELL_DEGREES}-degree (~1.1 km)
- * cells one deep -- a column two or more cells away from the original prepare point, or one a very
- * fast-moving player reaches before even the widened prefetch completes, can still see a transient
- * gap on first visit. Matching {@code prepareNear}'s own ~3.5 km {@code NEAR_REACH} exactly would
- * need a wider ring than this; not attempted here.
+ * <p>The first fix attempt (55454) widened THIS mixin to issue up to 9 sequential {@code
+ * waysForCell} calls (the point's cell plus its 8 Moore neighbors) per prepare call. Comment 55456
+ * found that broken under the Overpass.ch preview provider's own realistic rate limit: with a
+ * multi-second {@code previewMinRequestIntervalMs}, only the first of those 9 calls could actually
+ * succeed before {@code RoadTileSource}'s next-eligible deadline rejected the rest -- a problem the
+ * original regression test missed entirely by using the zero-interval constructor, never
+ * exercising that deadline. So this mixin stays at its original single-cell prefetch (below); the
+ * real fix is on the READ side instead: {@code RoadNetwork.candidatesNear} now also checks the
+ * Moore neighborhood's cached data (read-only, no fetch) when evaluating a column, since a live
+ * provider's bbox response for one cell already carries the FULL geometry of any way merely
+ * touching that cell -- including the portion extending into a neighbor -- so the neighbor's own
+ * fetch was never actually required to carry the seam. See {@code RoadNetwork.candidatesNear}'s own
+ * doc for the full reasoning, and {@code RoadTilePrefetchMixinTest
+ * #theWidenedPrefetchFetchesTheNeighborSoACrossingRoadIsNotOmitted} (updated to exercise the
+ * read-side fix at a realistic, nonzero request interval) for the regression.
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorPrepareMixin {
@@ -72,23 +62,11 @@ public abstract class EarthGeneratorPrepareMixin {
         prefetch(x, z);
     }
 
-    /**
-     * Prefetches the point's own road-data cell AND its full Moore neighborhood (the 8 cells
-     * sharing an edge or corner with it) -- see this class's own doc for why: a column can sit in
-     * any of those 9 cells by the time generation actually reaches it, and a mapped way crossing
-     * between any two of them must not be silently omitted just because only the center cell was
-     * fetched.
-     */
     private void prefetch(int x, int z) {
         var tiles = RoadNetwork.liveTileSourceForPrefetch();
         if (tiles == null) return;
         EarthGenerator self = (EarthGenerator) (Object) this;
         GeoPoint point = self.grid().geographic(x, z);
-        double cellDegrees = RoadNetwork.CELL_DEGREES;
-        for (int dLat = -1; dLat <= 1; dLat++) {
-            for (int dLon = -1; dLon <= 1; dLon++) {
-                tiles.waysForCell(point.latitude() + dLat * cellDegrees, point.longitude() + dLon * cellDegrees);
-            }
-        }
+        tiles.waysForCell(point.latitude(), point.longitude());
     }
 }
