@@ -9,9 +9,11 @@ import io.earthplatform.geography.globe.MercatorGrid;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -58,8 +60,17 @@ public final class RoadNetwork {
      *  Package-visible: {@link RoadTileSource} fetches and caches at this exact same cell granularity. */
     static final double CELL_DEGREES = 0.01;
 
-    /** Test-only override for the live tile source {@link #candidatesNear} also checks; {@code null} means "none configured". */
+    /** Test-only override for the live tile source {@link #candidatesNear} also checks; {@code null} means "use the default production wiring". */
     private static volatile RoadTileSource tileSourceOverride;
+    /** Test-only overrides for {@link #buildDefaultTileSource}'s two real inputs, without replacing the production wiring itself. */
+    private static volatile URI tileEndpointOverride;
+    private static volatile Path tileCacheRootOverride;
+    /** The real, lazily-built production tile source; {@code null} until first needed, or if FML paths are unavailable. */
+    private static volatile RoadTileSource defaultTileSource;
+
+    /** Default live Overpass-compatible endpoint; overridable with {@code -Dearthplatformroads.overpassEndpoint=...}. */
+    private static final String DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
+    private static final Duration TILE_FETCH_TIMEOUT = Duration.ofSeconds(20);
 
     private static volatile RoadNetwork instance;
 
@@ -94,18 +105,72 @@ public final class RoadNetwork {
         }
     }
 
-    /** Test-only: install (or clear, with {@code null}) the live {@link RoadTileSource} this network's lookups also consult. */
+    /** Test-only: install (or clear, with {@code null}) a specific {@link RoadTileSource} instance directly, bypassing the production wiring entirely. */
     static void setTileSourceForTests(RoadTileSource tileSource) {
         tileSourceOverride = tileSource;
     }
 
     /**
+     * Test-only: override the two real inputs {@link #buildDefaultTileSource} uses (endpoint,
+     * cache root) without replacing the production wiring itself -- unlike
+     * {@link #setTileSourceForTests}, this exercises the actual code path an ordinary install runs,
+     * just pointed at a local fixture instead of the real network and a temp directory instead of
+     * the real game dir. Pass {@code null} for either to go back to that input's real default.
+     */
+    static void setDefaultTileSourceInputsForTests(URI endpointOverride, Path cacheRootOverride) {
+        synchronized (RoadNetwork.class) {
+            tileEndpointOverride = endpointOverride;
+            tileCacheRootOverride = cacheRootOverride;
+            defaultTileSource = null;
+        }
+    }
+
+    /**
      * The live tile source {@link #candidatesNear} also checks, alongside the bundled/external
-     * regions preloaded into {@link #cellIndex}: {@code null} (the default outside a configured
-     * install) means no live tile source is active and lookups are bundled+external only.
+     * regions preloaded into {@link #cellIndex}. This is the actual production wiring: an ordinary
+     * install reaches a real, lazily-built {@link RoadTileSource} here (not just in a test), caching
+     * to a persistent directory under the game's own install so a later run (including a real
+     * restart) re-reads the same cache rather than starting over -- see
+     * {@link #buildDefaultTileSource}'s own doc for the one honest limitation this has (install-wide,
+     * not per-save-scoped). {@code null} only if FML's paths were never set up in this JVM (a
+     * context outside the real modded game) or FML's config dir genuinely cannot be resolved.
      */
     private static RoadTileSource tileSource() {
-        return tileSourceOverride;
+        if (tileSourceOverride != null) return tileSourceOverride;
+        RoadTileSource cached = defaultTileSource;
+        if (cached != null) return cached;
+        synchronized (RoadNetwork.class) {
+            if (defaultTileSource == null) defaultTileSource = buildDefaultTileSource();
+            return defaultTileSource;
+        }
+    }
+
+    /**
+     * Builds the real production {@link RoadTileSource}: a live Overpass-compatible endpoint
+     * (default {@value #DEFAULT_OVERPASS_ENDPOINT}, overridable with
+     * {@code -Dearthplatformroads.overpassEndpoint=...}) and a persistent cache directory under the
+     * game's own install, {@code <gamedir>/earthplatformroads/road_tiles/}.
+     *
+     * <p><b>Named, honest limitation</b>: this cache is scoped to the whole game install, not to
+     * one save -- MINECRAFT-566's review asked for "a world pinning its source snapshot," and a
+     * single persistent cache does pin road data to whatever was actually fetched (the same
+     * property {@link RoadTileSourceTest} verifies for the cache itself), but two different Earth
+     * saves on the same install currently share one cache rather than each getting its own. Scoping
+     * this per-save would mean resolving the active save's own directory from inside a mixin on
+     * {@code EarthGenerator} (which does not expose one), not attempted here.
+     */
+    private static RoadTileSource buildDefaultTileSource() {
+        try {
+            Path cacheRoot = tileCacheRootOverride != null
+                    ? tileCacheRootOverride
+                    : FMLPaths.GAMEDIR.get().resolve("earthplatformroads").resolve("road_tiles");
+            URI endpoint = tileEndpointOverride != null
+                    ? tileEndpointOverride
+                    : URI.create(System.getProperty("earthplatformroads.overpassEndpoint", DEFAULT_OVERPASS_ENDPOINT));
+            return new RoadTileSource(endpoint, cacheRoot, true, TILE_FETCH_TIMEOUT);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**
