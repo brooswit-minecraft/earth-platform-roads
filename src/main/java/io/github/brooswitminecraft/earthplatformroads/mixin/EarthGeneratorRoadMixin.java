@@ -33,15 +33,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * <p>Top surface at a step between two same-road columns uses {@link LayeredSlopesCompat}'s
  * polished-blackstone {@link LayeredBlock} with a layer count from {@link RoadSurfaceLayering},
  * instead of this mod's previous always-full {@code POLISHED_BLACKSTONE}: see MINECRAFT-566,
- * John's playtest finding that whole-block stairs on a grade are not acceptable. An earlier version
- * of this fix picked a layer count from the generic {@code slope} magnitude alone, which rounded a
- * single-block step down to "flat" and left the step untouched (caught in review, see the ticket);
- * this version instead compares this column's own ground height against its actual same-road
- * neighbors' ground heights to decide which side of a step it is on -- see
- * {@link RoadSurfaceLayering}'s class doc for why that is the one thing a single column's own top
- * block can actually do about a 1-block step without changing ground height itself.
- * {@code under()} always stays a full block (never layered) because {@code EarthGenerator} uses it
- * at depths 1-3 under the column, per the ticket's explicit instruction.
+ * John's playtest finding that whole-block stairs on a grade are not acceptable, and the ticket
+ * comments' two-round back-and-forth on exactly how to pick that layer count (see
+ * {@link RoadSurfaceLayering}'s class doc for that history) -- this mixin now scans outward up to
+ * {@link RoadSurfaceLayering#MAX_NEIGHBOR_DISTANCE} same-road columns in each of 4 directions for
+ * the nearest column with a lower ground height, and decays this column's own layer count by that
+ * distance, rather than comparing only immediate neighbors (which left a new, almost-as-bad gap one
+ * column past the actual step). {@code under()} always stays a full block (never layered) because
+ * {@code EarthGenerator} uses it at depths 1-3 under the column, per the ticket's explicit
+ * instruction.
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorRoadMixin {
@@ -63,10 +63,10 @@ public abstract class EarthGeneratorRoadMixin {
         cir.setReturnValue(new SurfaceGenerator.Surface(original.biome(), top, under, 0, 0, 0, 0, 0, false));
     }
 
-    /** Full block when every same-road neighbor shares this column's height; a fractional layered block at a step. */
+    /** Full block when no same-road neighbor within range is lower; a fractional layered block that decays by distance to one that is. */
     private static BlockState topSurfaceFor(EarthGenerator self, RoadSegment segment, int x, int z, int y) {
-        int[] neighborYs = sameRoadNeighborGroundYs(self, segment, x, z);
-        int layers = RoadSurfaceLayering.layersForNeighbors(y, neighborYs);
+        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y);
+        int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(distance);
         if (layers >= LayerMath.MAX_LAYERS) return Blocks.POLISHED_BLACKSTONE.defaultBlockState();
         return LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get().defaultBlockState()
                 .setValue(LayeredBlock.ANCHOR, Anchor.FLOOR)
@@ -74,24 +74,37 @@ public abstract class EarthGeneratorRoadMixin {
     }
 
     /**
-     * Ground heights of this column's 4-connected neighbors, but only the ones the same
-     * {@link RoadSegment} (by stable {@code wayId}) also covers -- a neighbor just outside the
-     * road's half-width, or on a different mapped way, is natural terrain or someone else's road,
-     * neither of which this column's own surface should try to match.
+     * Distance, in columns (Chebyshev / chessboard distance, so a diagonal neighbor at offset
+     * (1,1) counts as distance 1, not ~1.4), to the nearest same-road (by stable {@code wayId})
+     * neighbor with a lower ground height, searching outward one full ring at a time up to
+     * {@link RoadSurfaceLayering#MAX_NEIGHBOR_DISTANCE}; {@code 0} if none is found that close.
+     *
+     * <p>Scanning only the 4 axis-aligned offsets at each distance (as an earlier version of this
+     * method did) missed a lower neighbor reachable only diagonally, which broke the one property
+     * this whole scheme depends on: two columns one step apart must get distances that differ by
+     * at most 1 (so their decayed layer counts, and therefore their collision tops, stay close).
+     * Scanning the full ring (every cell at exactly this Chebyshev distance, {@code (2d+1)^2 -
+     * (2d-1)^2} of them) is what actually guarantees that -- a real regression John's review caught
+     * (a diagonal feature made one column drop sharply while its immediate neighbor, which could
+     * not see that same feature within its own axis-only scan, stayed full).
+     *
+     * <p>A neighbor just outside the road's half-width, or on a different mapped way, is natural
+     * terrain or someone else's road, neither of which this column's own surface should try to
+     * match.
      */
-    private static int[] sameRoadNeighborGroundYs(EarthGenerator self, RoadSegment segment, int x, int z) {
+    private static int nearestLowerSameRoadDistance(EarthGenerator self, RoadSegment segment, int x, int z, int y) {
         var grid = self.grid();
-        int[] dx = {1, -1, 0, 0};
-        int[] dz = {0, 0, 1, -1};
-        int[] found = new int[4];
-        int count = 0;
-        for (int i = 0; i < 4; i++) {
-            int nx = x + dx[i], nz = z + dz[i];
-            RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz);
-            if (neighborSegment != null && neighborSegment.wayId() == segment.wayId()) {
-                found[count++] = self.surfaceY(nx, nz);
+        for (int distance = 1; distance <= RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE; distance++) {
+            for (int ddx = -distance; ddx <= distance; ddx++) {
+                for (int ddz = -distance; ddz <= distance; ddz++) {
+                    if (Math.max(Math.abs(ddx), Math.abs(ddz)) != distance) continue; // only this ring, not the filled square
+                    int nx = x + ddx, nz = z + ddz;
+                    RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz);
+                    if (neighborSegment == null || neighborSegment.wayId() != segment.wayId()) continue;
+                    if (self.surfaceY(nx, nz) < y) return distance;
+                }
             }
         }
-        return java.util.Arrays.copyOf(found, count);
+        return 0;
     }
 }

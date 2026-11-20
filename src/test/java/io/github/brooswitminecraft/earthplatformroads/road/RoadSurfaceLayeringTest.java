@@ -1,6 +1,7 @@
 package io.github.brooswitminecraft.earthplatformroads.road;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.brooswitminecraft.layeredslopes.LayerMath;
 import org.junit.jupiter.api.Test;
@@ -8,41 +9,42 @@ import org.junit.jupiter.api.Test;
 /** Pure arithmetic, no Minecraft bootstrap: runs in a plain JUnit JVM. */
 class RoadSurfaceLayeringTest {
     @Test
-    void noNeighborsAtAllIsAFullBlock() {
-        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNeighbors(100, new int[0]));
+    void noLowerNeighborFoundIsAFullBlock() {
+        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNearestLowerNeighbor(0));
     }
 
     @Test
-    void allNeighborsAtTheSameHeightIsAFullBlock() {
-        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNeighbors(100, new int[] {100, 100, 100, 100}));
+    void negativeDistanceIsTreatedAsNoneFound() {
+        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNearestLowerNeighbor(-1));
     }
 
     @Test
-    void theLowSideOfAOneBlockStepStaysFull() {
-        // y=100 with a neighbor at 101: this column's top (y + MAX_LAYERS/16 = 101) must meet the
-        // base of the higher neighbor's own cell (also 101) -- this is the regression MINECRAFT-566's
-        // first fix attempt got wrong: a slope-magnitude heuristic rounded this exact case to "flat".
-        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNeighbors(100, new int[] {100, 101}));
+    void rightAtTheStepIsTheMinimumLayer() {
+        assertEquals(LayerMath.MIN_LAYERS, RoadSurfaceLayering.layersForNearestLowerNeighbor(1));
     }
 
     @Test
-    void theHighSideOfAOneBlockStepDropsToTheMinimumLayer() {
-        // y=101 with a neighbor at 100: this column's top must sit as low as possible in its own
-        // cell (101 + MIN_LAYERS/16) to approach the lower neighbor's top (100 + MAX_LAYERS/16 = 101).
-        assertEquals(LayerMath.MIN_LAYERS, RoadSurfaceLayering.layersForNeighbors(101, new int[] {100, 101}));
+    void layersIncreaseMonotonicallyWithDistance() {
+        int prev = RoadSurfaceLayering.layersForNearestLowerNeighbor(1);
+        for (int d = 2; d <= RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE; d++) {
+            int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(d);
+            assertTrue(layers >= prev, "Expected layers to not decrease as distance " + d + " grows from the step");
+            prev = layers;
+        }
     }
 
     @Test
-    void aSaddleWithBothAHigherAndALowerNeighborGetsAMidpointCompromise() {
-        int layers = RoadSurfaceLayering.layersForNeighbors(100, new int[] {99, 101});
-        assertEquals((LayerMath.MAX_LAYERS + LayerMath.MIN_LAYERS) / 2, layers);
+    void atOrBeyondTheMaxDistanceIsAFullBlock() {
+        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNearestLowerNeighbor(RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE));
+        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNearestLowerNeighbor(RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE + 5));
     }
 
     @Test
-    void aMultiBlockStepStillPicksTheExtremeOnEachSide() {
-        // Not the common case in practice (see RoadSurfaceLayering's class doc), but must not throw
-        // or pick something outside LayerMath's valid range.
-        assertEquals(LayerMath.MAX_LAYERS, RoadSurfaceLayering.layersForNeighbors(100, new int[] {103}));
-        assertEquals(LayerMath.MIN_LAYERS, RoadSurfaceLayering.layersForNeighbors(103, new int[] {100}));
+    void neverGoesOutsideLayerMathsValidRange() {
+        for (int d = -5; d <= 50; d++) {
+            int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(d);
+            assertTrue(layers >= LayerMath.MIN_LAYERS && layers <= LayerMath.MAX_LAYERS,
+                    "layersForNearestLowerNeighbor(" + d + ") = " + layers + " is out of LayerMath's valid range");
+        }
     }
 }

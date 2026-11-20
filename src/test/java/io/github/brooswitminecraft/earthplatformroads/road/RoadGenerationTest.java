@@ -126,54 +126,82 @@ class RoadGenerationTest {
     }
 
     /**
-     * Regression test for the exact MINECRAFT-566 review finding: these two adjacent columns were
-     * measured (see the ScratchProbeTest exploration this fixed-coordinate test replaces) to be a
-     * genuine, real-DEM-generated one-block step within the pinned Southside Drive band -- not a
-     * synthetic slope value. {@code HIGH_X} sits one block higher than {@code LOW_X} at the same z.
+     * Regression coverage for MINECRAFT-566's whole review back-and-forth, not just the single
+     * boundary column: these are real, DEM-generated (not synthetic) columns along one row of the
+     * pinned Southside Drive band, spanning a full short incline (a step down, a flat low plateau,
+     * a step back up), a separate isolated single-column dip, and a real cube-X boundary. See
+     * {@link RoadSurfaceLayering}'s class doc for why a plain immediate-neighbor comparison was not
+     * enough (the column just past a step jumped straight back to a full block, per John's review
+     * finding) and why this is now a distance-decayed approach instead.
      */
-    private static final int STEP_LOW_X = -10534017, STEP_HIGH_X = -10534018, STEP_Z = -3591018;
-    /** One column further from the step on the low side: both this and STEP_LOW_X share the same real ground height, a flat control. */
-    private static final int STEP_FLAT_CONTROL_X = -10534016;
+    private static final int MEASURED_ROW_X0 = -10534021, MEASURED_ROW_Z = -3591018;
+    private static final int MEASURED_ROW_MIN_DX = -8, MEASURED_ROW_MAX_DX = 9;
+    /** The specific extra high-side column John's review asked to add (X=-10534019, i.e. dx=2 here). */
+    private static final int EXTRA_HIGH_SIDE_DX = 2;
+    /** Real cube-X boundary within this row: dx=4 (cube N) and dx=5 (cube N+1) are the last/first columns of adjacent cubes. */
+    private static final int CUBE_BOUNDARY_LOW_DX = 4, CUBE_BOUNDARY_HIGH_DX = 5;
 
     @Test
-    void aGeneratedOneBlockStepClosesToAOneSixteenthSeamNotAWholeBlockCliff() {
-        int lowGround = generator.surfaceY(STEP_LOW_X, STEP_Z);
-        int highGround = generator.surfaceY(STEP_HIGH_X, STEP_Z);
-        int flatControlGround = generator.surfaceY(STEP_FLAT_CONTROL_X, STEP_Z);
-        assertEquals(lowGround + 1, highGround, "Expected a measured real one-block step between these two fixed columns; "
-                + "if the real DEM changed, re-measure replacement coordinates rather than adjusting this assertion to fit");
-        assertEquals(lowGround, flatControlGround, "Expected the flat-control column to share the low column's real ground height");
+    void aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff() {
+        int span = MEASURED_ROW_MAX_DX - MEASURED_ROW_MIN_DX + 1;
+        int[] ground = new int[span];
+        double[] top = new double[span];
+        boolean[] covered = new boolean[span];
+        var grid = generator.grid();
 
-        var lowState = surfaceBlockAtXZ(STEP_LOW_X, STEP_Z);
-        var highState = surfaceBlockAtXZ(STEP_HIGH_X, STEP_Z);
-        var flatState = surfaceBlockAtXZ(STEP_FLAT_CONTROL_X, STEP_Z);
+        for (int i = 0; i < span; i++) {
+            int dx = MEASURED_ROW_MIN_DX + i;
+            int x = MEASURED_ROW_X0 + dx;
+            covered[i] = RoadNetwork.coversColumn(grid, x, MEASURED_ROW_Z);
+            if (!covered[i]) continue;
+            ground[i] = generator.surfaceY(x, MEASURED_ROW_Z);
+            var state = surfaceBlockAtXZ(x, MEASURED_ROW_Z);
+            assertTrue(isRoadSurface(state), "Covered column at dx=" + dx + " must be road surface, got " + state);
+            top[i] = ground[i] + absoluteCollisionTopFraction(state);
+            assertSolidSupportUnder(x, MEASURED_ROW_Z, ground[i]);
+        }
 
-        assertTrue(isRoadSurface(lowState), "Low side of the step must still be road surface, got " + lowState);
-        assertTrue(isRoadSurface(highState), "High side of the step must still be road surface, got " + highState);
-        assertTrue(isRoadSurface(flatState), "Flat control column must still be road surface, got " + flatState);
+        // Confirm this row actually contains the real features this test exists to exercise, so a
+        // silent DEM change can't make the loop below vacuously pass over an all-flat row.
+        boolean sawAnyStep = false;
+        double maxAdjacentGap = 0;
+        int maxGapAtDx = Integer.MIN_VALUE;
+        for (int i = 0; i + 1 < span; i++) {
+            if (!covered[i] || !covered[i + 1]) continue;
+            if (ground[i] != ground[i + 1]) sawAnyStep = true;
+            double gap = Math.abs(top[i + 1] - top[i]);
+            if (gap > maxAdjacentGap) {
+                maxAdjacentGap = gap;
+                maxGapAtDx = MEASURED_ROW_MIN_DX + i;
+            }
+        }
+        assertTrue(sawAnyStep, "Expected at least one real ground-height step in this measured row; "
+                + "if the real DEM changed, re-measure a replacement row rather than adjusting this test to fit");
 
-        double lowTop = lowGround + absoluteCollisionTopFraction(lowState);
-        double highTop = highGround + absoluteCollisionTopFraction(highState);
-        double flatTop = flatControlGround + absoluteCollisionTopFraction(flatState);
+        // The actual regression: before the distance-decay fix, the column immediately past a
+        // step's single adjusted column jumped back to a full block, leaving close to a full
+        // 1-block gap one column further out than the original fix closed. This bounds the WORST
+        // adjacent gap across the whole measured incline, not just the one pair originally fixed.
+        assertTrue(maxAdjacentGap < 0.5, "Expected every adjacent pair's collision-top gap across this real incline to stay "
+                + "well under a full block; worst was " + maxAdjacentGap + " at dx=" + maxGapAtDx);
 
-        // Flat control: unchanged behaviour, a full block, top exactly at ground+1.
-        assertEquals(flatControlGround + 1.0, flatTop, 1e-9, "Flat control column must be a full block");
+        // The specific extra high-side column asked for in review (X=-10534019): must still read as
+        // road surface and must not itself reintroduce a near-full-block gap to either neighbor.
+        int extraIndex = EXTRA_HIGH_SIDE_DX - MEASURED_ROW_MIN_DX;
+        assertTrue(covered[extraIndex], "Expected the requested extra high-side column to be covered road surface");
+        if (extraIndex > 0 && covered[extraIndex - 1]) {
+            assertTrue(Math.abs(top[extraIndex] - top[extraIndex - 1]) < 0.5, "Extra high-side column's gap to its lower-dx neighbor must stay well under a full block");
+        }
+        if (extraIndex + 1 < span && covered[extraIndex + 1]) {
+            assertTrue(Math.abs(top[extraIndex + 1] - top[extraIndex]) < 0.5, "Extra high-side column's gap to its higher-dx neighbor must stay well under a full block");
+        }
 
-        // The regression this fixes: before, both sides of a 1-block step rounded to a full block,
-        // leaving the full 1-block gap (highTop - lowTop == 1.0) untouched. After, the low side
-        // stays full (meeting the step's base) and the high side drops to the minimum layer (sitting
-        // just above its own floor), closing the gap to one sixteenth of a block.
-        double gap = highTop - lowTop;
-        assertTrue(gap < 0.2, "Expected the step to close to roughly a 1/16-block seam, not a 1-block cliff; got gap=" + gap
-                + " (lowTop=" + lowTop + ", highTop=" + highTop + ")");
-        assertTrue(gap > 0, "The high side must still read as at least slightly higher than the low side, got gap=" + gap);
-
-        // Solid support: the block directly under each road column's top block must be a full,
-        // non-air block (never a floating layered block over a gap) -- under() is always a full
-        // block per the mixin, this confirms that holds for the real generated columns too.
-        assertSolidSupportUnder(STEP_LOW_X, STEP_Z, lowGround);
-        assertSolidSupportUnder(STEP_HIGH_X, STEP_Z, highGround);
-        assertSolidSupportUnder(STEP_FLAT_CONTROL_X, STEP_Z, flatControlGround);
+        // The real cube-X boundary: confirm it actually is one (sanity), then that it is continuous.
+        int boundaryX = MEASURED_ROW_X0 + CUBE_BOUNDARY_LOW_DX;
+        assertEquals(boundaryX >> 4, ((boundaryX + 1) >> 4) - 1, "Sanity: the chosen boundary columns must actually be in different cubes");
+        int lowIdx = CUBE_BOUNDARY_LOW_DX - MEASURED_ROW_MIN_DX, highIdx = CUBE_BOUNDARY_HIGH_DX - MEASURED_ROW_MIN_DX;
+        assertTrue(covered[lowIdx] && covered[highIdx], "Expected both sides of the real cube boundary to be covered road surface");
+        assertTrue(Math.abs(top[highIdx] - top[lowIdx]) < 0.5, "Collision top across the real cube boundary must stay continuous, not jump by close to a full block");
     }
 
     /** Absolute height, in blocks above {@code ground}, that this state's collision shape reaches -- 1.0 for a full block. */
