@@ -990,6 +990,39 @@ east side's higher ground through the other instance -- with a second assertion 
 documenting the actual pre-fix behavior (plain `.equals` never discovers it) side by side, so the
 bug this fixes is pinned, not just asserted away. 96/96 tests pass.
 
+## MINECRAFT-566: a fifth, separate finding -- ordinary-movement fetch-admission priority race (comment 55522)
+
+John found a genuinely different, deeper problem via a real NeoForge/combined-73 loopback
+reproduction (not the deck, not canopy clearance): in the ORDINARY-movement prefetch path
+(`RoadTileSource`/`RoadPrefetch`), a speculative lookahead fetch (tile A) can hold the only
+available admission slot/cooldown window while the CURRENT cell's own fetch (tile B, the one
+generation is actually about to consume) never gets to dispatch its own request at all. When
+generation runs before B's data arrives, it falls back to natural terrain (grass) -- the known,
+accepted bounded-wait limitation -- but then B's own queued job gets dropped unfulfilled once the
+provider's cooldown window passes, rather than being retried. By the time B eventually DOES fetch
+successfully, the grass cube has already been adopted/saved; reopening it from native
+`CubeStorage` just replays the saved grass, since this mod never retrofits already-saved terrain
+(an existing, repeatedly-stated design constraint, not something this finding changes).
+
+Suggested fix direction (John's own, not yet attempted): prioritize a cell's own queued immediate
+job over a speculative lookahead competing for the same slot; keep that demand pending across
+cooldown windows instead of dropping it outright; bound any retry to cubes that are both unsaved
+and still genuinely pending (never an already-saved cube, never an unrelated one). Explicit
+boundaries he named: preserve the existing confirmed-empty/failure/outage distinctions and the
+sustained-outage fail-open behavior; never block the game/server thread on HTTP; never rewrite a
+saved world; this does not change anything about the deck's own (separately disclosed,
+not-promoted) status.
+
+**Not attempted.** Properly verifying a change to fetch-admission scheduling needs exactly the real
+dispatch-timing/native-reopen testing John describes against an actual dedicated server -- this
+agent's environment has neither a running Minecraft client nor a real dedicated server to drive
+`ServerCubeWorld`/`ServerLevel` through (the same standing gap this document has noted since
+earlier in this ticket: `neoForge.unitTest` is a plain JUnit JVM, not a running server). Shipping an
+unverified concurrency/scheduling change this close to the deadline, with no way to confirm it
+myself against the real timing this bug is actually about, was judged worse than leaving it
+disclosed for whoever picks it up next. `b7ff716` (canopy clearance only) remains the confirmed,
+ready candidate -- untouched by this finding.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

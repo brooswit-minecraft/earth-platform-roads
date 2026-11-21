@@ -239,6 +239,18 @@ bump: minor
   itself (with the old, broken behavior pinned alongside it for contrast).
 
 ### Known gaps
+- A genuinely separate finding (comment 55522), in the ORDINARY-movement prefetch path
+  (`RoadTileSource`/`RoadPrefetch`), not the deck or canopy clearance: found via a real
+  NeoForge/combined-73 loopback reproduction, a speculative lookahead fetch can hold the only
+  available admission slot while the current cell's own fetch never dispatches at all; that cell's
+  queued job then drops unfulfilled once the provider cooldown passes rather than being retried, and
+  by the time it eventually does fetch successfully the natural-terrain fallback cube has already
+  been saved (never retrofitted, per this mod's existing design). Suggested fix (not attempted):
+  prioritize a cell's own queued immediate job over competing speculative lookahead, keep its demand
+  pending across cooldown windows, bound retry to unsaved-and-still-pending cubes only. Not
+  attempted this pass -- verifying a fetch-admission scheduling change needs real dispatch-timing
+  and native-reopen testing against an actual dedicated server, which this environment does not
+  have.
 - The flat-deck prototype (`RoadDeck`) does not extend support under the gravel shoulder -- a
   filled dip currently shows a drop to the shoulder's own natural height at the paved edge. Not an
   in-game visual confirmation either. A "prototype," per the ticket's own framing, not a finished
