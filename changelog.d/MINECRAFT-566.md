@@ -201,8 +201,24 @@ bump: minor
   preserves vanilla leaves through actual random ticks, correctly reopens once a removed log's
   decay control disappears, and leaves off-road/shoulder/support columns and an existing
   player-edited log untouched.
+- Added a first, deliberately narrow flat-road-deck prototype (comment 55485, redirected by 55503
+  toward "local deck/support placement using sampled natural heights... rather than globally
+  overriding `EarthGenerator.ground`"): `RoadDeck` is a pure ADDITIVE overlay at the exact same
+  post-generation seam `RoadCanopyClearance` already hooks -- never the natural height input, so
+  caves/structures/biomes/vegetation/water are all completely unaffected. For PAVED/CENTERLINE
+  columns only, `RoadDeck.deckY` raises a column's own natural ground to the local maximum natural
+  height among nearby ROAD columns within a 6-block window (never lowered -- no cuttings); where
+  raised, stone-brick support fills the gap and a plain full pavement block (never the layered
+  slope-compat variant -- a flat deck has no step to smooth) caps it. `RoadCanopyClearance`'s own
+  clearance floor now uses this same raised height, so the deck/support this builds is not
+  immediately cleared out from under itself; `SurfaceGeneratorRoadClearanceMixin` calls
+  `RoadDeck.buildAll` before `RoadCanopyClearance.clear` at that one seam.
 
 ### Known gaps
+- The flat-deck prototype (`RoadDeck`) does not extend support under the gravel shoulder -- a
+  filled dip currently shows a drop to the shoulder's own natural height at the paved edge. Not an
+  in-game visual confirmation either. A "prototype," per the ticket's own framing, not a finished
+  feature.
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
   does not verify the road material was actually painted under a column (that would mean
   re-deriving it the way the currently-disabled `RoadPrefetch.sectionLooksStale` does). On the rare

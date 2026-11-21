@@ -3,6 +3,7 @@ package io.github.brooswitminecraft.earthplatformroads.mixin;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadCanopyClearance;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadDeck;
 import java.util.List;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -37,6 +38,12 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * once woven becomes part of {@code SurfaceGenerator} itself, so it still sees the surrounding
  * {@code generate()} call's own {@code this} (the real generator instance) with no local-variable
  * capture needed for anything.
+ *
+ * <p>MINECRAFT-566 comment 55485/55503 (flat deck over a short dip, "local deck/support placement
+ * using sampled natural heights," never a global {@code EarthGenerator.ground()} override): since
+ * {@link RoadDeck} runs at this SAME seam, this now calls it FIRST, before {@link RoadCanopyClearance};
+ * the deck/support it builds is standing by the time clearance computes its own (possibly-raised)
+ * floor.
  */
 @Mixin(SurfaceGenerator.class)
 public abstract class SurfaceGeneratorRoadClearanceMixin {
@@ -51,7 +58,8 @@ public abstract class SurfaceGeneratorRoadClearanceMixin {
     private void earthplatformroads$clearRoadCanopyThenDropStray(
             LevelChunkSection section, int cubeX, int cubeY, int cubeZ, List<CompoundTag> blockEntities) {
         if ((Object) this instanceof EarthGenerator earthGenerator) {
-            RoadCanopyClearance.clear(earthGenerator, cubeX, cubeY, cubeZ, section);
+            RoadDeck.buildAll(earthGenerator, cubeX, cubeY, cubeZ, section); // MINECRAFT-566 55485/55503: build any raised deck/support FIRST
+            RoadCanopyClearance.clear(earthGenerator, cubeX, cubeY, cubeZ, section); // then clear canopy above that same (possibly-raised) floor
         }
         dropStrayBlockEntities(section, cubeX, cubeY, cubeZ, blockEntities);
     }

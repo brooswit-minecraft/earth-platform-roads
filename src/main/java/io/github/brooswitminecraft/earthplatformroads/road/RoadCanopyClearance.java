@@ -43,6 +43,15 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
  * residual race from comments 55496/55498/55505/55507), this can clear a column's canopy even though
  * the surface under it never actually got painted as road. This is a real, disclosed gap, not a fix
  * for that race -- do not read a clean canopy as proof the road surface underneath is correct.
+ *
+ * <p>MINECRAFT-566 comment 55485/55503 (flat road deck over a short dip): this loop's own floor is
+ * now {@link RoadDeck#deckY}, not the column's raw natural height -- {@code SurfaceGeneratorRoadClearanceMixin}
+ * calls {@link RoadDeck#buildSupportAndDeck} first for any column {@code deckY} raises, so by the
+ * time this clears everything above that SAME floor, the deck/support it just built is correctly
+ * left standing rather than being immediately cleared out from under itself. The underwater skip
+ * below still uses the column's own NATURAL height/water, not the raised deck floor, deliberately --
+ * whether a column is naturally underwater does not change because a nearby column pulled its deck
+ * up.
  */
 public final class RoadCanopyClearance {
     private RoadCanopyClearance() {}
@@ -68,9 +77,10 @@ public final class RoadCanopyClearance {
                 // isn't covered at this distance either).
                 RoadSegment.CrossSection zone = segment.crossSectionAt(grid, worldX, worldZ);
                 if (zone != RoadSegment.CrossSection.PAVED && zone != RoadSegment.CrossSection.CENTERLINE) continue;
-                int groundY = generator.surfaceY(worldX, worldZ);
+                int naturalY = generator.surfaceY(worldX, worldZ);
                 int waterY = generator.waterY(worldX, worldZ);
-                if (waterY != SurfaceGenerator.DRY && waterY >= groundY) continue; // underwater: no road deck here either, matching EarthGeneratorRoadMixin's own skip
+                if (waterY != SurfaceGenerator.DRY && waterY >= naturalY) continue; // underwater: no road deck here either, matching EarthGeneratorRoadMixin's own skip
+                int groundY = RoadDeck.deckY(generator, grid, worldX, worldZ); // the raised-dip-fill floor, never below naturalY
                 int firstLocalY = Math.max(0, groundY + 1 - baseY); // strictly ABOVE the deck -- never the deck itself, never below it
                 for (int localY = firstLocalY; localY <= 15; localY++) {
                     BlockState state = section.getBlockState(lx, localY, lz);

@@ -350,16 +350,24 @@ class RoadGenerationTest {
      * once a removed log stops supporting it); the same two placements one column off-road must be
      * left completely untouched, proving the clearance is scoped to the road's own paved/centerline
      * footprint, not applied blindly across the cube.
+     *
+     * <p>MINECRAFT-566 55485/55503: placements are relative to {@link RoadDeck#deckY}, not the raw
+     * natural height -- this pinned column's own deck floor can sit above its natural ground if a
+     * nearby road column is higher, and the clearance pass itself now uses that same raised floor.
      */
     @Test
     void canopyClearanceRemovesNonLeafBlocksOverTheRoadButPreservesLeavesAsPersistent() {
         int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
         int x = onRoad[0], z = onRoad[1];
-        int ground = generator.surfaceY(x, z);
-        int cubeX = x >> 4, cubeY = ground >> 4, cubeZ = z >> 4;
-        int localGroundY = ground & 15;
-        assertTrue(localGroundY <= 13, "Expected the pinned centerline column to leave room for two blocks above ground within its "
-                + "own cube; if the real DEM changed, re-pin a column with more headroom rather than adjusting this test to fit. Got localGroundY=" + localGroundY);
+        // MINECRAFT-566 55485/55503: RoadCanopyClearance's own floor is RoadDeck.deckY, not the raw
+        // natural height, now that a nearby higher road column can raise this column's own deck --
+        // compute the SAME floor the clearance pass itself will use, rather than assuming it equals
+        // natural ground height.
+        int floor = RoadDeck.deckY(generator, generator.grid(), x, z);
+        int cubeX = x >> 4, cubeY = floor >> 4, cubeZ = z >> 4;
+        int localFloorY = floor & 15;
+        assertTrue(localFloorY <= 13, "Expected the pinned centerline column to leave room for two blocks above its clearance floor "
+                + "within its own cube; if the real DEM changed, re-pin a column with more headroom rather than adjusting this test to fit. Got localFloorY=" + localFloorY);
 
         int localX = x & 15, localZ = z & 15;
         int offRoadLocalZ = (localZ + 8) & 15; // a different column within the SAME cube, confirmed off-road below
@@ -371,23 +379,94 @@ class RoadGenerationTest {
         var logState = net.minecraft.world.level.block.Blocks.OAK_LOG.defaultBlockState();
         var leafState = net.minecraft.world.level.block.Blocks.OAK_LEAVES.defaultBlockState()
                 .setValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT, false);
-        section.setBlockState(localX, localGroundY + 1, localZ, logState, false);
-        section.setBlockState(localX, localGroundY + 2, localZ, leafState, false);
-        section.setBlockState(localX, localGroundY + 1, offRoadLocalZ, logState, false);
-        section.setBlockState(localX, localGroundY + 2, offRoadLocalZ, leafState, false);
+        section.setBlockState(localX, localFloorY + 1, localZ, logState, false);
+        section.setBlockState(localX, localFloorY + 2, localZ, leafState, false);
+        section.setBlockState(localX, localFloorY + 1, offRoadLocalZ, logState, false);
+        section.setBlockState(localX, localFloorY + 2, offRoadLocalZ, leafState, false);
 
         RoadCanopyClearance.clear(generator, cubeX, cubeY, cubeZ, section);
 
-        var clearedLog = section.getBlockState(localX, localGroundY + 1, localZ);
+        var clearedLog = section.getBlockState(localX, localFloorY + 1, localZ);
         assertTrue(clearedLog.isAir(), "Expected a log directly over the road column to be cleared to air, got " + clearedLog);
-        var clearedLeaf = section.getBlockState(localX, localGroundY + 2, localZ);
+        var clearedLeaf = section.getBlockState(localX, localFloorY + 2, localZ);
         assertTrue(clearedLeaf.is(net.minecraft.world.level.block.Blocks.OAK_LEAVES), "Expected leaves over the road column to be preserved, got " + clearedLeaf);
         assertTrue(clearedLeaf.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT), "Expected leaves preserved over the road to be made persistent so they do not decay");
 
-        var untouchedLog = section.getBlockState(localX, localGroundY + 1, offRoadLocalZ);
+        var untouchedLog = section.getBlockState(localX, localFloorY + 1, offRoadLocalZ);
         assertTrue(untouchedLog.is(net.minecraft.world.level.block.Blocks.OAK_LOG), "Expected a log off the road to be left untouched, got " + untouchedLog);
-        var untouchedLeaf = section.getBlockState(localX, localGroundY + 2, offRoadLocalZ);
+        var untouchedLeaf = section.getBlockState(localX, localFloorY + 2, offRoadLocalZ);
         assertTrue(!untouchedLeaf.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT),
                 "Expected leaves off the road to be left untouched (still non-persistent)");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55485/55503 (flat road deck over a short dip, local-heights-only, never
+     * a global {@code ground()} override): against the SAME real, DEM-generated incline row
+     * {@code aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff} already
+     * uses -- {@link RoadDeck#deckY} must never report a height below a column's own natural ground
+     * (no cuttings), and at least one real dip in this row (already confirmed to exist by the
+     * incline test above) must actually get raised. Deliberately does NOT also assert "the row's own
+     * highest column is never raised further": {@code deckY}'s real window is a full 2D box (every
+     * nearby road column, not just ones sharing this exact Z row), so a 1D row measurement alone
+     * cannot predict what it will find off-row -- an earlier version of this test asserted exactly
+     * that from 1D data and was wrong, not {@code RoadDeck} itself (confirmed: the column it flagged
+     * really was correctly raised by a real, higher, off-row neighbor the 1D measurement never saw).
+     */
+    @Test
+    void deckNeverLowersAColumnAndRaisesARealDipToItsHighestNearbyRoadNeighbor() {
+        var grid = generator.grid();
+        int span = MEASURED_ROW_MAX_DX - MEASURED_ROW_MIN_DX + 1;
+        int[] natural = new int[span];
+        int[] deck = new int[span];
+        boolean[] covered = new boolean[span];
+        for (int i = 0; i < span; i++) {
+            int dx = MEASURED_ROW_MIN_DX + i;
+            int x = MEASURED_ROW_X0 + dx;
+            covered[i] = RoadNetwork.coversColumn(grid, x, MEASURED_ROW_Z);
+            if (!covered[i]) continue;
+            natural[i] = generator.surfaceY(x, MEASURED_ROW_Z);
+            deck[i] = RoadDeck.deckY(generator, grid, x, MEASURED_ROW_Z);
+            assertTrue(deck[i] >= natural[i], "deckY must never be below natural ground at dx=" + dx);
+        }
+
+        boolean sawARaise = false;
+        for (int i = 0; i < span; i++) {
+            if (covered[i] && deck[i] > natural[i]) sawARaise = true;
+        }
+        assertTrue(sawARaise, "Expected at least one real dip in this row to actually get raised by the deck");
+    }
+
+    /**
+     * Exercises {@link RoadDeck#buildAll} through a REAL generated cube at the pinned centerline
+     * point (already confirmed, by the test above calling {@link RoadDeck#deckY} directly, to be a
+     * column this ticket's own dip-raising logic actually raises): the support fill strictly between
+     * natural ground and the deck top must be stone bricks, and the deck top itself must be a PLAIN
+     * full pavement block (never the layered slope-compat variant -- a flat deck has no step to
+     * smooth, so layering does not apply here, see {@link RoadDeck}'s own class doc).
+     */
+    @Test
+    void deckBuildsStoneBrickSupportUnderAPlainFullPavementTop() {
+        int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
+        int x = onRoad[0], z = onRoad[1];
+        int naturalY = generator.surfaceY(x, z);
+        int deckY = RoadDeck.deckY(generator, generator.grid(), x, z);
+        assertTrue(deckY > naturalY, "Expected the pinned centerline column to actually be raised by a nearby higher road column; "
+                + "if the real DEM/road geometry changed, re-pin a column this logic actually raises rather than adjusting this test to fit");
+
+        int cubeX = x >> 4, cubeY = deckY >> 4, cubeZ = z >> 4;
+        LevelChunkSection section = generator.generate(cubeX, cubeY, cubeZ);
+        int localX = x & 15, localZ = z & 15, deckLocalY = deckY & 15;
+
+        var deckBlock = section.getBlockState(localX, deckLocalY, localZ);
+        assertTrue(deckBlock.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                        || deckBlock.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE),
+                "Expected the deck top to be a plain full pavement block, got " + deckBlock);
+
+        if (deckY - naturalY >= 2) { // at least one real support block strictly between natural ground and the deck top
+            int supportLocalY = (naturalY + 1) & 15;
+            var supportBlock = section.getBlockState(localX, supportLocalY, localZ);
+            assertTrue(supportBlock.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS),
+                    "Expected stone-brick support directly above natural ground, got " + supportBlock);
+        }
     }
 }

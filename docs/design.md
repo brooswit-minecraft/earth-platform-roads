@@ -790,6 +790,69 @@ clear a column's canopy even though the road surface underneath never actually g
 a disclosed gap, not a fix for that race -- a clean canopy over a column is not evidence the road
 material underneath is correct.
 
+## MINECRAFT-566: a first flat-road-deck prototype (comment 55485, redirected by 55503)
+
+Comment 55510 offered two next directions (narrow bounded pending-data readiness, or a road-local
+deck prototype); the deck was chosen -- it has a settled, lower-risk direction already from 55503
+("local deck/support placement using sampled natural heights and road-local streaming/save extent,
+rather than globally overriding `EarthGenerator.ground`"), while re-entering the stale-cache
+detector means re-opening a problem neither John nor I have root-caused yet (see the two sections
+above).
+
+The key realization: `RoadCanopyClearance` already proved a SUBTRACTIVE overlay at the post
+-generation seam (after `terrain()`/vegetation/structures, before `dropStrayBlockEntities`) is safe
+-- it never touches the natural height input, so caves/structures/biomes/vegetation/water are
+completely unaffected. A flat deck can be built the SAME way, just ADDITIVE instead of subtractive:
+pave a pavement block and stone-brick support strictly ABOVE a column's own natural ground, never
+touching `ground()` itself. This is categorically different from, and far less risky than, the
+"raise `ground()` itself" approach the earlier section on this same topic declined.
+
+`RoadDeck.deckY` raises a column's own natural ground to the local MAXIMUM natural ground height
+among nearby ROAD columns (never non-road terrain) within a small, deliberately conservative 6
+-block window -- large enough to fill a short dip (55485's own stated problem), far too small to
+turn a road climbing a real mountain grade into one artificial, unified plateau. Never lowered (no
+cuttings/embankments-into-hills, consistent with this mod's existing "no cuttings" design decision).
+Pure function of coordinates and the generator's own natural heights (never of which blocks have
+actually been painted), so it is continuous across a cube boundary and deterministic regardless of
+generation order -- the same guarantee `EarthGeneratorRoadMixin`'s own slope layering already
+relies on.
+
+Where a column is raised, `RoadDeck.buildSupportAndDeck` fills stone bricks strictly between the
+natural ground and the new deck top, then caps it with a PLAIN full pavement block (yellow
+terracotta for `CENTERLINE`, polished blackstone otherwise) -- deliberately NOT the layered
+slope-compat block `EarthGeneratorRoadMixin` paints at natural height: that layering exists
+specifically to smooth a STEP between differently-heighted neighbor columns, and every column
+sharing the same `deckY` is, by construction, flat relative to its neighbors -- there is no step
+here to smooth, so a plain full block is the materially correct choice, not a simplification.
+
+`RoadCanopyClearance`'s own clearance floor now calls the same `RoadDeck.deckY` instead of the raw
+natural height (a pure function, so both callers agree without passing anything between them), and
+`SurfaceGeneratorRoadClearanceMixin` calls `RoadDeck.buildAll` BEFORE `RoadCanopyClearance.clear` at
+the same seam -- the deck/support this builds is standing by the time clearance computes its own
+(now possibly-raised) floor, so it is not immediately cleared out from under itself.
+
+**Scope, deliberately narrow (per the ticket's own "small playable draft, not an all-or-nothing
+rewrite"):** PAVED/CENTERLINE only, matching `RoadCanopyClearance`'s own scope -- never the gravel
+shoulder. A filled dip currently shows a drop to the shoulder's own natural height at the paved
+edge; extending support under the shoulder too is a disclosed follow-up, not attempted here.
+
+**Verified:** `RoadGenerationTest.deckNeverLowersAColumnAndRaisesARealDipToItsHighestNearbyRoadNeighbor`
+and `.deckBuildsStoneBrickSupportUnderAPlainFullPavementTop`, against the same real DEM-generated
+incline row and pinned centerline point the rest of this ticket's generation tests use: `deckY`
+never reports below natural ground, a real dip in that row actually gets raised, and the pinned
+centerline column (confirmed to be raised by a real nearby higher road column) gets stone-brick
+support directly above its natural ground and a plain full pavement block at the deck top. One
+assertion attempted and DROPPED during this work, left out deliberately rather than left in wrong:
+"the row's own highest column is never raised further" cannot be verified from a 1D row measurement
+alone, since `deckY`'s real window is a full 2D box (every nearby road column, not only ones
+sharing the same Z row) -- an off-row neighbor legitimately raised a column the 1D data alone made
+look like it shouldn't be, which was the test's own wrong assumption, not a `RoadDeck` bug.
+
+**Not attempted this pass:** no in-game visual confirmation (this agent's environment has no
+running Minecraft client); shoulder support (above); junction-specific behavior where two
+differently-raised roads cross. This is explicitly a prototype, consistent with the ticket's own
+"not an all-or-nothing rewrite."
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
