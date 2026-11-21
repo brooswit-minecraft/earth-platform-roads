@@ -345,17 +345,32 @@ bump: minor
   (collects distinct cells across the cube's 256-column scan first) rather than redundantly
   dispatching the same cell up to 256 times. 91/91 tests pass (one new case proving the dispatch
   returns near-instantly yet the cell still actually resolves once a real cooldown clears).
+- **Independent native verification on `cf8c013` (comment 55549), the ordinary-movement mechanism's
+  own milestone confirmation:** ordinary delayed data and priority PASS -- a speculative request
+  finishing ~1s after a real demand was wanted, with that real demand having NO durable cube
+  through the whole deferral, winning the first legal POST despite a competing lookahead AND a
+  same-cell sibling, POSTing exactly once, and reopening the saved, correctly-painted result. A
+  real `429`->`500`->`200` outage/recovery sequence: no durable cube through any of the failed
+  responses, recovers to the correct result once a valid response arrives, reopens saved. A
+  genuine HTTP 200 empty response: generates and saves grass correctly (legitimately natural
+  terrain, not something to keep waiting on). The ordinary-movement half of this mechanism is now
+  independently, natively confirmed across every one of these cases.
 
 ### Known gaps
-- Per comment 55547: `loadNow`'s own explicit policy (SynchronousLoadGuard excludes it from the
-  pending-defer mechanism entirely) means the SAME column can still legitimately show unsaved,
-  provisional grass via a forced arrival WHILE the ordinary-streaming path's own retry for that
-  exact cube is still outstanding -- not only the originally-disclosed teleport-into-new-coordinates
-  case, but also an arrival landing on a column the player is already walking toward. This is the
-  same deliberate, explicit policy choice (an arrival needs a `Cube` back synchronously, with no
-  "retry next tick" option), not a new behavior -- kept as-is per John's own framing ("keep this
-  exception explicit; no blanket null or server-thread HTTP"), not attempted to be narrowed further
-  this pass.
+- **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
+  theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube
+  forced load landing while the ordinary-streaming path's own retry for that cube is still
+  outstanding -- reproduced the synchronous load adopting and SAVING provisional grass before the
+  real data arrived; a later fresh control correctly painted the same cube, but the original's
+  saved grass survived reopen. `SynchronousLoadGuard`'s existing explicit policy (an arrival needs a
+  `Cube` back synchronously, with no "retry next tick" option) is the deliberate reason this
+  happens, not a new bug -- it is the same disclosed design boundary from comments 55522/55524,
+  just now natively confirmed to actually occur, not only reasoned about. John's own explicit
+  framing: keep the ordinary-movement preview scoped as-is (this known gap does not block it), and
+  develop a SEPARATE safe policy for forced callers as its own follow-up -- constraints already
+  given for whenever that is designed: no server-thread HTTP, no blanket `null`, no silent
+  persistence of provisional output, retain actual writes safely if applicable. Not attempted this
+  pass.
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
   does not verify the road material was actually painted under a column (that would mean
   re-deriving it the way the currently-disabled `RoadPrefetch.sectionLooksStale` does). On the rare
