@@ -4,21 +4,41 @@ Blackstone road surfaces mapped from OpenStreetMap onto Earth Platform's generat
 
 NeoForge 1.21.1, Java 21. Mod ID: `earthplatformroads`. MIT licensed.
 
-## What this prototype does
+## What this mod does
 
-Overlays a short, real, pinned OpenStreetMap extract of Yosemite Valley's
-Southside Drive onto [Earth Platform](https://github.com/pirut/earth-platform)
-0.1.0-alpha.73's cube generation: columns within 3 blocks either side of the
-road's centerline (one way, two lanes -- see
-`docs/road-data-provenance.md`) generate a continuous polished-blackstone
-surface, at-grade, with vegetation suppressed; every other column is
-untouched. See `docs/design.md` for why this is a Mixin and exactly where it
-hooks in, and `docs/earth-platform-dependency.md` for how to build Earth
-Platform as a local compile/test dependency (it is not published anywhere).
+Overlays mapped OpenStreetMap road centerlines onto
+[Earth Platform](https://github.com/pirut/earth-platform) 0.1.0-alpha.73's
+cube generation: columns within a class-derived half-width of a mapped way's
+centerline generate a continuous polished-blackstone surface, at-grade, with
+vegetation suppressed; every other column is untouched. On an incline, the
+top surface uses a [Layered Slopes](https://github.com/brooswit-minecraft/layered-slopes)
+compat block with sub-block height instead of always a full block (see
+`docs/design.md`'s MINECRAFT-566 section). See `docs/design.md` for why this
+is a Mixin and exactly where it hooks in, and `docs/earth-platform-dependency.md`
+for how to build Earth Platform as a local compile/test dependency (it is
+not published anywhere; Layered Slopes is, via GitHub releases --
+`scripts/fetch_layered_slopes_dependency.sh`).
 
-**Scope, deliberately**: one ~190m at-grade segment only. No bridges,
-tunnels, grade separation, intersections, worldwide rollout, or claims about
-driving behaviour -- see MINECRAFT-564.
+Road data is installed, not hard-coded, from two sources using the same
+versioned format: bundled regions baked into the jar
+(`data/earthplatformroads/roads/regions/*.json`, listed by `regions/index.json`)
+and external regions -- every `*.json` file dropped directly into
+`config/earthplatformroads/roads/regions/` in a real install, no index file
+needed there, no Java change, no mod rebuild. This is literal: mapped
+coverage for a new destination is installing a region file, not this mod
+shipping an ever-bigger bundled extract (see `docs/design.md`'s MINECRAFT-566
+section, and `RoadNetworkExternalRegionTest` for proof against a genuinely
+unbundled destination). As of this writing only Yosemite Valley's original
+pinned Southside Drive extract (~190m, one way) is bundled by default.
+
+**Explicit current milestone boundary** (not an open gap -- deferred by
+MINECRAFT-566's own milestone update): bridges and tunnels are tracked in the
+data model but never rendered as a crossing (no surface is drawn for them at
+all, rather than an incorrect at-grade one); correct rendering is a following
+milestone. **Explicit current gaps**: the layering heuristic
+(`RoadSurfaceLayering`) is verified against real generated data in tests but
+has not been verified in an actual playtest. See the MINECRAFT-566 ticket for
+the current, up-to-date status.
 
 ## Building
 
