@@ -1164,6 +1164,80 @@ check pending-ness across exactly that set, the same kind of full-footprint scan
 `cubeContainsNaturalSurface` already does for Y-relevance, applied to cell-pending-ness instead of
 natural height.
 
+## MINECRAFT-566: John's direction change supersedes every bounded-fail-open design above (comment 55545)
+
+Two more native findings against `bf7ae5f` (comments 55544/55545) landed almost immediately after
+the cadence-aware budget (above) shipped:
+
+- **55544**: even the dynamic budget failed a core case -- a speculative request A was still
+  in-flight (dispatched, awaiting its response) at the exact moment B sampled its own budget from
+  `RoadTileSource.nextEligibleRequestAt`. That field does not move until A's response actually
+  lands, so B's one-time snapshot silently missed the real future cooldown entirely (sampled near
+  zero while the real eligible slot was still ~5.7s away). "A one-time snapshot of committed
+  cooldown misses an in-flight response setting the next interval" -- no one-time read of that
+  field can ever be reliable against this race.
+- **55545, a full direction change**, not a bug report: "the mod should keep waiting for needed map
+  data... no timeout/cooldown/outage alone should adopt or permanently save bare terrain." This
+  supersedes the entire "accept whatever `generate()` produces once some bound is reached" premise
+  every fix from comment 55522 through 55544 shared.
+
+**The new mechanism**, built on a native Earth Platform seam discovered by reading the real,
+decompiled `ServerCubeWorld` class (not guessed): `ServerCubeWorld.produce` wraps its own call to
+`CubeGenerator.generate(...)` in a `try { ... } catch (RuntimeException failure) { return new
+Ready(..., null, ..., failure, ...); }`. Its caller, `adoptReady`, treats a `null`-section `Ready`
+as a genuine generation failure: it does NOT create a `Cube`, does NOT touch storage at all, and
+schedules `retryAt.put(key, ticks + 100)` (~5 real-world seconds at 20 TPS) -- the next ordinary
+tick-driven `request` pass naturally re-attempts the exact same cube later, on whatever worker
+thread happens to pick it up then. This is Earth Platform's OWN existing, already-native retry
+machinery, used by every OTHER kind of generation failure already -- nothing new needed building.
+
+So: instead of accept-then-maybe-retry-once-then-fail-open, `ServerCubeWorldRoadPrefetchMixin` now
+dispatches a fire-and-forget fetch for every real cell the cube's own relevant footprint intersects
+(`RoadPrefetch.dispatchRelevantCellFetches`, resolving 55542 as part of this change -- the actual
+intersecting cells, never a speculative halo) and, if ANY of them is still genuinely PENDING
+(`RoadPrefetch.isAnyRelevantCellPending`), throws `RoadDataNotReadyException` INSTEAD OF ever
+calling the real `generate()`. Both new `RoadPrefetch` methods reuse the exact same
+natural-height-padded, geometry-independent footprint scan `cubeContainsNaturalSurface` already
+uses (per comment 55539's own lesson: never require mapped geometry before a fetch resolves),
+just checking cell state across every column in that scan instead of (or in addition to) natural
+height.
+
+**What this eliminates, not just fixes:** because `generate()` is never called at all while
+relevant data is pending, the entire "snapshot readiness before the accepted attempt" race
+(comments 55532/55534/55537/55539) is now structurally moot for this mechanism -- there is no
+already-accepted, possibly-premature attempt to race against. There is also no fixed or dynamic
+defer budget to size (comments 55534/55535/55544's entire "how long should this worker wait"
+question) -- this call site never waits at all; it dispatches and immediately either proceeds or
+throws. `RoadTileSource.timeUntilNextEligibleRequest()` (added for 55535, proven unreliable by
+55544) and `RoadPrefetch.sustainedOutage()`/`RoadPrefetch.timeUntilNextEligibleRequest()` (its
+wrappers) are removed entirely rather than patched further -- comment 55545 explicitly accepts that
+a sustained outage no longer causes any fallback to grass at all; the cube simply keeps being
+retried by Earth Platform's own scheduler until the data resolves or the player no longer wants it
+(Earth Platform's own `wanted`/`droppedKeys` mechanism, already native).
+
+**`loadNow`'s own forced-arrival contract, now an explicit policy rather than an open question**
+(comment 55545's own ask): `SynchronousLoadGuard` still gates this entire mechanism out of
+`loadNow` completely, because `loadNow` cannot defer or retry at all -- its caller needs a `Cube`
+back on this exact call, synchronously, this tick, with no "come back next tick" option the way
+`request`'s worker-pool path has via `retryAt`. The deliberate, explicit policy (the SAME behavior
+documented since comments 55522/55524, now stated as a policy rather than left implicit): a forced
+arrival always adopts whatever natural or already-resolved terrain the generator has for that exact
+column, right now, never blocking and never throwing. The alternative (blocking an arrival
+indefinitely, or returning `null` and risking every OTHER forced-load caller, portal ground
+selection among them) was evaluated and rejected as worse, not overlooked.
+
+Verified: `RoadPrefetch.isAnyRelevantCellPending`/`dispatchRelevantCellFetches` against a real,
+entirely-cold synthetic fixture (no cache file, no mapped geometry, a real HTTP stub) -- proving
+pending-ness is reported correctly before a fetch, dispatch actually sends a real request, and the
+same cube is no longer reported pending once that cell resolves. `RoadDataNotReadyException` is a
+plain `RuntimeException` (confirmed by reading the decompiled class to be exactly the type
+`produce`'s own `catch` clause is declared to catch). 90/90 tests pass (net: two obsolete tests for
+the now-removed cadence-budget methods replaced by one new test for the two new methods).
+**Not independently reproduced here**: that Earth Platform's own `retryAt`/`adoptReady` pipeline
+actually behaves as the decompiled source describes end to end on a real, running server -- the
+same disclosed harness gap as every other fix in this class; John's own native infrastructure is
+what will confirm that.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

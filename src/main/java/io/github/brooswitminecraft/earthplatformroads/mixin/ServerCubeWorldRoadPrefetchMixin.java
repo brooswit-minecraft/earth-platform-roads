@@ -2,10 +2,9 @@ package io.github.brooswitminecraft.earthplatformroads.mixin;
 
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadDataNotReadyException;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import io.github.brooswitminecraft.earthplatformroads.road.SynchronousLoadGuard;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.nbt.CompoundTag;
@@ -72,8 +71,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * that fast path exactly as before), and before generation actually runs. This dispatches through
  * {@link RoadPrefetch#forColumnBounded} -- built on the exact same deduplicated, one-in-flight,
  * rate-limited {@code RoadTileSource} machinery {@code EarthGeneratorPrepareMixin} already uses, not
- * a second parallel mechanism -- but bounded (see {@link #PREFETCH_WAIT_BOUND} and comment 55476's
- * "bounded-worker" ask, below) rather than fully synchronous, since this specific call site is a
+ * a second parallel mechanism -- but bounded (see comment 55476's "bounded-worker" ask, below;
+ * comment 55545 later changed what happens once that bound is reached -- see that section) rather
+ * than fully synchronous, since this specific call site is a
  * finite, shared generation-worker pool. Because this runs on the background worker thread BEFORE
  * {@code generate()}, a cell that resolves within the bound makes its data available to
  * {@code EarthGeneratorRoadMixin}'s {@code surface()} hook during THIS SAME generation call -- not a
@@ -106,8 +106,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * {@code EarthGeneratorPrepareMixin} still uses: {@code RoadTileSource.waysForCellWithBoundedWait}
  * coalesces every caller for the same still-pending cell onto ONE real fetch (keyed by cell, so
  * every cube-Y layer of one column shares it), runs that fetch's actual network wait on one
- * dedicated background thread (never a generation worker), and bounds each CALLER's own wait to
- * {@link #PREFETCH_WAIT_BOUND} before failing open -- the shared fetch keeps running regardless, so
+ * dedicated background thread (never a generation worker), and bounds each CALLER's own wait (at
+ * the time of this writing, comment 55545 changed this call site's own bound to zero -- see that
+ * section for why) -- the shared fetch keeps running regardless, so
  * a later caller still benefits once it resolves. The Moore-neighborhood lookahead dispatch is fully
  * async too ({@code enqueueLookaheadAsync}): the calling worker thread never waits on it at all.
  *
@@ -135,8 +136,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * map entry is not HTTP.
  *
  * <h2>A real ordering bug in that fix, found by comment 55492 through pure logical review</h2>
- * The first version evicted BEFORE dispatching/waiting on the fetch, leaving a window (up to
- * {@link #PREFETCH_WAIT_BOUND}) during which some OTHER concurrent caller -- a {@code lowestGround}
+ * The first version evicted BEFORE dispatching/waiting on the fetch, leaving a window during which
+ * some OTHER concurrent caller -- a {@code lowestGround}
  * survey on the server tick thread, for example -- could re-populate this exact column's cache
  * with ANOTHER premature decision, undoing the eviction before {@code generate()} ever benefited
  * from it. Fixed by reordering: the dispatch/wait now runs first, and the eviction is the very
@@ -208,19 +209,92 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * own injection points (into {@code ServerCubeWorld} itself) actually weave and fire as written --
  * NeoForge's {@code gameTestServer} run (a real dedicated server, the sanctioned mechanism for
  * exactly this kind of test) is the right tool for that and is not attempted here.
+ *
+ * <h2>A direction change superseding the "bounded fail-open to grass" design above (comment 55545)</h2>
+ * Comments 55522 through 55535 (above) all shared one premise: once some bound was reached (a
+ * fixed window, later a dynamic one), this injection would accept whatever {@code generate()}
+ * produced -- including bare/wrong terrain for a column whose real road data simply hadn't
+ * resolved yet -- and that result would be saved, permanently, by {@code produce}'s own normal
+ * path. John's own explicit direction change: "the mod should keep waiting for needed map data...
+ * no timeout/cooldown/outage alone should adopt or permanently save bare terrain." This supersedes
+ * every bounded-fail-open behavior described above for this specific mechanism (the UNRELATED
+ * stale-{@code SurfaceGenerator}-cache retry loop, {@link #MAX_STALE_RETRY_ATTEMPTS}, is untouched
+ * -- a different problem, see its own sections above).
+ *
+ * <p><b>The mechanism:</b> rather than accept-then-maybe-retry-once, this injection now dispatches
+ * a fire-and-forget fetch for every real cell this cube's own relevant footprint intersects
+ * ({@link RoadPrefetch#dispatchRelevantCellFetches}; comment 55542's own direction -- the actual
+ * intersecting cells, never a speculative halo) and, if ANY of them is still genuinely
+ * {@link io.github.brooswitminecraft.earthplatformroads.road.RoadTileSource.CellState#PENDING}
+ * ({@link RoadPrefetch#isAnyRelevantCellPending}), throws
+ * {@link io.github.brooswitminecraft.earthplatformroads.road.RoadDataNotReadyException} INSTEAD OF
+ * ever calling the real {@code generate()} at all. {@code ServerCubeWorld.produce}'s own
+ * surrounding {@code try/catch (RuntimeException failure)} (confirmed by reading the real,
+ * decompiled class) turns that into a {@code Ready} result with a {@code null} section; its own
+ * {@code adoptReady} does NOT create a {@code Cube} and does NOT touch storage at all, and
+ * schedules {@code retryAt.put(key, ticks + 100)} (roughly 5 real-world seconds at 20 TPS) -- the
+ * NEXT ordinary tick-driven {@code request} pass naturally re-attempts this exact cube later, on
+ * whatever worker thread happens to pick it up then. See {@code RoadDataNotReadyException}'s own
+ * doc for the full mechanism and why it is Earth Platform's OWN existing, already-native retry
+ * machinery, not something this mod built: this mixin never manages retry scheduling, in-flight
+ * resource bounds, or discarding no-longer-wanted cubes -- {@code ServerCubeWorld}'s own
+ * {@code retryAt}/{@code pending}/{@code wanted} fields already do every one of those, for every
+ * OTHER kind of generation failure too.
+ *
+ * <p>Because this throws BEFORE ever calling {@code generate()} when relevant data is pending, the
+ * entire "snapshot readiness before the accepted attempt" race (comments 55532/55534/55537/55539)
+ * is now structurally moot for this mechanism: there is no "already-accepted, possibly-premature"
+ * attempt to race against, because none is ever produced while relevant data is still pending.
+ * There is also no fixed or dynamic defer budget to size (comments 55534/55535/55544's entire
+ * "how long should this generation worker wait" question): this call site never waits at all
+ * anymore -- the fetch is dispatched and this returns (by throwing) immediately either way.
+ *
+ * <p><b>Comment 55545 explicitly accepts the consequence:</b> "repeated healthy-domain outage/429/
+ * 500 keeps the requested cube absent from durable storage... recovers when valid result returns" --
+ * a sustained provider outage no longer causes a fallback to grass at all; the cube simply keeps
+ * being retried (by Earth Platform's own scheduler, at its own pace) until either the data resolves
+ * or the player no longer wants that cube (Earth Platform's own {@code wanted}/{@code droppedKeys}
+ * mechanism, already native, already handles that). {@code RoadTileSource.sustainedOutage()} (used
+ * by an earlier, now-superseded version of this mechanism, and still used elsewhere by
+ * {@code RoadNetwork.diagnoseColumn}'s own distinct diagnostic) is no
+ * longer consulted by this injection at all for that reason -- waiting longer cannot make a
+ * genuinely down provider resolve sooner, but per this direction change, giving up and showing
+ * wrong terrain is no longer an acceptable alternative either, so there is nothing left for that
+ * signal to usefully change here. Once {@code CellState.CONFIRMED_EMPTY} (a genuinely resolved "no
+ * road here"), generation proceeds immediately and normally -- that is legitimate natural terrain,
+ * not something to keep waiting on.
+ *
+ * <p><b>{@code loadNow}'s own forced-arrival contract, addressed explicitly rather than left
+ * implicit:</b> John's own framing -- "needs an explicit policy before claiming full coverage, not
+ * a blanket null or silent save of provisional grass." {@code loadNow} cannot defer or retry at all:
+ * its caller (an arrival point, a portal, or similar) needs a {@code Cube} back on this exact call,
+ * synchronously, this tick -- there is no "come back next tick" option available to it the way
+ * {@code request}'s own worker-pool path has via {@code retryAt}. The deliberate, explicit policy
+ * (unchanged in behavior from every earlier comment in this class, now stated as a policy rather
+ * than left as an open question): {@link SynchronousLoadGuard} gates this entire mechanism
+ * (dispatch, pending-check, throw) out of {@code loadNow} completely -- a forced arrival always
+ * adopts whatever natural or already-resolved terrain the generator has for that exact column,
+ * right now, never blocking and never throwing, exactly as {@code SynchronousLoadGuardTest} already
+ * covers. A forced arrival CAN still show provisional (pending) terrain at the one column it
+ * arrives on, by this explicit design choice -- the alternative (blocking an arrival indefinitely,
+ * or returning {@code null} and risking every OTHER forced-load caller, portal ground selection
+ * among them) was evaluated and rejected as worse, not overlooked. This is the SAME disclosed
+ * design boundary documented earlier in this class's own doc (comments 55522/55524) -- restated
+ * here as an explicit policy statement per John's own request, not a behavior change.
+ *
+ * <p><b>Known, disclosed limitation of this exact candidate:</b> no test in this repository drives
+ * the real {@code ServerCubeWorld.produce}/{@code adoptReady}/{@code retryAt} pipeline -- the same
+ * disclosed harness gap named earlier in this class's own doc. What IS verified directly: the two
+ * new {@code RoadPrefetch} methods against real {@code RoadTileSource.CellState}s and real
+ * synthetic fixtures, and that {@code RoadDataNotReadyException} is a plain {@code RuntimeException}
+ * (confirmed, by reading the decompiled class, to be exactly the type {@code produce}'s own
+ * {@code catch} clause is declared to catch). What is NOT independently reproduced here: that
+ * Earth Platform's own {@code retryAt}/{@code adoptReady} pipeline actually behaves as the
+ * decompiled source describes end to end on a real, running server -- John's own native
+ * infrastructure is what will confirm that, as with every other fix in this class.
  */
 @Mixin(targets = "io.earthplatform.minecraft.cubic.ServerCubeWorld")
 public abstract class ServerCubeWorldRoadPrefetchMixin {
-    /**
-     * MINECRAFT-566 comment 55476's "bounded-worker" ask: how long THIS generation worker thread
-     * may wait for a fresh fetch before failing open -- short relative to the full HTTP timeout
-     * ({@code RoadNetwork.TILE_FETCH_TIMEOUT}, 20s), long enough to usually catch a healthy
-     * provider's own response. See {@code RoadTileSource#waysForCellWithBoundedWait}'s own doc for
-     * why a timeout here never loses or fabricates anything -- the real fetch keeps running
-     * regardless, coalesced across every cube-Y layer of this same column.
-     */
-    private static final Duration PREFETCH_WAIT_BOUND = Duration.ofSeconds(2);
-
     /**
      * MINECRAFT-566 comment 55496's residual race, bounded rather than eliminated (see this
      * class's own "known, disclosed residual race" doc section): how many times
@@ -243,87 +317,6 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      */
     private static final int MAX_STALE_RETRY_ATTEMPTS = 0;
 
-    /**
-     * MINECRAFT-566 comment 55522/55526: "bound deferral of only unsaved road-relevant surface
-     * cubes... while geometry is actually PENDING" -- the deeper, deliberately-deferred half of
-     * 55522 (the fetch-side priority/cooldown fix itself landed separately, comments 55522/55528).
-     * Deliberately SEPARATE from the (currently disabled) stale-retry mechanism above: a different
-     * problem (a tile genuinely never having resolved yet, not a stale per-column cache entry), with
-     * a different, direct detector ({@link RoadPrefetch#isPendingForColumn}, never the indirect
-     * "compare decorated output against fresh geometry" approach that mechanism's own detector was
-     * found to have false positives in).
-     *
-     * <p>Only ever runs for the ordinary-streaming path (never {@code loadNow}'s own arrival --
-     * "keep forced loads as an explicit separate control", per comment 55526 explicitly), only ever
-     * when {@link RoadPrefetch#hasLiveTileSource} (an explicit gate, per comment 55532 -- there is
-     * nothing to defer for if no live source is even configured), only for a cube whose own Y-range
-     * actually {@link RoadPrefetch#cubeContainsNaturalSurface} (a road is only ever painted AT a
-     * column's own natural height; a cube that cannot possibly contain it has nothing to gain from
-     * deferring), and only ever on a cube THIS generation call is producing fresh -- {@code produce}'s
-     * own storage-read fast path above this injection point means an already-saved cube never
-     * reaches here at all, so this can never retrofit one.
-     *
-     * <p><b>Comment 55532, a real race found by John's own native reproduction:</b> the first
-     * version of this fix checked {@code RoadPrefetch.isPendingForColumn} only AFTER the accepted
-     * {@code generate()} call had already run -- but the tile can transition PENDING -&gt; READY
-     * literally DURING that one call (observed concretely: the tile became READY barely 91ms after
-     * the accepted attempt had already produced grass; the post-hoc pending check then correctly,
-     * but uselessly, reported "not pending", so the retry loop's own precondition was already false
-     * and it never fired at all -- the stale grass was accepted and saved). Fixed by snapshotting
-     * readiness IMMEDIATELY BEFORE the accepted attempt instead of inferring it from decorated
-     * blocks afterward: if the snapshot says PENDING, this unconditionally gives the cell one more
-     * bounded chance to resolve, regardless of what the state looks like by the time this runs --
-     * handling the race window rather than missing it.
-     *
-     * <p>Bounded two ways at once: a real wall-clock budget (a dynamic total per comment 55535 --
-     * see {@link #DEFER_ROUND_TRIP_MARGIN}'s own doc -- the REMAINING portion of which is passed to
-     * the re-dispatch, not a fresh full bound every time, which comment 55532 also flagged as a real
-     * inconsistency with this budget's own "total, not per-attempt" intent) and a single retry
-     * attempt (once the cell resolves and this regenerates once, there is nothing further to gain
-     * from retrying again). Either bound running out, or the wait coming back still pending, means
-     * an explicit, deliberate fail-open: accept whatever the last attempt produced, exactly like any
-     * other pending/failed cell already does, never an unbounded stall of this generation worker
-     * thread.
-     *
-     * <p><b>Comment 55534, a real gap in the 55532 fix itself:</b> John's own native checks found
-     * two more real issues. First, the deadline was computed AFTER the first accepted
-     * {@code generate()} call had already returned, so this window only ever bounded the RETRY's
-     * own slice, not the method's real total extra time (initial dispatch wait + first
-     * {@code generate()} + retry wait) -- observed concretely: a held response failed open at
-     * 4.26s against this "3s" window. Fixed by capturing the deadline once, before the INITIAL
-     * dispatch, so this window genuinely is the aggregate budget it was always meant to be. Second,
-     * the initial dispatch itself (not just this retry) now shares the exact same
-     * {@code hasLiveTileSource}/{@code cubeContainsNaturalSurface} gate -- the first version of
-     * that gate only ever covered this retry, so a deep/sky cube (Y-irrelevant) still sent its own
-     * initial fetch POST, and a cache-only source (no live-fetch capability, but still non-null)
-     * still entered this method's wait scheduling despite sending zero POSTs. See
-     * {@code RoadPrefetch.hasLiveTileSource}'s own updated doc for the cache-only distinction.
-     *
-     * <p><b>Comment 55535, a real design gap in the fixed window itself:</b> a FIXED constant here
-     * cannot be both short (so a genuine outage fails open quickly) and long enough to survive the
-     * provider's own real steady-cadence cooldown (observed concretely under the DEFAULT cadence: an
-     * entirely ordinary, healthy cold cell gave up and saved grass PERMANENTLY -- an already-saved
-     * cube never reaches this injection again -- before its own real cooldown had even cleared, even
-     * though an explicit, later fetch immediately proved the cell would have resolved correctly).
-     * Replaced by a DYNAMIC budget, computed once per call from
-     * {@link RoadPrefetch#timeUntilNextEligibleRequest} (the REAL remaining cooldown, not a guess),
-     * plus {@link #DEFER_ROUND_TRIP_MARGIN} for the request/response itself once that cooldown
-     * clears, clamped to {@link #MAX_DEFER_WAIT} as a hard safety ceiling regardless of cadence. The
-     * one case this budget deliberately does NOT try to extend for is
-     * {@link RoadPrefetch#sustainedOutage} (several real, dispatched failures in a row, no success
-     * between): waiting out a longer cooldown cannot help a provider that is already known to be
-     * down, so that case clamps to the short {@link #PREFETCH_WAIT_BOUND} instead -- "a deliberate
-     * finite outage policy," per John's own framing, rather than this budget growing to cover a
-     * cadence that will not actually help.
-     */
-    private static final Duration DEFER_ROUND_TRIP_MARGIN = Duration.ofSeconds(2);
-
-    /**
-     * MINECRAFT-566 comment 55535: a hard ceiling on the dynamic defer budget above, regardless of
-     * how long the provider's own real cooldown turns out to be -- this generation worker thread
-     * must not stall indefinitely even against a misconfigured or unusually long cadence.
-     */
-    private static final Duration MAX_DEFER_WAIT = Duration.ofSeconds(10);
 
     @Shadow
     private CubeGenerator generator;
@@ -346,62 +339,22 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         if (!(cubeGenerator instanceof EarthGenerator earthGenerator)) {
             return cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
         }
-        // MINECRAFT-566 comment 55492, a real bug in the first version of this fix: evicting
-        // BEFORE the bounded wait below left a window (up to PREFETCH_WAIT_BOUND) during which
-        // some OTHER concurrent caller -- a lowestGround survey on the server tick thread, for
-        // example -- could re-populate this exact column's cache with ANOTHER premature decision,
-        // undoing the eviction before generate() ever benefited from it. The dispatch/wait must
-        // run FIRST; the eviction must be the very LAST thing before calling the real generate().
-        // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
-        // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
-        // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
-        // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
-        // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
-        // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
-        // time. Fixed by converting to this cube's own center block coordinate before dispatching --
-        // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
-        // center avoids ever landing exactly on a tile-boundary column by construction. Computed
-        // unconditionally (cheap integer math) since the pending-defer retry loop near the end of
-        // this method needs the same center point too.
-        int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
-        int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
-        // MINECRAFT-566 comment 55534: John's own native checks found the INITIAL dispatch below
-        // sending its own POST for a deep/sky cube whose Y-range can never contain a road (only the
-        // later defer snapshot was Y-gated), and a cache-only source (no live-fetch capability, but
-        // still a non-null RoadTileSource) sending zero POSTs yet still entering this method's wait
-        // scheduling. Both gates below are the SAME ones the defer snapshot already uses -- computed
-        // once, here, and reused for both so the two can never drift apart.
-        // MINECRAFT-566 comment 55539: short-circuit on SynchronousLoadGuard FIRST -- loadNow's own
-        // arrival path never dispatches regardless of this gate's answer, so there is no reason to
-        // pay for the (now a real 16x16 scan) cost of computing it at all on that path.
-        boolean liveAndRelevant = !SynchronousLoadGuard.isActive()
+        // MINECRAFT-566 comment 55545, superseding every earlier bounded-fail-open version of this
+        // check (comments 55522 through 55544 -- see this class's own "direction change" doc
+        // section for the full history): never call generate() AT ALL while a real cell this cube's
+        // own relevant footprint depends on is still genuinely PENDING -- dispatch (fire-and-forget,
+        // never waited on) and throw instead, letting Earth Platform's own native
+        // retryAt/adoptReady machinery defer this exact cube to a later tick, on its own schedule,
+        // without this worker thread blocking at all. SynchronousLoadGuard still excludes loadNow's
+        // own arrival path entirely -- see that section's own explicit policy statement.
+        if (!SynchronousLoadGuard.isActive()
                 && RoadPrefetch.hasLiveTileSource()
-                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ);
-        // MINECRAFT-566 comment 55535: the aggregate defer budget is now DYNAMIC -- sized against
-        // the REAL remaining steady-cadence cooldown (RoadPrefetch.timeUntilNextEligibleRequest)
-        // plus a fixed round-trip margin, clamped to MAX_DEFER_WAIT -- rather than a fixed guess that
-        // could not be both short (fail an outage open quickly) and long enough to survive an
-        // entirely ordinary cooldown. sustainedOutage() short-circuits this to the short
-        // PREFETCH_WAIT_BOUND instead: a known-down provider will not be fixed by waiting longer.
-        // Computed once, here, before the initial dispatch, so it is a genuine aggregate budget
-        // across initial dispatch + first generate() + retry (comment 55534's own fix, preserved).
-        Duration deferBudget;
-        if (!liveAndRelevant) {
-            deferBudget = Duration.ZERO; // nothing to defer for at all; never read, kept for clarity
-        } else if (RoadPrefetch.sustainedOutage()) {
-            deferBudget = PREFETCH_WAIT_BOUND;
-        } else {
-            Duration candidate = RoadPrefetch.timeUntilNextEligibleRequest().plus(DEFER_ROUND_TRIP_MARGIN);
-            deferBudget = candidate.compareTo(MAX_DEFER_WAIT) > 0 ? MAX_DEFER_WAIT : candidate;
-        }
-        Instant deferDeadline = Instant.now().plus(deferBudget);
-        if (liveAndRelevant) { // already excludes loadNow's own arrival path -- see liveAndRelevant's own doc
-            // MINECRAFT-566 comment 55476's "bounded-worker" ask, now comment 55535's dynamic budget:
-            // forColumnBounded (not the plain forColumn prepare/prepareNear uses) coalesces this
-            // column's own-cell fetch across every cube-Y layer and bounds this worker's own wait to
-            // deferBudget (the real remaining cooldown, not a fixed guess), with the real network
-            // wait happening on a dedicated background thread, never this one.
-            RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, deferBudget);
+                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ)) {
+            RoadPrefetch.dispatchRelevantCellFetches(earthGenerator, cubeX, cubeY, cubeZ);
+            if (RoadPrefetch.isAnyRelevantCellPending(earthGenerator, cubeX, cubeY, cubeZ)) {
+                throw new RoadDataNotReadyException(
+                        "road data still pending for cube (" + cubeX + "," + cubeY + "," + cubeZ + ")");
+            }
         }
         // MINECRAFT-566 comment 55486/55487, a real, independently-reproduced staleness bug found
         // in Earth Platform's own code: SurfaceGenerator permanently memoizes this column's whole
@@ -424,15 +377,6 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // empty lists (isolating each attempt's side effects completely) and merging ONLY the
         // accepted attempt's additions into the caller's real lists at the very end -- the same
         // isolation `produce()` itself already relies on by always passing fresh empty lists in.
-        // MINECRAFT-566 comment 55532: this snapshot MUST be taken immediately BEFORE the accepted
-        // attempt below, not inferred afterward from decorated blocks or re-checked only once that
-        // attempt has already run -- the tile can resolve PENDING -> READY literally DURING that
-        // one generate() call (John's own native reproduction: the tile became READY barely 91ms
-        // after the accepted attempt had already produced grass), and a check made only after the
-        // fact would correctly, but uselessly, see "not pending" and never retry at all. See
-        // DEFER_ROUND_TRIP_MARGIN's own doc for the full reasoning.
-        boolean wasPendingBeforeAcceptedAttempt = liveAndRelevant // already excludes loadNow's own arrival path
-                && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ);
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
         List<CompoundTag> attemptEntities = new ArrayList<>();
         LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
@@ -452,31 +396,6 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             attemptBlockEntities = new ArrayList<>(); // discard the abandoned attempt's own additions entirely
             attemptEntities = new ArrayList<>();
             section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
-        }
-        // MINECRAFT-566 comment 55522/55526/55532's deferred "pending surface-cube" half: fires
-        // only when the SNAPSHOT taken above (before the accepted attempt) says this cell was
-        // genuinely pending -- never re-derived from the current state here, for exactly the race
-        // reason that snapshot's own doc explains. Re-dispatches the SAME cell (coalesced via
-        // RoadTileSource's own in-flight map, so this never sends a second real request while the
-        // first is still outstanding), passing the REMAINING portion of the dynamic deferBudget
-        // (comment 55535 -- never a fresh bound each time, this budget is a total, not per-attempt),
-        // and only if that wait actually resolved it, evicts and regenerates once -- an EXPLICIT,
-        // deliberate fail-open the moment the budget is already out, or the wait comes back still
-        // pending: accept whatever the last attempt produced, exactly like any other pending/failed
-        // cell already does, never an unbounded stall of this generation worker thread. A single
-        // retry attempt is enough: once resolved and regenerated, there is nothing further to gain.
-        if (wasPendingBeforeAcceptedAttempt) {
-            Instant now = Instant.now();
-            if (now.isBefore(deferDeadline)) {
-                Duration remaining = Duration.between(now, deferDeadline);
-                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, remaining);
-                if (!RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)) {
-                    RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
-                    attemptBlockEntities = new ArrayList<>(); // discard the abandoned (premature) attempt's own additions entirely
-                    attemptEntities = new ArrayList<>();
-                    section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
-                } // else: still pending after waiting again -- explicit bounded fail-open, do not spin further
-            } // else: window already out before even trying again -- explicit bounded fail-open
         }
         blockEntities.addAll(attemptBlockEntities);
         entities.addAll(attemptEntities);

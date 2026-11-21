@@ -108,29 +108,6 @@ public final class RoadPrefetch {
     }
 
     /**
-     * MINECRAFT-566 comment 55535: {@code RoadTileSource.sustainedOutage()}, exposed for the same
-     * reason {@link #hasLiveTileSource} is -- {@code ServerCubeWorldRoadPrefetchMixin}'s defer needs
-     * this as its "stop waiting, this is a real outage, not just an ordinary cooldown" signal. Never
-     * {@code true} when there is no live tile source at all (nothing has ever genuinely attempted a
-     * fetch, let alone failed one).
-     */
-    public static boolean sustainedOutage() {
-        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
-        return tiles != null && tiles.sustainedOutage();
-    }
-
-    /**
-     * MINECRAFT-566 comment 55535: {@code RoadTileSource.timeUntilNextEligibleRequest()}, exposed so
-     * the defer can size its own wait against the REAL remaining steady-cadence cooldown instead of
-     * guessing with a fixed constant -- see that method's own doc for the native finding that drove
-     * this. {@link Duration#ZERO} when there is no live tile source at all (nothing to wait for).
-     */
-    public static Duration timeUntilNextEligibleRequest() {
-        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
-        return tiles == null ? Duration.ZERO : tiles.timeUntilNextEligibleRequest();
-    }
-
-    /**
      * MINECRAFT-566 comment 55534, a conservative padding below each sampled column's own natural
      * ground height, applied by {@link #cubeContainsNaturalSurface}: John's own native "upper-first"
      * fixture found a real road footprint column (off-center, e.g. the shoulder) whose OWN natural
@@ -191,6 +168,65 @@ public final class RoadPrefetch {
             }
         }
         return false;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55545, John's own direction change: "no timeout/cooldown/outage alone
+     * should adopt or permanently save bare terrain... start with actual road-data tiles
+     * intersecting the relevant cube footprint (55542), not the speculative halo." Scans this cube's
+     * own 16x16 footprint exactly like {@link #cubeContainsNaturalSurface} (the same
+     * {@link #BASE_PAVING_PADDING_BLOCKS}-padded natural-height filter -- only a column that could
+     * plausibly need THIS cube even counts), but for each such column checks whether the ACTUAL cell
+     * it maps to is still genuinely {@link RoadTileSource.CellState#PENDING}, rather than inferring
+     * everything from one center sample (comment 55542's own finding: a cube can straddle two real
+     * cells, one already confirmed-empty at the center while a different cell covering only an outer
+     * strip of the SAME cube is still genuinely pending -- natively reproduced, worker adopted grass
+     * for that case). {@code false} when there is no live tile source at all.
+     */
+    public static boolean isAnyRelevantCellPending(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return false;
+        MercatorGrid grid = generator.grid();
+        int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int worldX = baseX + lx, worldZ = baseZ + lz;
+                int localY = generator.surfaceY(worldX, worldZ) - baseY;
+                if (localY + BASE_PAVING_PADDING_BLOCKS < 0 || localY > 15) continue; // this column could never need this cube
+                GeoPoint point = grid.geographic(worldX, worldZ);
+                if (tiles.cellState(point.latitude(), point.longitude()) == RoadTileSource.CellState.PENDING) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55545: the dispatch counterpart to {@link #isAnyRelevantCellPending} --
+     * fires off (never waits on) a fetch for every actual cell this cube's own relevant footprint
+     * intersects, exactly the same set {@link #isAnyRelevantCellPending} checks, not a broader
+     * speculative neighborhood. {@link RoadTileSource#waysForCellWithBoundedWait} with
+     * {@link Duration#ZERO} dispatches (coalesced, never a duplicate real request for an
+     * already-in-flight cell) and returns immediately without waiting -- the caller never blocks on
+     * this at all, matching "keep wanted unresolved cubes deferred/retryable without tying up...
+     * worker threads." Redundant calls for columns mapping to the same cell (the ordinary case: one
+     * cell is almost always far larger than one cube) are cheap no-ops once dispatched, so no extra
+     * per-cell deduplication is attempted here.
+     */
+    public static void dispatchRelevantCellFetches(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return;
+        MercatorGrid grid = generator.grid();
+        int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int worldX = baseX + lx, worldZ = baseZ + lz;
+                int localY = generator.surfaceY(worldX, worldZ) - baseY;
+                if (localY + BASE_PAVING_PADDING_BLOCKS < 0 || localY > 15) continue;
+                GeoPoint point = grid.geographic(worldX, worldZ);
+                tiles.waysForCellWithBoundedWait(point.latitude(), point.longitude(), Duration.ZERO);
+                tiles.enqueueLookaheadAsync(point.latitude(), point.longitude());
+            }
+        }
     }
 
     /**

@@ -1229,47 +1229,59 @@ class RoadTilePrefetchMixinTest {
     }
 
     /**
-     * MINECRAFT-566 comment 55535: {@code RoadPrefetch.sustainedOutage}/{@code
-     * timeUntilNextEligibleRequest} must delegate to the real configured source, and return sane
-     * defaults (never true / always zero) with no live source at all -- the signals
-     * {@code ServerCubeWorldRoadPrefetchMixin}'s dynamic defer budget relies on.
+     * MINECRAFT-566 comment 55545, John's own direction change superseding every bounded-fail-open
+     * design: {@code RoadPrefetch.isAnyRelevantCellPending}/{@code dispatchRelevantCellFetches} are
+     * what {@code ServerCubeWorldRoadPrefetchMixin} now uses, INSTEAD of ever calling {@code
+     * generate()}, to decide whether to throw {@code RoadDataNotReadyException} rather than accept
+     * bare terrain. Entirely cold boot (no cache file, no HTTP stub response yet), proving: (1) a
+     * relevant, never-fetched cube is reported pending; (2) dispatching actually sends a real
+     * request; (3) once that request resolves, the SAME cube is no longer reported pending.
      */
     @Test
-    void sustainedOutageAndTimeUntilNextEligibleRequestDelegateCorrectly(@TempDir Path roadCache) throws Exception {
-        RoadNetwork.setTileSourceForTests(null);
-        assertTrue(!RoadPrefetch.sustainedOutage(), "Expected no sustained outage reported when there is no live source at all");
-        assertEquals(Duration.ZERO, RoadPrefetch.timeUntilNextEligibleRequest(),
-                "Expected zero remaining cooldown reported when there is no live source at all");
-
+    void isAnyRelevantCellPendingAndDispatchRelevantCellFetchesWorkCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         java.nio.file.Files.createDirectories(roadCache);
         AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555088,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Pending Cell Test Road"},
+                  "geometry":[{"lat":47.0010,"lon":-117.0050},{"lat":47.0060,"lon":-117.0050}]}]}
+                """;
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {
             requests.incrementAndGet();
-            exchange.sendResponseHeaders(500, -1); // every real dispatch genuinely fails
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
             exchange.close();
         });
         stub.start();
         try {
             RoadTileSource tileSource = new RoadTileSource(
-                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5), null, Duration.ofMillis(200));
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
             RoadNetwork.setTileSourceForTests(tileSource);
-            assertTrue(!RoadPrefetch.sustainedOutage(), "Expected no outage reported before any real failure has happened");
-            assertEquals(Duration.ZERO, RoadPrefetch.timeUntilNextEligibleRequest(),
-                    "Expected zero remaining cooldown before any request has ever been dispatched");
 
-            // Three real, genuinely dispatched failures in a row (each past the 200ms cooldown so
-            // none is merely DISPATCH_SUPPRESSED) is exactly SUSTAINED_OUTAGE_FAILURE_THRESHOLD.
-            tileSource.waysForCell(53.0, -4.0);
-            Thread.sleep(200);
-            tileSource.waysForCell(53.1, -4.1);
-            Thread.sleep(200);
-            tileSource.waysForCell(53.2, -4.2);
-            assertEquals(3, requests.get(), "Expected three real dispatched requests against this always-failing stub");
-            assertTrue(RoadPrefetch.sustainedOutage(), "Expected RoadPrefetch to delegate and report the real sustained outage");
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 47.0035, lon = -117.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+            int cubeY = generator.surfaceY(block[0], block[1]) >> 4;
 
-            Duration remaining = RoadPrefetch.timeUntilNextEligibleRequest();
-            assertTrue(!remaining.isNegative(), "Expected a non-negative remaining cooldown after a real dispatch. Got " + remaining);
+            assertTrue(RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY, cubeZ),
+                    "Expected the cube containing this never-fetched cell's own natural surface to be reported pending");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY + 50, cubeZ),
+                    "Expected a cube far ABOVE the natural ground height to NOT be reported pending regardless of cell state");
+
+            RoadPrefetch.dispatchRelevantCellFetches(generator, cubeX, cubeY, cubeZ); // fire-and-forget: must not block this thread
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchRelevantCellFetches to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY, cubeZ),
+                    "Expected the SAME cube to no longer be reported pending once its cell has resolved");
         } finally {
             stub.stop(0);
         }

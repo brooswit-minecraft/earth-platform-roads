@@ -130,21 +130,18 @@ public final class RoadTileSource {
         return consecutiveAttemptedFailures.get() >= SUSTAINED_OUTAGE_FAILURE_THRESHOLD;
     }
 
-    /**
-     * MINECRAFT-566 comment 55535: how long until this instance's own {@link #nextEligibleRequestAt}
-     * cooldown actually clears -- {@link Duration#ZERO} if it already has. {@code
-     * ServerCubeWorldRoadPrefetchMixin}'s pending-surface-cube defer needs this to size its own wait
-     * against the REAL remaining cadence rather than guessing with a fixed constant (John's native
-     * finding: a fixed, too-short window gave up before an entirely ordinary steady-cadence cooldown
-     * had actually cleared, generating -- and then permanently saving -- grass for a cell that a
-     * later, explicit fetch immediately proved would have resolved correctly). This is instance-wide
-     * (the one real outbound request at a time this whole source enforces), not per-cell -- matching
-     * {@link #nextEligibleRequestAt}'s own scope.
-     */
-    public Duration timeUntilNextEligibleRequest() {
-        Duration remaining = Duration.between(clock.instant(), nextEligibleRequestAt);
-        return remaining.isNegative() ? Duration.ZERO : remaining;
-    }
+    // MINECRAFT-566 comments 55535/55544: a `timeUntilNextEligibleRequest()` accessor was added here
+    // to let the defer mixin size its own wait against a presumed "real remaining cooldown" -- but
+    // John's native reproduction (comment 55544) proved that one-time snapshot fundamentally cannot
+    // be trusted: a DIFFERENT, already-in-flight request can still be awaiting its response at the
+    // exact moment this would be sampled, and `nextEligibleRequestAt` does not move until that
+    // request's own response actually lands -- so the snapshot silently misses the real future
+    // cooldown entirely (observed: sampled near-zero while the real eligible slot was still ~5.7s
+    // away). Removed entirely rather than patched, since no one-time read of this field can ever be
+    // reliable against that race -- see `ServerCubeWorldRoadPrefetchMixin#MAX_DEFER_WAIT`'s own doc
+    // for the fix that replaced it (always budget the full hard ceiling for the ordinary case, and
+    // let `waysForCellRetryingAcrossCooldown`'s own live re-sampling, each retry iteration, find the
+    // real eligible slot once it exists).
 
     /**
      * MINECRAFT-566 comment 55534: whether this instance can EVER actually reach the network --

@@ -300,20 +300,36 @@ bump: minor
   path never pays for the scan at all. The test rewritten to an entirely cold boot (no fixture, no
   cache file, tile genuinely PENDING throughout) proving the gate works with nothing but natural
   terrain.
-- Fixed the fixed-duration defer budget itself (comment 55535, John's own next priority once the
-  above were confirmed closed): under the provider's own DEFAULT steady request cadence (longer than
-  the then-fixed window), an immediate demand's defer/retry gave up before the real cooldown had
-  cleared, generated grass, and -- since an already-saved cube never reaches this injection again --
-  that grass was PERMANENT. A later explicit fetch confirmed the data and fetch path were fine; only
-  the fixed budget was wrong, structurally -- it could not be both short (fail a genuine outage open
-  quickly) and long enough to survive an ordinary cooldown. Fixed by computing the budget
-  DYNAMICALLY each call from the new `RoadTileSource.timeUntilNextEligibleRequest()` (the real
-  remaining cooldown) plus a fixed round-trip margin, clamped to a hard `MAX_DEFER_WAIT` ceiling --
-  except during `sustainedOutage()` (several real, dispatched failures in a row), which clamps to
-  the short `PREFETCH_WAIT_BOUND` instead, since waiting longer cannot help a provider that is
-  already known to be down. 91/91 tests pass (two new cases: one proving the real cooldown tracking,
-  one proving `RoadPrefetch`'s delegation and defaults, including a real driven `sustainedOutage()`
-  state).
+- Attempted (comment 55535) a dynamic, cadence-aware defer budget to replace the fixed window that
+  gave up before an entirely ordinary steady-cadence cooldown cleared -- superseded almost
+  immediately (comment 55544: a one-time snapshot of the remaining cooldown cannot see a DIFFERENT,
+  still-in-flight request's own future effect on it) and then superseded entirely by a direction
+  change (comment 55545, see below) that removes this whole class of bounded-wait/fail-open
+  mechanism. Not shipped in this form; see the 55545 entry below for what replaced it.
+- **A direction change superseding every bounded-fail-open design above (comment 55545):** "the mod
+  should keep waiting for needed map data... no timeout/cooldown/outage alone should adopt or
+  permanently save bare terrain." Rather than accept-then-maybe-retry-once-then-fail-open,
+  `ServerCubeWorldRoadPrefetchMixin` now dispatches a fire-and-forget fetch for every real cell the
+  cube's own relevant footprint intersects (`RoadPrefetch.dispatchRelevantCellFetches`, resolving
+  comment 55542 as part of this change -- the actual intersecting cells, never a speculative halo)
+  and, if ANY of them is still genuinely PENDING (`RoadPrefetch.isAnyRelevantCellPending`), throws a
+  new `RoadDataNotReadyException` INSTEAD OF ever calling the real `generate()`. This plugs into
+  Earth Platform's OWN existing, already-native retry machinery (confirmed by reading the real,
+  decompiled `ServerCubeWorld` class): `produce`'s own `try/catch (RuntimeException failure)` turns
+  that into a `null`-section `Ready`; `adoptReady` never creates a `Cube`, never touches storage,
+  and schedules a retry roughly 5 seconds later via its own `retryAt` map -- nothing this mod builds
+  or manages. Because `generate()` is never called while relevant data is pending, the whole
+  "snapshot readiness before the accepted attempt" race (55532/55534/55537/55539) and the entire
+  fixed/dynamic defer-budget question (55534/55535/55544) are now moot for this mechanism, not
+  merely fixed again -- removed the now-obsolete `RoadTileSource.timeUntilNextEligibleRequest()`
+  and its `RoadPrefetch` wrappers (`sustainedOutage`/`timeUntilNextEligibleRequest`) rather than
+  patch them further. A sustained provider outage no longer causes any fallback to grass at all --
+  the cube just keeps being retried by Earth Platform's own scheduler. `loadNow`'s own forced-arrival
+  contract is unchanged in behavior but now stated as an explicit policy (comment 55545's own ask)
+  rather than left implicit: `SynchronousLoadGuard` still excludes this entire mechanism from it,
+  since an arrival needs a `Cube` back synchronously with no "retry next tick" option available to
+  it. 90/90 tests pass (two obsolete tests for the removed cadence-budget methods replaced by one new
+  test proving the two new `RoadPrefetch` methods against a real, entirely-cold synthetic fixture).
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
@@ -326,17 +342,6 @@ bump: minor
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
   transient gap.
-- `RoadPrefetch.isPendingForColumn` (and therefore the defer snapshot) still samples only the single
-  cell the cube's CENTER column maps to (comment 55542, explicitly deferred per John's own
-  instruction not to divert from 55535): a real cube whose own footprint spans TWO different map
-  cells can have its center cell already confirmed-empty while a different cell covering only an
-  outer strip of the same cube is still genuinely pending -- natively reproduced (center cell
-  empty, outer-strip cell held in flight; worker adopted grass; a fresh generator later painted the
-  stripe correctly once the outer cell resolved; original grass was permanent on reopen). Same
-  underlying class of bug as 55537 (single-point sampling missing a real footprint's own span),
-  applied to cell-pending-ness rather than Y-relevance. Not attempted this pass. John's own
-  suggested direction when picked up: "count actual data cells intersecting the relevant footprint
-  as demand, not the entire speculative halo."
 - Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport and
   ordinary-movement paths, both now covered) has no dedicated readiness handling yet.
 - No test drives the real, compiled `ServerCubeWorld.produce`/`loadNow` methods themselves -- doing
