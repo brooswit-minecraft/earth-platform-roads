@@ -337,4 +337,57 @@ class RoadGenerationTest {
         assertTrue(sawGravel, "Expected to actually generate a real gravel SHOULDER column moving away from the centerline");
         assertTrue(sawNatural, "Expected to eventually leave the road and generate natural terrain");
     }
+
+    /**
+     * MINECRAFT-566 comment 55488 (leaf-preserving road-column clearance): calls
+     * {@link RoadCanopyClearance#clear} directly (this test covers the CLEARANCE LOGIC against a
+     * real generator and real pinned road geometry, not the mixin's own wiring -- nothing short of
+     * a real server's own tree/structure decoration actually landing a block over this exact pinned
+     * column could exercise the mixin's own {@code @Redirect} end to end, which is not reproducible
+     * from this harness) by hand-placing a log and a non-persistent leaf directly above the pinned
+     * centerline's own ground height within a REAL generated cube. A log over the road must come
+     * back as air; a leaf over the road must stay a leaf but become persistent (so it does not decay
+     * once a removed log stops supporting it); the same two placements one column off-road must be
+     * left completely untouched, proving the clearance is scoped to the road's own paved/centerline
+     * footprint, not applied blindly across the cube.
+     */
+    @Test
+    void canopyClearanceRemovesNonLeafBlocksOverTheRoadButPreservesLeavesAsPersistent() {
+        int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
+        int x = onRoad[0], z = onRoad[1];
+        int ground = generator.surfaceY(x, z);
+        int cubeX = x >> 4, cubeY = ground >> 4, cubeZ = z >> 4;
+        int localGroundY = ground & 15;
+        assertTrue(localGroundY <= 13, "Expected the pinned centerline column to leave room for two blocks above ground within its "
+                + "own cube; if the real DEM changed, re-pin a column with more headroom rather than adjusting this test to fit. Got localGroundY=" + localGroundY);
+
+        int localX = x & 15, localZ = z & 15;
+        int offRoadLocalZ = (localZ + 8) & 15; // a different column within the SAME cube, confirmed off-road below
+        int offRoadZ = (cubeZ << 4) + offRoadLocalZ;
+        assertTrue(!RoadNetwork.coversColumn(generator.grid(), x, offRoadZ),
+                "Expected the chosen comparison column to actually be off-road; if the real road geometry changed, re-pin a different offset");
+
+        LevelChunkSection section = generator.generate(cubeX, cubeY, cubeZ);
+        var logState = net.minecraft.world.level.block.Blocks.OAK_LOG.defaultBlockState();
+        var leafState = net.minecraft.world.level.block.Blocks.OAK_LEAVES.defaultBlockState()
+                .setValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT, false);
+        section.setBlockState(localX, localGroundY + 1, localZ, logState, false);
+        section.setBlockState(localX, localGroundY + 2, localZ, leafState, false);
+        section.setBlockState(localX, localGroundY + 1, offRoadLocalZ, logState, false);
+        section.setBlockState(localX, localGroundY + 2, offRoadLocalZ, leafState, false);
+
+        RoadCanopyClearance.clear(generator, cubeX, cubeY, cubeZ, section);
+
+        var clearedLog = section.getBlockState(localX, localGroundY + 1, localZ);
+        assertTrue(clearedLog.isAir(), "Expected a log directly over the road column to be cleared to air, got " + clearedLog);
+        var clearedLeaf = section.getBlockState(localX, localGroundY + 2, localZ);
+        assertTrue(clearedLeaf.is(net.minecraft.world.level.block.Blocks.OAK_LEAVES), "Expected leaves over the road column to be preserved, got " + clearedLeaf);
+        assertTrue(clearedLeaf.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT), "Expected leaves preserved over the road to be made persistent so they do not decay");
+
+        var untouchedLog = section.getBlockState(localX, localGroundY + 1, offRoadLocalZ);
+        assertTrue(untouchedLog.is(net.minecraft.world.level.block.Blocks.OAK_LOG), "Expected a log off the road to be left untouched, got " + untouchedLog);
+        var untouchedLeaf = section.getBlockState(localX, localGroundY + 2, offRoadLocalZ);
+        assertTrue(!untouchedLeaf.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT),
+                "Expected leaves off the road to be left untouched (still non-persistent)");
+    }
 }

@@ -173,6 +173,28 @@ bump: minor
   centerline, and the candidate-query margin across tile/cube seams was already generous enough
   (no change needed) for the new, wider footprint.
 
+- Disabled the bounded stale-publication verify-and-retry added for the residual per-column cache
+  race (comments 55496/55498/55499): a compiled-worker run (comment 55505) and a follow-up
+  diagnostic (55507) both found the detector itself (`RoadPrefetch.sectionLooksStale`) producing
+  false positives -- rejecting already-correct sections, and flagging legitimately natural columns
+  as stale -- for reasons neither John nor I had root-caused yet. `MAX_STALE_RETRY_ATTEMPTS` is now
+  `0` (the retry loop and detector are left in place, dormant, re-enabling is a one-line change once
+  a safer detector replaces this one); shipped behavior reverts to "evict once, generate once,"
+  John's own named smaller verified fallback.
+- Added leaf-preserving road-column clearance (comment 55488): `SurfaceGeneratorRoadClearanceMixin`
+  redirects `SurfaceGenerator.generate()`'s own call to its private `dropStrayBlockEntities` -- the
+  real final generation seam, confirmed by reading the decompiled class, after `terrain()`/
+  vegetation/structures have all run and before that call's own block-entity-tag filtering --  and
+  `RoadCanopyClearance.clear` removes every non-leaf block directly above a paved/centerline road
+  column's own natural deck height within that one cube, preserving leaves (set `PERSISTENT` so a
+  removed supporting log never lets them decay) and never touching the gravel shoulder, anything
+  below the deck, underwater columns, or a column off the mapped footprint. Scoped per-cube, same
+  pattern as the rest of this mod's generation-time hooks -- never a separate full-column edit pass.
+  Leaf detection uses `state.getBlock() instanceof LeavesBlock`, not `BlockTags.LEAVES`: the tag
+  read back empty in this project's own `neoForge.unitTest` harness (no real server datapack
+  reload there), and the plain type check also catches `CherryLeavesBlock`/`MangroveLeavesBlock`
+  (both confirmed to extend `LeavesBlock`) for free.
+
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
@@ -197,3 +219,8 @@ bump: minor
 - A disposable-profile playtest on the bundled Yosemite extract confirmed the road looks smooth
   (full Slopes/car/Flowing Fluids pack); the live-tile-fetched path (an unbundled destination) has
   not yet had an in-game visual confirmation.
+- The new canopy-clearance test calls `RoadCanopyClearance.clear` directly against a real generator
+  and real pinned road geometry; it does not exercise `SurfaceGeneratorRoadClearanceMixin`'s own
+  `@Redirect` wiring end to end (that would need a real tree/structure actually landing a block over
+  this exact pinned column during generation, not reproducible from this harness). Not yet
+  confirmed in a live playtest either.

@@ -700,6 +700,77 @@ iteration, provide the verified styling preview separately with honest limits" -
 (comment 55484) stands as shipped; this flat-deck/stone-brick-support work remains queued, now with
 a concrete understanding of the real mechanism and risk, not a vague "later."
 
+## MINECRAFT-566: the verify-and-retry's own detector turned out to have false positives (comments 55505/55507)
+
+A compiled-worker run John did (comment 55505) found the bounded verify-and-retry above
+(`sectionLooksStale` / `MAX_STALE_RETRY_ATTEMPTS = 3`) rejecting an already-correctly-painted
+section twice more than necessary (two wasted extra `generate()` calls); a follow-up diagnostic
+(55507) found it specifically flagging columns whose generated block was legitimately natural
+terrain (not actually stale at all) as false positives. John: the real fix is comparing the
+generation's own INPUT `Surface` decision, or an explicit stale-snapshot signal, rather than
+inferring staleness from the final decorated blocks the way `sectionLooksStale` does now; `31c67c5`
+stays held from any Zippy installation until that is designed and verified.
+
+Given the deadline and an honest "I do not yet understand the exact root cause either" (comment
+55508), this was **not** attempted under time pressure. Instead `MAX_STALE_RETRY_ATTEMPTS` was set
+to `0` (`b637907`) -- Java's own `&&` short-circuit means `sectionLooksStale` is never even called
+now, so the whole retry mechanism is functionally disabled, not just capped. Shipped behavior
+reverts to exactly `c78bf01`'s: evict once, generate once -- the smaller, already-verified fallback
+John himself named as acceptable. The detection function and retry loop are left in place,
+dormant and still covered by their own direct test
+(`RoadTilePrefetchMixinTest.sectionLooksStaleDetectsAMismatchAgainstFreshRoadDataAndClearsOnceFixed`),
+so re-enabling is a one-line change once a safer detector replaces `sectionLooksStale` itself.
+
+## MINECRAFT-566: leaf-preserving road-column clearance (comment 55488)
+
+The separable slice comment 55503 explicitly redirected toward once 55485 (flat deck) and the
+stale-retry false positives were both correctly judged too risky to bundle into the deadline build.
+
+A column's own road MATERIAL is decided once, at its natural height, by `surface()`
+(`EarthGeneratorRoadMixin`) -- but nothing stops ordinary tree/structure decoration from placing a
+log, leaf canopy, or other block ABOVE that height afterward, the same way it would over any other
+column. `SurfaceGenerator.generate(int,int,int,List,List)`'s real sequence (confirmed by reading the
+decompiled class, nothing copied from it): `terrain()` (vegetation decoration included) ->
+`Vegetation.bees()` -> `structures.place()` + `recalcBlockCounts()` -> `dropStrayBlockEntities()` ->
+return. By the time that last call runs, every pass that could have placed something over a road
+column has already happened -- "the actual final generation seam after structures and before
+dropStrayBlockEntities" per John's own phrasing.
+
+`SurfaceGeneratorRoadClearanceMixin` `@Redirect`s exactly that `dropStrayBlockEntities` call site
+(not an `@Inject` at `RETURN`, which would run strictly AFTER it, nor local-variable capture of
+`generate()`'s own `section` local, which would need typing an unused, inaccessible second captured
+local (`VanillaStructures`) just to satisfy Mixin's capture-ordering contract). Redirecting a call
+to a PRIVATE STATIC target method still lets the handler itself be declared non-static: once woven
+into `SurfaceGenerator`, it shares the exact same `this` as the surrounding (non-static) `generate()`
+call, with no local capture needed for anything. The handler clears first, via
+`RoadCanopyClearance.clear(EarthGenerator, cubeX, cubeY, cubeZ, section)`, then calls the real
+(`@Shadow`-declared) `dropStrayBlockEntities` -- clearing BEFORE that call means its own existing
+filter (drop a block-entity tag whose block is no longer valid there) correctly cleans up anything
+this mod just cleared to air, rather than duplicating that bookkeeping.
+
+`RoadCanopyClearance.clear` scans this one cube's own 16x16 columns (never a separate full-column
+edit pass, matching this mod's existing per-cube pattern): for every column whose fresh
+`RoadNetwork`/`crossSectionAt` zone is `PAVED` or `CENTERLINE` (never `SHOULDER`, never a column
+underwater by the same `surfaceY`/`waterY` check `EarthGeneratorRoadMixin` and `sectionLooksStale`
+already use), every non-air block strictly above that column's own natural ground height, up to
+this cube's own top, is cleared to air -- except leaves, which are preserved but made
+`LeavesBlock.PERSISTENT` (so removing a supporting log in the same pass never leaves them to decay
+naturally afterward). Leaf detection uses `state.getBlock() instanceof LeavesBlock`, not
+`BlockTags.LEAVES`: the tag read back empty in this project's own `neoForge.unitTest` harness (no
+real server datapack reload happens there), and the plain type check also catches
+`CherryLeavesBlock`/`MangroveLeavesBlock` for free (both confirmed, by reading the real classes, to
+extend `LeavesBlock`).
+
+**Verified** by `RoadGenerationTest.canopyClearanceRemovesNonLeafBlocksOverTheRoadButPreservesLeavesAsPersistent`:
+against the same real, non-private Yosemite fixture the rest of this ticket's generation tests use,
+a hand-placed log and non-persistent leaf directly above the pinned centerline's own ground height
+are cleared/preserved-and-made-persistent respectively, while the identical placements one column
+off-road are left completely untouched. **Known, disclosed test gap:** this calls
+`RoadCanopyClearance.clear` directly, not through the mixin's own `@Redirect` -- exercising the
+mixin's wiring end to end would need a real tree/structure actually landing a block over this exact
+pinned column during a real `generate()` call, which is not reproducible from this harness; no
+in-game visual confirmation has been done either.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
