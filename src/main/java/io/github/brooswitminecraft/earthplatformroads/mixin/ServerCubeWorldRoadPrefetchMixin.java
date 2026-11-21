@@ -254,18 +254,37 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      * found to have false positives in).
      *
      * <p>Only ever runs for the ordinary-streaming path (never {@code loadNow}'s own arrival --
-     * "keep forced loads as an explicit separate control", per comment 55526 explicitly) and only
-     * ever on a cube THIS generation call is producing fresh -- {@code produce}'s own storage-read
-     * fast path above this injection point means an already-saved cube never reaches here at all, so
-     * this can never retrofit one. Bounded two ways at once: a small fixed attempt count
-     * ({@link #MAX_PENDING_DEFER_ATTEMPTS}) AND a real wall-clock window
-     * ({@link #PENDING_DEFER_WINDOW}) -- either bound running out means an explicit, deliberate
-     * fail-open (accept whatever the last attempt produced, exactly like any other pending/failed
-     * cell already does), never an unbounded stall of this generation worker thread.
+     * "keep forced loads as an explicit separate control", per comment 55526 explicitly), only ever
+     * when {@link RoadPrefetch#hasLiveTileSource} (an explicit gate, per comment 55532 -- there is
+     * nothing to defer for if no live source is even configured), only for a cube whose own Y-range
+     * actually {@link RoadPrefetch#cubeContainsNaturalSurface} (a road is only ever painted AT a
+     * column's own natural height; a cube that cannot possibly contain it has nothing to gain from
+     * deferring), and only ever on a cube THIS generation call is producing fresh -- {@code produce}'s
+     * own storage-read fast path above this injection point means an already-saved cube never
+     * reaches here at all, so this can never retrofit one.
+     *
+     * <p><b>Comment 55532, a real race found by John's own native reproduction:</b> the first
+     * version of this fix checked {@code RoadPrefetch.isPendingForColumn} only AFTER the accepted
+     * {@code generate()} call had already run -- but the tile can transition PENDING -&gt; READY
+     * literally DURING that one call (observed concretely: the tile became READY barely 91ms after
+     * the accepted attempt had already produced grass; the post-hoc pending check then correctly,
+     * but uselessly, reported "not pending", so the retry loop's own precondition was already false
+     * and it never fired at all -- the stale grass was accepted and saved). Fixed by snapshotting
+     * readiness IMMEDIATELY BEFORE the accepted attempt instead of inferring it from decorated
+     * blocks afterward: if the snapshot says PENDING, this unconditionally gives the cell one more
+     * bounded chance to resolve, regardless of what the state looks like by the time this runs --
+     * handling the race window rather than missing it.
+     *
+     * <p>Bounded two ways at once: a real wall-clock window ({@link #PENDING_DEFER_WINDOW}, the
+     * REMAINING portion of which is passed to the re-dispatch -- not a fresh full
+     * {@link #PREFETCH_WAIT_BOUND} every time, which comment 55532 also flagged as a real
+     * inconsistency with this window's own "total, not per-attempt" intent) and a single retry
+     * attempt (once the cell resolves and this regenerates once, there is nothing further to gain
+     * from retrying again). Either bound running out, or the wait coming back still pending, means
+     * an explicit, deliberate fail-open: accept whatever the last attempt produced, exactly like any
+     * other pending/failed cell already does, never an unbounded stall of this generation worker
+     * thread.
      */
-    private static final int MAX_PENDING_DEFER_ATTEMPTS = 2;
-
-    /** Total wall-clock budget across every deferred retry attempt combined -- never per-attempt. See {@link #MAX_PENDING_DEFER_ATTEMPTS}'s own doc. */
     private static final Duration PENDING_DEFER_WINDOW = Duration.ofSeconds(3);
 
     @Shadow
@@ -336,6 +355,17 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // empty lists (isolating each attempt's side effects completely) and merging ONLY the
         // accepted attempt's additions into the caller's real lists at the very end -- the same
         // isolation `produce()` itself already relies on by always passing fresh empty lists in.
+        // MINECRAFT-566 comment 55532: this snapshot MUST be taken immediately BEFORE the accepted
+        // attempt below, not inferred afterward from decorated blocks or re-checked only once that
+        // attempt has already run -- the tile can resolve PENDING -> READY literally DURING that
+        // one generate() call (John's own native reproduction: the tile became READY barely 91ms
+        // after the accepted attempt had already produced grass), and a check made only after the
+        // fact would correctly, but uselessly, see "not pending" and never retry at all. See
+        // PENDING_DEFER_WINDOW's own doc for the full reasoning.
+        boolean wasPendingBeforeAcceptedAttempt = !SynchronousLoadGuard.isActive()
+                && RoadPrefetch.hasLiveTileSource()
+                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeY, centerBlockX, centerBlockZ)
+                && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ);
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
         List<CompoundTag> attemptEntities = new ArrayList<>();
         LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
@@ -356,32 +386,32 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             attemptEntities = new ArrayList<>();
             section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
         }
-        // MINECRAFT-566 comment 55522/55526's deferred "pending surface-cube" half: never for
-        // loadNow's own arrival path (an explicit separate control, per 55526), and only while this
-        // cube's own covering tile is genuinely still PENDING (RoadPrefetch.isPendingForColumn's
-        // direct cache-state read, never the sectionLooksStale detector's own indirect inference --
-        // see MAX_PENDING_DEFER_ATTEMPTS's own doc for why these stay deliberately separate
-        // mechanisms). Re-dispatches the SAME cell (coalesced via RoadTileSource's own in-flight
-        // map, so this never sends a second real request while the first is still outstanding) and,
-        // only if that bounded wait actually resolved it, evicts and regenerates once more -- an
-        // EXPLICIT, deliberate fail-open the moment either bound (attempt count or wall-clock
-        // window) runs out, or the wait comes back still pending: accept whatever the last attempt
-        // produced, exactly like any other pending/failed cell already does, never an unbounded
-        // stall of this generation worker thread.
-        if (!SynchronousLoadGuard.isActive()) {
+        // MINECRAFT-566 comment 55522/55526/55532's deferred "pending surface-cube" half: fires
+        // only when the SNAPSHOT taken above (before the accepted attempt) says this cell was
+        // genuinely pending -- never re-derived from the current state here, for exactly the race
+        // reason that snapshot's own doc explains. Re-dispatches the SAME cell (coalesced via
+        // RoadTileSource's own in-flight map, so this never sends a second real request while the
+        // first is still outstanding), passing the REMAINING portion of PENDING_DEFER_WINDOW (never
+        // a fresh full PREFETCH_WAIT_BOUND -- this window is a total budget, not per-attempt), and
+        // only if that wait actually resolved it, evicts and regenerates once -- an EXPLICIT,
+        // deliberate fail-open the moment the window is already out, or the wait comes back still
+        // pending: accept whatever the last attempt produced, exactly like any other pending/failed
+        // cell already does, never an unbounded stall of this generation worker thread. A single
+        // retry attempt is enough: once resolved and regenerated, there is nothing further to gain.
+        if (wasPendingBeforeAcceptedAttempt) {
             Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
-            for (int deferAttempt = 0; deferAttempt < MAX_PENDING_DEFER_ATTEMPTS
-                    && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)
-                    && Instant.now().isBefore(deferDeadline); deferAttempt++) {
-                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
-                if (RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)) {
-                    break; // still pending after waiting again -- explicit bounded fail-open, do not spin further
-                }
-                RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
-                attemptBlockEntities = new ArrayList<>(); // discard the abandoned (premature) attempt's own additions entirely
-                attemptEntities = new ArrayList<>();
-                section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
-            }
+            Instant now = Instant.now();
+            if (now.isBefore(deferDeadline)) {
+                Duration remaining = Duration.between(now, deferDeadline);
+                Duration thisWait = remaining.compareTo(PREFETCH_WAIT_BOUND) < 0 ? remaining : PREFETCH_WAIT_BOUND;
+                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, thisWait);
+                if (!RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)) {
+                    RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+                    attemptBlockEntities = new ArrayList<>(); // discard the abandoned (premature) attempt's own additions entirely
+                    attemptEntities = new ArrayList<>();
+                    section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+                } // else: still pending after waiting again -- explicit bounded fail-open, do not spin further
+            } // else: window already out before even trying again -- explicit bounded fail-open
         }
         blockEntities.addAll(attemptBlockEntities);
         entities.addAll(attemptEntities);

@@ -937,6 +937,52 @@ project's `neoForge.unitTest` harness to drive `produce`/`generate` through dire
 offer, actual paint continuity and native save/reopen will be verified on his own infrastructure,
 not here. 88/88 tests pass (1 new).
 
+## MINECRAFT-566: a real race in the pending-surface-cube defer/retry (comment 55532)
+
+John reproduced a race natively on `combined-73` against the 55526 commit: the first real
+generation for a column produced grass at 4211ms; the held loopback tile became READY at 4302ms
+(exactly one POST sent); the FIRST actual pending probe the defer loop ran did not fire until
+4305ms and, by then, correctly reported `false` (not pending) -- so the loop never retried at all,
+even though the output it was about to accept had been generated while the tile was still
+genuinely pending. A second, identical fresh generator reproduced against the same resolved tile
+painted the road correctly, confirming the data itself was fine -- only the TIMING of the check
+was wrong. Worker generated exactly once; stale grass survived a native save/reopen.
+
+**Root cause:** the 55526 version called `isPendingForColumn` only AFTER the first accepted
+`generate()` call returned. That call itself can take long enough that the tile transitions
+PENDING -> READY *during* it (here, within roughly 91ms of the generate call starting). By the
+time the post-hoc check runs, it is looking at the CURRENT (now-ready) state, not the state the
+already-completed `generate()` call actually saw -- "not pending" was the correct answer to the
+wrong question. No amount of retrying the check itself fixes this: the defect is in checking
+AFTER rather than BEFORE.
+
+**Fix:** snapshot `wasPendingBeforeAcceptedAttempt = RoadPrefetch.isPendingForColumn(...)`
+immediately before calling the real, accepted `generate()` -- never re-derived afterward -- and
+gate the retry decision on that snapshot. This correctly retries exactly the case 55532 found (an
+attempt that ran against genuinely-pending input, even if the tile resolved moments later) and
+correctly skips retrying when the snapshot was already READY (the ordinary, non-racy case,
+unchanged from 55526). Because the snapshot can only ever be true once per accepted attempt, one
+retry attempt is structurally sufficient -- `MAX_PENDING_DEFER_ATTEMPTS` is removed rather than
+tuned; the only remaining bound is the wall-clock `PENDING_DEFER_WINDOW` (3s total).
+
+Two more gates John asked for explicitly, both straightforward: `RoadPrefetch.hasLiveTileSource()`
+(no live tile source configured at all -- skip the whole mechanism, nothing will ever resolve)
+and `RoadPrefetch.cubeContainsNaturalSurface` (a road is only ever painted at a column's own
+natural ground height, so a cube whose Y-range does not even contain that height can never show
+one regardless of pending state -- the 55526 loop had no such filter and would have deferred for
+cubes that could never possibly benefit). Also corrected the retry's own wait: 55526 passed a
+fresh `PREFETCH_WAIT_BOUND` (2s) into the re-dispatch on every attempt, rather than the REMAINING
+portion of the 3s `PENDING_DEFER_WINDOW` total budget -- fixed to compute and pass what is
+actually left.
+
+No change to `loadNow`'s forced-load path (`SynchronousLoadGuard` still gates it out of this
+entire mechanism) or to any no-HTTP saved/forced semantics, per John's explicit instruction.
+89/89 tests pass. The same disclosed test gap as 55526 remains: no real `ServerCubeWorld`/
+`ServerLevel` fixture exists in this harness to drive `produce`/`generate` end to end, so this fix
+is verified directly against `RoadPrefetch`'s own new detectors/gates; actual paint continuity and
+native save/reopen will be reverified on John's own infrastructure. Not yet confirmed ready for
+Zippy.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

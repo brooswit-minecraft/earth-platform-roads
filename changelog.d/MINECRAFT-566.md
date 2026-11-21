@@ -236,6 +236,23 @@ bump: minor
   detector directly against all three real cache states; the mixin's own injection points remain
   the same known, disclosed test gap (no real `ServerCubeWorld`/`ServerLevel` in this harness) --
   actual paint continuity and native save/reopen will be verified on John's own infrastructure.
+- Fixed a real race in the defer/retry above (comment 55532, reproduced natively on
+  `combined-73`): the pending check ran AFTER the already-accepted `generate()` call, so a tile
+  that resolved PENDING -> READY DURING that exact call (observed 91ms apart) left the post-hoc
+  check correctly, but uselessly, reporting "not pending" -- the retry precondition was already
+  false by the time it was evaluated, so stale/pending-input output was kept even though the
+  underlying race the retry exists to catch had genuinely just happened. Fixed by snapshotting
+  `RoadPrefetch.isPendingForColumn` immediately BEFORE the accepted `generate()` call rather than
+  re-deriving it afterward, and gating the retry on that snapshot. Also added: an explicit
+  `RoadPrefetch.hasLiveTileSource()` gate (no live tile source configured at all -- nothing to
+  ever wait for), `RoadPrefetch.cubeContainsNaturalSurface` (a cube whose own Y-range does not
+  contain the column's natural ground height can never show a road regardless of pending state --
+  deferring for it is pure waste; the prior loop had no such filter), and corrected the retry's
+  own wait to pass the REMAINING portion of `PENDING_DEFER_WINDOW` into the re-dispatch rather
+  than a fresh full wait bound each attempt (the earlier version effectively ignored the window as
+  a total budget). `MAX_PENDING_DEFER_ATTEMPTS` removed entirely -- the corrected, snapshot-gated
+  design only ever needs one retry attempt, not a bounded count of them. No change to `loadNow`'s
+  forced-load path (still an explicit separate control) or to any no-HTTP saved/forced semantics.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
@@ -273,12 +290,10 @@ bump: minor
   `@Redirect` wiring end to end (that would need a real tree/structure actually landing a block over
   this exact pinned column during generation, not reproducible from this harness). Not yet
   confirmed in a live playtest either.
-- Per comment 55522: only the FETCH side (priority + cooldown retry) was fixed; the deeper
-  "bound deferral of only unsaved road-relevant surface cubes" half -- actually retrying a cube's
-  GENERATION once pending data resolves, not just improving how promptly the fetch itself resolves
-  -- was not attempted. That needs the same "verify output against fresh data, retry generation"
-  approach already found buggy once before (the currently-disabled `sectionLooksStale`/stale-retry
-  mechanism), real additional design work.
+- Per comment 55522: the FETCH side (priority + cooldown retry) and the deferred-generation half
+  (comments 55526/55532) are both now implemented, covered by direct tests, and awaiting John's
+  own native paint-continuity/save-reopen verification -- this draft is not yet confirmed ready
+  for Zippy.
 - The forced-load (`loadNow`) exception from comment 55524 is unchanged, already documented
   (`SynchronousLoadGuard`) and already tested (`SynchronousLoadGuardTest`) from earlier in this
   ticket; John's own real-server confirmation that it holds (zero extra HTTP, a forced arrival can

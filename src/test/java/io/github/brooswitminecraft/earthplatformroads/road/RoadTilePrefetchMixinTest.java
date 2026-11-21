@@ -1170,4 +1170,36 @@ class RoadTilePrefetchMixinTest {
         assertTrue(!RoadPrefetch.isPendingForColumn(generator, emptyBlock[0], emptyBlock[1]),
                 "Expected a cell with a confirmed-empty marker to NOT be pending");
     }
+
+    /**
+     * MINECRAFT-566 comment 55532: {@code hasLiveTileSource} must reflect whether a live source is
+     * actually configured, and {@code cubeContainsNaturalSurface} must correctly tell apart a cube
+     * that actually contains a column's own natural ground height from one that does not -- the
+     * explicit "live-fetch capability" and "actual surface relevance (Y filter)" gates John's own
+     * review asked for on the pending-surface-cube defer.
+     */
+    @Test
+    void hasLiveTileSourceAndCubeContainsNaturalSurfaceGateCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Deliberately no assertion on the "before configuring" state here: RoadNetwork.tileSource()
+        // falls back to a lazily-built, process-lifetime-cached default RoadTileSource once any test
+        // anywhere in this run has triggered it, so "no override set yet" does not imply "no live
+        // source at all" -- the only reliably-testable property is the post-configuration state below.
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        assertTrue(RoadPrefetch.hasLiveTileSource(), "Expected a configured tile source to be reported as live");
+
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        double lat = 49.0005, lon = -114.0005;
+        int[] block = generator.block(lat, lon);
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeYContainingSurface = ground >> 4;
+
+        assertTrue(RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface, block[0], block[1]),
+                "Expected the cube whose own Y-range actually contains the natural ground height to be reported as containing it");
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface + 50, block[0], block[1]),
+                "Expected a cube far ABOVE the natural ground height to NOT be reported as containing it");
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface - 50, block[0], block[1]),
+                "Expected a cube far BELOW the natural ground height to NOT be reported as containing it");
+    }
 }

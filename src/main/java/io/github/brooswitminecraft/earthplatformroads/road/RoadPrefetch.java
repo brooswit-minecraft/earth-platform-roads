@@ -87,6 +87,33 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55532: whether there is even a live tile source configured at all --
+     * an EXPLICIT gate for {@code ServerCubeWorldRoadPrefetchMixin}'s pending-surface-cube defer,
+     * rather than relying only on {@link #isPendingForColumn}'s own implicit {@code null}-source
+     * check (correct in effect, but John's own review asked this be an explicit, named condition).
+     */
+    public static boolean hasLiveTileSource() {
+        return RoadNetwork.liveTileSourceForPrefetch() != null;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55532: "gate by... actual surface relevance (current loop has no Y
+     * filter)" -- a road is only ever painted AT a column's own natural ground height
+     * ({@code EarthGeneratorRoadMixin}'s {@code surface()} hook never touches any other Y), so a
+     * cube whose own Y-range does not even CONTAIN that height (deep underground, or high above the
+     * surface) can never show a road regardless of whether the tile is pending -- deferring/retrying
+     * generation for such a cube would be pure waste. Same {@code localY} check
+     * {@link #sectionLooksStale} already uses for the same reason, pulled out here as its own named
+     * function since this is now a second, independent caller.
+     */
+    public static boolean cubeContainsNaturalSurface(EarthGenerator generator, int cubeY, int x, int z) {
+        int groundY = generator.surfaceY(x, z);
+        int baseY = cubeY << 4;
+        int localY = groundY - baseY;
+        return localY >= 0 && localY <= 15;
+    }
+
+    /**
      * A cube/chunk index's own center BLOCK coordinate along one axis -- the conversion
      * {@code ServerCubeWorldRoadPrefetchMixin} needs before calling {@link #forColumn} with
      * {@code ServerCubeWorld.produce}'s cube indices (see comment 55476, and that mixin's own doc).
