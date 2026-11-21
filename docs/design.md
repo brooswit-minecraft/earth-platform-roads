@@ -897,6 +897,46 @@ Avoiding that would need scheduling a resubmission after the cooldown rather tha
 place -- a real further improvement, left as a disclosed, not-yet-attempted gap rather than a
 rushed partial redesign.
 
+## MINECRAFT-566: the deferred "pending surface-cube" half of 55522, now attempted (comment 55526)
+
+Once John's own native loopback verification confirmed the fetch-side fix (priority + cooldown
+retry, including the 55528 correction) actually holds, he directed moving on to the deeper half of
+55522 that was deliberately deferred earlier: "proceed with the narrow unsaved surface-cube
+defer/retry and explicit bounded fail-open ... keep forced loads as an explicit separate control."
+He also offered to verify actual paint and native save/reopen himself on his own infrastructure,
+which removes the earlier blocker (no real dedicated server in this environment to verify
+dispatch/block/save-reopen against).
+
+**Design, deliberately narrow:** added to `ServerCubeWorldRoadPrefetchMixin`'s existing `@Redirect`,
+AFTER the first `generate()` call and the (still disabled) stale-retry loop, as its own separate
+bounded loop -- never merged with or extending the stale-retry mechanism, which is a DIFFERENT
+problem (a stale per-column cache entry) with a DIFFERENT, already-found-unreliable detector
+(comparing decorated output against fresh geometry). The new detector,
+`RoadPrefetch.isPendingForColumn`, is a direct read of `RoadTileSource`'s own authoritative
+`CellState` for the cube's own center cell -- no inference from decorated blocks at all, avoiding
+exactly the false-positive risk `sectionLooksStale` had.
+
+Only runs for the ordinary-streaming path -- `SynchronousLoadGuard.isActive()` gates it out
+entirely for `loadNow`'s own arrival, matching John's explicit "keep forced loads as an explicit
+separate control." Only ever touches a cube THIS call is producing fresh: `produce`'s own
+storage-read fast path above this injection means an already-saved cube never reaches here, so this
+can never retrofit one. Bounded two ways at once -- a small fixed attempt count
+(`MAX_PENDING_DEFER_ATTEMPTS`, 2) AND a real wall-clock window (`PENDING_DEFER_WINDOW`, 3 seconds
+total across every attempt combined, not per-attempt) -- and an EXPLICIT fail-open the moment either
+bound runs out, or a re-dispatched wait comes back still pending: accept whatever the last attempt
+produced, exactly like any other pending/failed cell already does. Re-dispatching the same cell
+reuses `RoadPrefetch.forColumnBounded`, which is itself coalesced via `RoadTileSource`'s own
+in-flight map -- this never sends a second real request while the first is still outstanding.
+
+**Verified**: `RoadTilePrefetchMixinTest.isPendingForColumnReflectsTheRealCacheStateDirectly`
+proves the new detector against all three real `RoadTileSource.CellState`s directly (a never-touched
+cell is genuinely PENDING; a cell with a real ready marker, or a confirmed-empty marker, is NOT).
+The mixin's own injection points remain the SAME known, disclosed test gap this class's doc has
+named since earlier in this ticket -- no real `ServerCubeWorld`/`ServerLevel` exists in this
+project's `neoForge.unitTest` harness to drive `produce`/`generate` through directly; per John's own
+offer, actual paint continuity and native save/reopen will be verified on his own infrastructure,
+not here. 88/88 tests pass (1 new).
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

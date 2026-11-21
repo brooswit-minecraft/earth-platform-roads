@@ -223,6 +223,19 @@ bump: minor
   `DISPATCH_SUPPRESSED`; also added a 1ms sleep floor per a second, unconfirmed concern (an early
   sub-ms wake consuming a retry attempt without actually waiting). Verified with a new test
   asserting exactly one request against a genuinely failing provider, even with a generous bound.
+- Added the deferred "pending surface-cube" half of 55522 (comment 55526, once John's own native
+  verification confirmed the fetch-side fix holds): `ServerCubeWorldRoadPrefetchMixin` now defers
+  and retries generation, narrowly, when the cube's own covering tile is genuinely still
+  `RoadTileSource.CellState.PENDING` -- a new, direct detector (`RoadPrefetch.isPendingForColumn`,
+  a plain cache-state read, never the indirect "compare decorated output" approach
+  `sectionLooksStale` uses) kept deliberately separate from that (still disabled) stale-retry
+  mechanism. Never for `loadNow`'s own arrival (an explicit separate control, per John's own
+  instruction); never touches an already-saved cube (the storage-read fast path above this
+  injection already guarantees that); bounded by both a small fixed attempt count AND a real
+  wall-clock window, with an explicit fail-open the moment either runs out. Verified the new
+  detector directly against all three real cache states; the mixin's own injection points remain
+  the same known, disclosed test gap (no real `ServerCubeWorld`/`ServerLevel` in this harness) --
+  actual paint continuity and native save/reopen will be verified on John's own infrastructure.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it

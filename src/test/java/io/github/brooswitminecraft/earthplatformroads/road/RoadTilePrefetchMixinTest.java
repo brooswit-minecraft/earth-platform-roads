@@ -1125,4 +1125,49 @@ class RoadTilePrefetchMixinTest {
         assertTrue(RoadPrefetch.sectionLooksStale(generator, cubeX, cubeY, cubeZ, staleSection),
                 "Expected a section whose road column was overwritten with a natural material to be flagged stale");
     }
+
+    /**
+     * MINECRAFT-566 comment 55522/55526: {@code RoadPrefetch.isPendingForColumn} is the direct,
+     * reliable detector {@code ServerCubeWorldRoadPrefetchMixin}'s new "defer/retry while the
+     * covering tile is genuinely PENDING" mechanism checks -- deliberately NOT the indirect
+     * "compare decorated output against fresh geometry" approach {@code sectionLooksStale} uses
+     * (that one was found to have real false positives). Proves the three real
+     * {@code RoadTileSource.CellState}s directly: a cell with no cache marker at all is PENDING
+     * (true); a cell with a {@code .json} ready marker is NOT pending (false); a cell with an
+     * {@code .empty} confirmed-empty marker is also NOT pending (false) -- only a genuinely
+     * unresolved cell counts.
+     */
+    @Test
+    void isPendingForColumnReflectsTheRealCacheStateDirectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+        // A cell never touched at all: genuinely pending.
+        double pendingLat = 46.0005, pendingLon = -111.0005;
+        int[] pendingBlock = generator.block(pendingLat, pendingLon);
+        assertTrue(RoadPrefetch.isPendingForColumn(generator, pendingBlock[0], pendingBlock[1]),
+                "Expected a never-touched cell to be genuinely pending");
+
+        // A cell with a real ready marker: not pending.
+        double readyLat = 47.0005, readyLon = -112.0005;
+        long readyCellLat = (long) Math.floor(readyLat / RoadNetwork.CELL_DEGREES);
+        long readyCellLon = (long) Math.floor(readyLon / RoadNetwork.CELL_DEGREES);
+        java.nio.file.Files.writeString(roadCache.resolve(readyCellLat + "_" + readyCellLon + ".json"), """
+                {"schema_version":1,"region_id":"pending-detector-ready","ways":[]}
+                """);
+        int[] readyBlock = generator.block(readyLat, readyLon);
+        assertTrue(!RoadPrefetch.isPendingForColumn(generator, readyBlock[0], readyBlock[1]),
+                "Expected a cell with a real ready marker to NOT be pending");
+
+        // A cell with a confirmed-empty marker: also not pending.
+        double emptyLat = 48.0005, emptyLon = -113.0005;
+        long emptyCellLat = (long) Math.floor(emptyLat / RoadNetwork.CELL_DEGREES);
+        long emptyCellLon = (long) Math.floor(emptyLon / RoadNetwork.CELL_DEGREES);
+        java.nio.file.Files.writeString(roadCache.resolve(emptyCellLat + "_" + emptyCellLon + ".empty"), "");
+        int[] emptyBlock = generator.block(emptyLat, emptyLon);
+        assertTrue(!RoadPrefetch.isPendingForColumn(generator, emptyBlock[0], emptyBlock[1]),
+                "Expected a cell with a confirmed-empty marker to NOT be pending");
+    }
 }

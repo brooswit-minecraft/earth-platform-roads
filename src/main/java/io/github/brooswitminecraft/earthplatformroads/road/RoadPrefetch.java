@@ -68,6 +68,25 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55526's "narrow unsaved surface-cube defer/retry" ask: whether the real
+     * tile/cell covering this column is still genuinely {@link RoadTileSource.CellState#PENDING} --
+     * never resolved as either READY or CONFIRMED_EMPTY. Unlike {@link #sectionLooksStale} (which
+     * infers staleness indirectly, by comparing the already-decorated GENERATED block against fresh
+     * geometry, and was found to have real false positives -- see that method's own doc), this is a
+     * direct read of {@link RoadTileSource}'s own authoritative cache state for this exact cell, with
+     * no inference involved: a reliable signal to decide whether deferring/retrying generation is
+     * even worth attempting, deliberately kept separate from the (currently disabled) stale-retry
+     * mechanism rather than reusing or extending it. {@code false} (never "pending") when there is no
+     * live tile source at all -- nothing to wait for.
+     */
+    public static boolean isPendingForColumn(EarthGenerator generator, int x, int z) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return false;
+        GeoPoint point = generator.grid().geographic(x, z);
+        return tiles.cellState(point.latitude(), point.longitude()) == RoadTileSource.CellState.PENDING;
+    }
+
+    /**
      * A cube/chunk index's own center BLOCK coordinate along one axis -- the conversion
      * {@code ServerCubeWorldRoadPrefetchMixin} needs before calling {@link #forColumn} with
      * {@code ServerCubeWorld.produce}'s cube indices (see comment 55476, and that mixin's own doc).

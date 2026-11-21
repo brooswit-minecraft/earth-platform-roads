@@ -5,6 +5,7 @@ import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import io.github.brooswitminecraft.earthplatformroads.road.SynchronousLoadGuard;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.nbt.CompoundTag;
@@ -242,6 +243,31 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      */
     private static final int MAX_STALE_RETRY_ATTEMPTS = 0;
 
+    /**
+     * MINECRAFT-566 comment 55522/55526: "bound deferral of only unsaved road-relevant surface
+     * cubes... while geometry is actually PENDING" -- the deeper, deliberately-deferred half of
+     * 55522 (the fetch-side priority/cooldown fix itself landed separately, comments 55522/55528).
+     * Deliberately SEPARATE from the (currently disabled) stale-retry mechanism above: a different
+     * problem (a tile genuinely never having resolved yet, not a stale per-column cache entry), with
+     * a different, direct detector ({@link RoadPrefetch#isPendingForColumn}, never the indirect
+     * "compare decorated output against fresh geometry" approach that mechanism's own detector was
+     * found to have false positives in).
+     *
+     * <p>Only ever runs for the ordinary-streaming path (never {@code loadNow}'s own arrival --
+     * "keep forced loads as an explicit separate control", per comment 55526 explicitly) and only
+     * ever on a cube THIS generation call is producing fresh -- {@code produce}'s own storage-read
+     * fast path above this injection point means an already-saved cube never reaches here at all, so
+     * this can never retrofit one. Bounded two ways at once: a small fixed attempt count
+     * ({@link #MAX_PENDING_DEFER_ATTEMPTS}) AND a real wall-clock window
+     * ({@link #PENDING_DEFER_WINDOW}) -- either bound running out means an explicit, deliberate
+     * fail-open (accept whatever the last attempt produced, exactly like any other pending/failed
+     * cell already does), never an unbounded stall of this generation worker thread.
+     */
+    private static final int MAX_PENDING_DEFER_ATTEMPTS = 2;
+
+    /** Total wall-clock budget across every deferred retry attempt combined -- never per-attempt. See {@link #MAX_PENDING_DEFER_ATTEMPTS}'s own doc. */
+    private static final Duration PENDING_DEFER_WINDOW = Duration.ofSeconds(3);
+
     @Shadow
     private CubeGenerator generator;
 
@@ -269,18 +295,20 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // example -- could re-populate this exact column's cache with ANOTHER premature decision,
         // undoing the eviction before generate() ever benefited from it. The dispatch/wait must
         // run FIRST; the eviction must be the very LAST thing before calling the real generate().
+        // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
+        // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
+        // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
+        // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
+        // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
+        // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
+        // time. Fixed by converting to this cube's own center block coordinate before dispatching --
+        // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
+        // center avoids ever landing exactly on a tile-boundary column by construction. Computed
+        // unconditionally (cheap integer math) since the pending-defer retry loop near the end of
+        // this method needs the same center point too.
+        int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
+        int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
         if (!SynchronousLoadGuard.isActive()) { // loadNow's arrival path: never fetch here
-            // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
-            // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
-            // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
-            // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
-            // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
-            // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
-            // time. Fixed by converting to this cube's own center block coordinate before dispatching --
-            // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
-            // center avoids ever landing exactly on a tile-boundary column by construction.
-            int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
-            int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
             // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
             // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
             // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
@@ -327,6 +355,33 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             attemptBlockEntities = new ArrayList<>(); // discard the abandoned attempt's own additions entirely
             attemptEntities = new ArrayList<>();
             section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+        }
+        // MINECRAFT-566 comment 55522/55526's deferred "pending surface-cube" half: never for
+        // loadNow's own arrival path (an explicit separate control, per 55526), and only while this
+        // cube's own covering tile is genuinely still PENDING (RoadPrefetch.isPendingForColumn's
+        // direct cache-state read, never the sectionLooksStale detector's own indirect inference --
+        // see MAX_PENDING_DEFER_ATTEMPTS's own doc for why these stay deliberately separate
+        // mechanisms). Re-dispatches the SAME cell (coalesced via RoadTileSource's own in-flight
+        // map, so this never sends a second real request while the first is still outstanding) and,
+        // only if that bounded wait actually resolved it, evicts and regenerates once more -- an
+        // EXPLICIT, deliberate fail-open the moment either bound (attempt count or wall-clock
+        // window) runs out, or the wait comes back still pending: accept whatever the last attempt
+        // produced, exactly like any other pending/failed cell already does, never an unbounded
+        // stall of this generation worker thread.
+        if (!SynchronousLoadGuard.isActive()) {
+            Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
+            for (int deferAttempt = 0; deferAttempt < MAX_PENDING_DEFER_ATTEMPTS
+                    && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)
+                    && Instant.now().isBefore(deferDeadline); deferAttempt++) {
+                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
+                if (RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)) {
+                    break; // still pending after waiting again -- explicit bounded fail-open, do not spin further
+                }
+                RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+                attemptBlockEntities = new ArrayList<>(); // discard the abandoned (premature) attempt's own additions entirely
+                attemptEntities = new ArrayList<>();
+                section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+            }
         }
         blockEntities.addAll(attemptBlockEntities);
         entities.addAll(attemptEntities);
