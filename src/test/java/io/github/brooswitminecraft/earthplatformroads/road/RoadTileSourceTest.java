@@ -656,4 +656,28 @@ class RoadTileSourceTest {
         }
         assertEquals(1, result.size(), "Expected the bounded wait to retry across the short cooldown and actually succeed, not give up on the first decline");
     }
+
+    /**
+     * MINECRAFT-566 comment 55528, a real bug John's own independent loopback reproduction found: a
+     * genuinely ATTEMPTED failure (a request that was actually sent and failed, e.g. an HTTP 500)
+     * advances {@code nextEligibleRequestAt} by the steady cadence exactly like a success does, so
+     * the first version of the cooldown-retry loop -- inferring "was this just cooldown?" purely
+     * from whether that instant was still ahead of now -- could not tell a real failure apart from a
+     * merely-not-yet-eligible decline, and retried (sending a SECOND real request) after a real
+     * failure too. This asserts the fixed behavior: a bounded-wait call against a provider that
+     * genuinely fails must send exactly ONE real request and come back empty -- never a second one
+     * -- even with a generous bound that would easily have covered a cooldown-driven retry.
+     */
+    @Test
+    void boundedWaitNeverRetriesAGenuineAttemptedFailureEvenWithPlentyOfBoundLeft(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, "service unavailable", 500);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(100));
+
+        var result = source.waysForCellWithBoundedWait(90.0, 90.0, Duration.ofSeconds(2));
+
+        assertTrue(result.isEmpty(), "Expected a genuinely failed fetch to come back empty (pending), not fabricate a result");
+        assertEquals(1, requests.get(), "Expected EXACTLY one real request -- a genuine attempted failure must never be retried by the cooldown-retry loop");
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellState(90.0, 90.0), "Expected the cell to stay genuinely pending (retryable later), not confirmed-empty");
+    }
 }

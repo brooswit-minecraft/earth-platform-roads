@@ -212,6 +212,17 @@ bump: minor
   cooldown (bounded, never a real attempted failure) instead of giving up immediately. Branch built
   from the accepted canopy-only commit (`b7ff716`), excluding the separate, not-yet-ready flat-deck
   prototype entirely, per John's own explicit instruction.
+- Fixed a real bug in that cooldown-retry fix itself (comment 55528, John's own independent
+  loopback reproduction): the retry loop inferred "was this just cooldown?" purely from whether
+  `nextEligibleRequestAt` was ahead of now, but a genuinely ATTEMPTED failure (e.g. an HTTP 500)
+  advances that same instant by the steady cadence exactly like a success does -- `waysForCell`
+  discarded the real fetch outcome entirely, so the loop could not tell a real failure apart from a
+  cooldown decline, and retried (sending a second real request) after a real failure too (four
+  fresh demands against a failing endpoint gave POST counts `1,1,1,2`). Fixed by propagating the
+  real outcome (`waysForCellDetailed`/`FetchAttemptResult`) and retrying ONLY on
+  `DISPATCH_SUPPRESSED`; also added a 1ms sleep floor per a second, unconfirmed concern (an early
+  sub-ms wake consuming a retry attempt without actually waiting). Verified with a new test
+  asserting exactly one request against a genuinely failing provider, even with a generous bound.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
@@ -261,3 +272,8 @@ bump: minor
   still adopt pending/natural terrain the same way the ordinary-movement path can) is now
   cross-referenced in `ServerCubeWorldRoadPrefetchMixin`'s own class doc rather than duplicating
   that coverage. `loadNow`'s own synchronous contract is deliberately left unchanged.
+- The cooldown-retry loop (`waysForCellRetryingAcrossCooldown`) occupies `ASYNC_FETCH_EXECUTOR`'s
+  one shared thread for the full duration of each sleep -- no other queued task, immediate or
+  lookahead, can run until this call's own `Runnable.run()` returns. Avoiding that would need
+  scheduling a resubmission after the cooldown rather than sleeping in place; not attempted this
+  pass, per John's own "if feasible" framing.

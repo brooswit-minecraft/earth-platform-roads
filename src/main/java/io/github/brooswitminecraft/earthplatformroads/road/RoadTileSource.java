@@ -326,15 +326,26 @@ public final class RoadTileSource {
      * cooldown" rather than {@link #waysForCell}'s own single attempt, which gives up the instant
      * {@link #attemptFetch} is dispatch-suppressed by {@link #nextEligibleRequestAt} -- even though
      * this caller's own {@code deadline} (from {@link #waysForCellWithBoundedWait}'s {@code bound})
-     * may still have most of its budget left. Retries ONLY while the reason nothing resolved is
-     * genuinely this instance's own steady cooldown (sleeping exactly until that cooldown, or this
-     * call's own deadline, whichever comes first, never longer) -- a real ATTEMPTED failure (a
-     * dispatched request that actually failed) is NOT retried here, so a persistently-failing
-     * provider cannot be hammered by this loop; {@link #consecutiveAttemptedFailures}/
-     * {@link #sustainedOutage} already track that case on their own terms. Runs on
-     * {@link #ASYNC_FETCH_EXECUTOR}'s own background thread, never the caller's (generation worker)
-     * thread, so sleeping here never blocks generation. Bounded to
-     * {@value #MAX_COOLDOWN_RETRIES} attempts regardless, so a pathological case (the cooldown
+     * may still have most of its budget left. Retries ONLY on {@link FetchOutcome#DISPATCH_SUPPRESSED}
+     * (checked directly via {@link #waysForCellDetailed}, never inferred from the clock -- comment
+     * 55528, a real bug John's independent loopback reproduction found: a genuinely ATTEMPTED
+     * failure, e.g. an HTTP 500, advances {@link #nextEligibleRequestAt} by the steady cadence
+     * exactly like a success does, so inferring "was this just cooldown?" purely from whether that
+     * instant was still ahead of now could not tell the two apart, and ended up retrying -- sending
+     * a SECOND real request -- after a real failure too). Sleeps exactly until that cooldown, or
+     * this call's own deadline, whichever comes first, never longer, with a 1ms floor so a
+     * near-zero remaining gap still advances real wall-clock time instead of a no-op "sleep" that
+     * risks burning through {@value #MAX_COOLDOWN_RETRIES} attempts without actually waiting (a
+     * second thing comment 55528 flagged as plausible, not yet pinned). Never retries a genuine
+     * {@code RESOLVED} or {@code ATTEMPTED_FAILURE} outcome -- a persistently-failing provider
+     * cannot be hammered by this loop; {@link #consecutiveAttemptedFailures}/{@link #sustainedOutage}
+     * already track that case on their own terms. Runs on {@link #ASYNC_FETCH_EXECUTOR}'s own
+     * background thread, never the caller's (generation worker) thread, so sleeping here never
+     * blocks generation -- though it DOES occupy that one shared thread for up to the full sleep
+     * duration each time (no other queued task, immediate or lookahead, can run until this call's
+     * own {@code Runnable.run()} returns); a redesign avoiding that (e.g. scheduling a resubmission
+     * rather than sleeping in place) is a real further improvement, not attempted this pass. Bounded
+     * to {@value #MAX_COOLDOWN_RETRIES} attempts regardless, so a pathological case (the cooldown
      * window kept being pushed back by a concurrent caller, say) cannot spin indefinitely even if it
      * somehow stayed within the deadline the whole time.
      */
@@ -342,15 +353,14 @@ public final class RoadTileSource {
 
     private List<RoadSegment> waysForCellRetryingAcrossCooldown(double lat, double lon, Instant deadline) {
         for (int attempt = 0; attempt < MAX_COOLDOWN_RETRIES; attempt++) {
-            List<RoadSegment> result = waysForCell(lat, lon);
-            if (!result.isEmpty() || cellState(lat, lon) != CellState.PENDING) return result; // genuinely resolved: ready or confirmed-empty
+            FetchAttemptResult attemptResult = waysForCellDetailed(lat, lon);
+            if (attemptResult.outcome() != FetchOutcome.DISPATCH_SUPPRESSED) return attemptResult.ways(); // RESOLVED or a genuine ATTEMPTED_FAILURE -- never retried here
             Instant now = clock.instant();
             Instant cooldownUntil = nextEligibleRequestAt;
-            if (!cooldownUntil.isAfter(now)) return List.of(); // not cooldown -- a genuine attempted failure; do not spin on those here
             Instant wakeAt = cooldownUntil.isBefore(deadline) ? cooldownUntil : deadline;
             if (!wakeAt.isAfter(now)) return List.of(); // no budget left in our own deadline
             try {
-                Thread.sleep(Duration.between(now, wakeAt).toMillis());
+                Thread.sleep(Math.max(1, Duration.between(now, wakeAt).toMillis()));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return List.of();
@@ -495,6 +505,25 @@ public final class RoadTileSource {
      * the SAME cell) and then {@link #networkLock} (to serialize the actual outbound request).
      */
     public List<RoadSegment> waysForCell(double lat, double lon) {
+        return waysForCellDetailed(lat, lon).ways();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55528, a real bug found by John's independent loopback reproduction:
+     * {@link #waysForCell} discarded {@link #attemptFetch}'s own {@link FetchOutcome}, and a
+     * dispatched request that genuinely FAILED (e.g. an HTTP 500) still advances
+     * {@link #nextEligibleRequestAt} by the steady {@link #minRequestInterval} cadence exactly like
+     * a successful one does -- so {@link #waysForCellRetryingAcrossCooldown}, inferring "was this
+     * declined by cooldown?" purely from whether {@code nextEligibleRequestAt} was ahead of now,
+     * could not tell a genuine attempted failure apart from a merely-not-yet-eligible decline, and
+     * ended up retrying (sending a SECOND real request) after a real failure too -- exactly the
+     * "hammer a failing provider" risk that method's own doc claimed to avoid. This record lets
+     * {@link #waysForCellDetailed} report the real outcome so the retry loop can check it directly
+     * instead of re-deriving a weaker signal from the clock.
+     */
+    private record FetchAttemptResult(List<RoadSegment> ways, FetchOutcome outcome) {}
+
+    private FetchAttemptResult waysForCellDetailed(double lat, double lon) {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
@@ -503,17 +532,17 @@ public final class RoadTileSource {
         Path emptyFile = cacheRoot.resolve(cellId + ".empty");
 
         List<RoadSegment> diskHit = readDiskCacheIfPresent(key, readyFile, emptyFile);
-        if (diskHit != null) return diskHit;
+        if (diskHit != null) return new FetchAttemptResult(diskHit, FetchOutcome.RESOLVED);
 
         synchronized (cellLocks.computeIfAbsent(key, k -> new Object())) {
             // Double-check: another thread may have just finished fetching this exact cell while
             // this one was waiting for the per-cell lock.
             diskHit = readDiskCacheIfPresent(key, readyFile, emptyFile);
-            if (diskHit != null) return diskHit;
+            if (diskHit != null) return new FetchAttemptResult(diskHit, FetchOutcome.RESOLVED);
 
-            attemptFetch(key, cellLat, cellLon, readyFile, emptyFile);
+            FetchOutcome outcome = attemptFetch(key, cellLat, cellLon, readyFile, emptyFile);
             List<RoadSegment> afterAttempt = memory.get(key);
-            return afterAttempt != null ? afterAttempt : List.of();
+            return new FetchAttemptResult(afterAttempt != null ? afterAttempt : List.of(), outcome);
         }
     }
 

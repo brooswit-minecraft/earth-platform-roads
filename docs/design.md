@@ -860,6 +860,43 @@ John's confirmation of it rather than duplicating that coverage; deliberately no
 instruction. No server-thread HTTP, no provider-cadence bypass, no edits to existing saves, and the
 flat-deck prototype remains untouched and not promoted by this branch.
 
+## MINECRAFT-566: the cooldown-retry fix itself had a real bug (comment 55528)
+
+John's own independent loopback reproduction of `5a4e1b2` found exactly the kind of bug this
+pattern invites: `waysForCellRetryingAcrossCooldown` inferred "was this attempt just declined by
+cooldown?" purely from whether `nextEligibleRequestAt` was still ahead of now -- but
+`fetchCell` advances that instant by the steady cadence on EVERY dispatched request, successful or
+not, since it is set right after sending, before the response status is even checked. A genuinely
+ATTEMPTED failure (an HTTP 500 that really was sent and really did fail) therefore left the exact
+same signal a cooldown-declined attempt would -- `waysForCell` itself discarded the real
+`FetchOutcome` entirely, so the retry loop had no way to tell them apart, and retried (sending a
+SECOND real request) after a genuine failure too. Concretely reproduced: four fresh demands with a
+1.8s budget and 200ms cadence against a deliberately-failing endpoint gave POST counts `1,1,1,2` --
+a real duplicate request roughly 206ms after the first.
+
+**Fixed** by actually propagating the outcome: a new private `waysForCellDetailed`/
+`FetchAttemptResult` record returns the real `FetchOutcome` alongside the result, and
+`waysForCellRetryingAcrossCooldown` now checks it directly -- retrying ONLY on
+`DISPATCH_SUPPRESSED`, never on `RESOLVED` or `ATTEMPTED_FAILURE`. The public `waysForCell` API is
+unchanged (still just returns the ways list; every other caller is unaffected). Also added a 1ms
+floor to the sleep duration, per John's second (unconfirmed, "plausible cause") observation that an
+early sub-millisecond wake could consume a retry attempt without actually advancing real wall-clock
+time, risking exhausting the bounded retry count before the real cooldown passes.
+
+**Verified**: a new `RoadTileSourceTest.boundedWaitNeverRetriesAGenuineAttemptedFailureEvenWithPlentyOfBoundLeft`
+asserts a bounded-wait call against a provider that genuinely fails (HTTP 500) sends EXACTLY one
+real request and comes back empty, even with a generous bound that would easily have covered a
+cooldown-driven retry -- the exact shape of the bug this fixes. 87/87 tests pass (1 new), stable
+across repeated reruns of the full suite.
+
+**Not attempted**, per John's own "if feasible" framing (not the confirmed bug, and not required):
+this retry loop still occupies `ASYNC_FETCH_EXECUTOR`'s one shared thread for the full duration of
+each sleep -- no other queued task, immediate or lookahead, can run until this call's own
+`Runnable.run()` returns, since sleeping does not yield the thread to a different queued task.
+Avoiding that would need scheduling a resubmission after the cooldown rather than sleeping in
+place -- a real further improvement, left as a disclosed, not-yet-attempted gap rather than a
+rushed partial redesign.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
