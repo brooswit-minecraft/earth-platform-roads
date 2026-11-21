@@ -348,7 +348,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // scheduling. Both gates below are the SAME ones the defer snapshot already uses -- computed
         // once, here, and reused for both so the two can never drift apart.
         boolean liveAndRelevant = RoadPrefetch.hasLiveTileSource()
-                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeY, centerBlockX, centerBlockZ);
+                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ);
         // MINECRAFT-566 comment 55534: "the reported 3s is not an aggregate worker bound" -- the
         // prior version computed this deadline AFTER the first accepted generate() call returned,
         // so PENDING_DEFER_WINDOW only ever bounded the retry's OWN slice, not the real total extra

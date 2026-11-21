@@ -1017,6 +1017,50 @@ initial dispatch, so the window is now a genuine aggregate budget across the who
 89/89 tests pass (one updated to cover the cache-only-is-not-live distinction directly, alongside
 a new positive case for an actually live-capable configured source).
 
+## MINECRAFT-566: the Y-filter needed the full footprint, not one center column (comment 55537)
+
+John's native checks against `88ecd8f` confirmed the 55534 fixes hold: deep, sky, and a
+preview-off cache-only instance all correctly bypass both the initial dispatch and the defer retry,
+sending zero POSTs. A new "positive control" fixture then failed: a column whose own natural ground
+height is Y79 at the sampled CENTER, but an off-center column within the SAME real road footprint
+(the paved edge or shoulder a block or two out) has its own natural ground height at Y80 -- landing
+in a DIFFERENT cube. With the cold "upper" (Y80-containing) cube requested first, the OLD
+center-only `cubeContainsNaturalSurface` check reported it as Y-irrelevant (only the center's own
+Y79 mattered to that check), so the worker adopted grass with zero dispatch at all -- not even the
+old, un-gated initial fetch from before 55534. The "lower" cube (relevant by the center check)
+correctly fetched once and a fresh generator painted the correct layered stripe for IT, but the
+upper cube's grass, already saved before any fetch was ever attempted, survived native reopen
+permanently.
+
+**Root cause:** a real road footprint (paved surface + centerline + gravel shoulder) is not flat --
+different columns across its width can have different natural ground heights, sometimes enough to
+fall in different cubes. Sampling only ONE column (the cube's geometric center) to decide "is this
+cube Y-relevant at all" cannot see that some OTHER column in the same cube, elsewhere in the
+footprint, needs a completely different cube's worth of Y-range.
+
+**Fix:** `RoadPrefetch.cubeContainsNaturalSurface` no longer takes a single block column. It now
+takes `(cubeX, cubeY, cubeZ)` and scans the cube's own full 16x16 column grid -- the same per-column
+iteration `sectionLooksStale` already uses for the same underlying reason -- looking for ANY
+road-covered column (`RoadNetwork.segmentCoveringColumn` non-null, and not
+`CrossSection.OFF_ROAD`) whose own natural ground height, padded a fixed, conservative
+`BASE_PAVING_PADDING_BLOCKS` (3) below, falls inside this cube's Y-range. The cube is relevant the
+moment ANY such column qualifies -- not just the center sample. The 3-block padding is a fixed
+constant, deliberately not computed from Earth Platform's own private, memoized `Surface`
+decoration (per John's own "no material-bearing upstream surface memo" framing) -- the same stance
+this whole mixin pair already takes toward that upstream cache (see `sectionLooksStale`'s own doc).
+
+Verified directly: a new synthetic fixture way (never one of John's own real test locations) proves
+the scan finds a road-covered column and correctly gates both the containing cube and cubes 50
+blocks above/below it, plus a new negative case (a cube with no road-covered column in its own
+footprint at all is never relevant regardless of Y). The EXACT natural-terrain height variation
+John's native fixture reproduces (two real DEM-derived heights, one block apart, landing in
+different cubes) was not independently reproduced here -- this harness has no DEM-mocking seam to
+force that deterministically -- but the fix's correctness does not depend on knowing in advance
+which column in the cube has the differing height; it depends only on scanning the whole footprint
+instead of one sample point, which the new tests directly exercise. 89/89 tests pass (two new
+cases, one updated to the new 3-argument signature with a real on-road fixture rather than an
+arbitrary off-road sample point).
+
 ## MINECRAFT-566: default-cadence native finding not yet fixed (comment 55535)
 
 John's next native round, against the SAME `54cc747` commit (pre-55534-fix), ran under the

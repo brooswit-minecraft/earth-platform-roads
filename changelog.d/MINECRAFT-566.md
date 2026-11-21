@@ -267,6 +267,24 @@ bump: minor
   `PENDING_DEFER_WINDOW` is now a genuine aggregate budget across the whole method -- the prior
   version let a held response fail open at 4.26s against a nominal 3s window, since the window only
   ever covered the retry's own slice.
+- Fixed a real gap found by John's own native "upper-first" fixture (comment 55537, confirming
+  deep/sky/cache-only all now correctly stay at zero POSTs): `cubeContainsNaturalSurface` checked
+  only a single CENTER column's own natural ground height, but a real road footprint is not flat --
+  an off-center column within the SAME footprint (the paved edge or shoulder, not the sampled center
+  point) can have a different natural ground height, even landing in a DIFFERENT cube. A cube
+  Y-irrelevant only by the old center-only check still adopted grass with no dispatch at all, and
+  that grass was permanent on reopen once a fresh generator correctly painted the (different) cube
+  the center check had flagged. Fixed by scanning the CUBE's own full 16x16 column grid (the same
+  per-column pattern `RoadPrefetch.sectionLooksStale` already uses) for ANY road-covered column
+  (skipping `CrossSection.OFF_ROAD`) whose own natural ground height, padded 3 blocks below (a fixed
+  conservative margin, deliberately not computed from Earth Platform's own private `Surface`
+  decoration -- same stance `sectionLooksStale` already takes), falls inside this cube's Y-range.
+  `cubeContainsNaturalSurface` now takes `(cubeX, cubeY, cubeZ)` instead of a single block column.
+  Verified directly against a synthetic fixture way; the exact natural-terrain height variation
+  John's native fixture exercises was not independently reproduced in this harness (no DEM-mocking
+  seam exists to force it deterministically) -- the new scan-based detector's correctness does not
+  depend on which specific column in the cube has the differing height, only that scanning the whole
+  footprint (not one sample point) finds it, which the new test does directly prove.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it

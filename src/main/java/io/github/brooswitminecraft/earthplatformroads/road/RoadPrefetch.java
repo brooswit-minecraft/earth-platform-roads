@@ -108,20 +108,56 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55534, a conservative padding below each sampled column's own natural
+     * ground height, applied by {@link #cubeContainsNaturalSurface}: John's own native "upper-first"
+     * fixture found a real road footprint column (off-center, e.g. the shoulder) whose OWN natural
+     * ground height sits a block or more ABOVE another column's (e.g. the paved centerline) -- the
+     * footprint is not flat. Rather than compute the exact material-bearing depth from Earth
+     * Platform's own upstream {@code Surface} decoration (deliberately not done -- that is the same
+     * private, memoized, already-disqualified-once data source {@code sectionLooksStale} avoids;
+     * see this class's own doc), a small fixed conservative margin below ground is used instead.
+     */
+    private static final int BASE_PAVING_PADDING_BLOCKS = 3;
+
+    /**
      * MINECRAFT-566 comment 55532: "gate by... actual surface relevance (current loop has no Y
      * filter)" -- a road is only ever painted AT a column's own natural ground height
      * ({@code EarthGeneratorRoadMixin}'s {@code surface()} hook never touches any other Y), so a
-     * cube whose own Y-range does not even CONTAIN that height (deep underground, or high above the
-     * surface) can never show a road regardless of whether the tile is pending -- deferring/retrying
-     * generation for such a cube would be pure waste. Same {@code localY} check
-     * {@link #sectionLooksStale} already uses for the same reason, pulled out here as its own named
-     * function since this is now a second, independent caller.
+     * cube whose own Y-range does not even come close to any road-covered column's natural ground
+     * height can never show a road regardless of whether the tile is pending -- deferring/retrying
+     * generation for such a cube would be pure waste.
+     *
+     * <p><b>Comment 55534, a real gap in the first version:</b> the first version checked only the
+     * CUBE's own single center column's ground height. John's native "upper-first" fixture found a
+     * real road footprint is not flat: an off-center column within the SAME footprint (e.g. the
+     * paved edge or shoulder, not the sampled center point) can have its own natural ground height
+     * a block or more different from the center's -- so a cube that is Y-irrelevant for the center
+     * column alone can still be exactly where a DIFFERENT, still-within-footprint column's own road
+     * surface needs to be painted. The center cube fetched and painted correctly; the "upper" cube
+     * (irrelevant only by the old center-only check) was skipped entirely, adopted grass with no
+     * dispatch, and that grass was permanent on reopen. Fixed by scanning this CUBE's own full 16x16
+     * column grid (the same per-column pattern {@link #sectionLooksStale} already uses, deliberately
+     * NOT the road's own cross-section geometry, which would need a second, different RoadNetwork
+     * lookup) for ANY road-covered column (skipping {@code CrossSection.OFF_ROAD}) whose own natural
+     * ground height, padded by {@link #BASE_PAVING_PADDING_BLOCKS} below, falls inside this cube's
+     * Y-range -- "relevant if ANY real road column in this cube's own footprint could plausibly need
+     * this cube," not just the one center sample point.
      */
-    public static boolean cubeContainsNaturalSurface(EarthGenerator generator, int cubeY, int x, int z) {
-        int groundY = generator.surfaceY(x, z);
-        int baseY = cubeY << 4;
-        int localY = groundY - baseY;
-        return localY >= 0 && localY <= 15;
+    public static boolean cubeContainsNaturalSurface(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
+        MercatorGrid grid = generator.grid();
+        int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int worldX = baseX + lx, worldZ = baseZ + lz;
+                RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, worldX, worldZ);
+                if (segment == null) continue;
+                if (segment.crossSectionAt(grid, worldX, worldZ) == RoadSegment.CrossSection.OFF_ROAD) continue;
+                int groundY = generator.surfaceY(worldX, worldZ);
+                int localY = groundY - baseY;
+                if (localY + BASE_PAVING_PADDING_BLOCKS >= 0 && localY <= 15) return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -1196,17 +1196,39 @@ class RoadTilePrefetchMixinTest {
         RoadNetwork.setTileSourceForTests(liveSource);
         assertTrue(RoadPrefetch.hasLiveTileSource(), "Expected a configured, live-capable tile source to be reported as live");
 
+        // MINECRAFT-566 comment 55534: cubeContainsNaturalSurface now scans this CUBE's own real
+        // road-covered columns (it must find at least one to ever report relevant at all), not just
+        // a single arbitrary off-road sample point -- a fictional, never-used-elsewhere fixture
+        // (not any of John's own real test locations), a simple two-node way straight along one
+        // cell's own interior.
+        String fixtureJson = """
+                {"schema_version":1,"region_id":"pure-fixture","ways":[{"way_id":555099,
+                  "way_tags":{"highway":"residential","name":"Fixture Test Road"},
+                  "centerline":[{"lat":46.0010,"lon":-116.0050},{"lat":46.0060,"lon":-116.0050}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(roadCache.resolve("4600_-11601.json"), fixtureJson);
+
         EarthGenerator generator = bootAndBuildGenerator(demCache);
-        double lat = 49.0005, lon = -114.0005;
-        int[] block = generator.block(lat, lon);
-        int ground = generator.surfaceY(block[0], block[1]);
+        int[] onRoadBlock = generator.block(46.0035, -116.0050); // midpoint of the fixture way: exactly on its centerline
+        var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), onRoadBlock[0], onRoadBlock[1]);
+        assertTrue(covering != null && covering.wayId() == 555099L,
+                "Expected the fixture way to actually cover this column. Got " + covering);
+        int ground = generator.surfaceY(onRoadBlock[0], onRoadBlock[1]);
+        int cubeXContaining = onRoadBlock[0] >> 4, cubeZContaining = onRoadBlock[1] >> 4;
         int cubeYContainingSurface = ground >> 4;
 
-        assertTrue(RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface, block[0], block[1]),
-                "Expected the cube whose own Y-range actually contains the natural ground height to be reported as containing it");
-        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface + 50, block[0], block[1]),
+        assertTrue(RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface, cubeZContaining),
+                "Expected the cube whose own Y-range actually contains a road column's natural ground height to be reported as containing it");
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface + 50, cubeZContaining),
                 "Expected a cube far ABOVE the natural ground height to NOT be reported as containing it");
-        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeYContainingSurface - 50, block[0], block[1]),
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface - 50, cubeZContaining),
                 "Expected a cube far BELOW the natural ground height to NOT be reported as containing it");
+        // Far from the fixture way entirely -- no road-covered column in this cube at all, so the
+        // cube can never be reported as containing a natural road surface regardless of Y.
+        int[] offRoadBlock = generator.block(46.5000, -116.5000);
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(
+                        generator, offRoadBlock[0] >> 4, generator.surfaceY(offRoadBlock[0], offRoadBlock[1]) >> 4, offRoadBlock[1] >> 4),
+                "Expected a cube with no road-covered column at all to NOT be reported as containing a natural road surface");
     }
 }
