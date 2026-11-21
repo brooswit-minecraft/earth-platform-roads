@@ -8,17 +8,31 @@ import java.util.List;
 
 /**
  * One mapped OpenStreetMap way's centerline (or a pinned, bounded run of its consecutive nodes),
- * and the half-width either side of it that counts as road surface. Coordinates are
- * latitude/longitude, as pinned in {@code data/earthplatformroads/roads/regions/*.json}; projecting
- * them to a world's own block grid happens at query time against that world's actual
- * {@link MercatorGrid}, never baked in, so the same pinned geometry is correct for whatever home
- * point and scale the world was made with.
+ * and the PAVED half-width either side of it. Coordinates are latitude/longitude, as pinned in
+ * {@code data/earthplatformroads/roads/regions/*.json}; projecting them to a world's own block grid
+ * happens at query time against that world's actual {@link MercatorGrid}, never baked in, so the
+ * same pinned geometry is correct for whatever home point and scale the world was made with.
  *
  * <p>{@code nodeIds} carries the way's real OSM node IDs 1:1 with {@code centerline}, in the same
  * order: {@link RoadNetwork} uses a node ID shared by two segments as a mapped junction, not
  * geometric proximity, so two ways that merely cross without a shared node are correctly not a
  * junction. An empty {@code nodeIds} array (the pre-junction-tracking pinned fixture) means this
  * segment opts out of junction detection entirely, not that it has zero junctions.
+ *
+ * <p><b>Cross-section (MINECRAFT-566's road-styling ask)</b>: {@code pavedHalfWidthBlocks} alone is
+ * no longer the whole footprint. A thin yellow-terracotta centerline sits astride the centerline
+ * itself (within {@value #CENTERLINE_HALF_WIDTH_BLOCKS} blocks, classes that
+ * {@link RoadClass#hasCenterline} only), the paved (blackstone) surface extends out to
+ * {@code pavedHalfWidthBlocks}, and a narrow gravel shoulder continues {@value #SHOULDER_WIDTH_BLOCKS}
+ * block further out to {@link #totalHalfWidthBlocks()} -- see {@link #crossSectionAt}, the single
+ * source of truth for which zone a column falls into, used by both {@link #coversColumn} (the
+ * WHOLE footprint, paved and shoulder alike -- a bridge/tunnel's exclusion, or a column simply being
+ * "on this road at all", covers the shoulder too) and the road surface mixin. Nesting all three
+ * zones against the exact same {@link #distanceBlocks} value, with
+ * {@code CENTERLINE_HALF_WIDTH_BLOCKS < pavedHalfWidthBlocks < totalHalfWidthBlocks()} always, is
+ * what guarantees the centerline can never land outside the paved surface (a John-named acceptance
+ * requirement) regardless of how a curve or junction's nearest-segment geometry behaves -- there is
+ * no separate, independently-computed centerline check that could disagree with the paved one.
  */
 public record RoadSegment(
         long wayId,
@@ -26,27 +40,55 @@ public record RoadSegment(
         RoadClass roadClass,
         GeoPoint[] centerline,
         long[] nodeIds,
-        double halfWidthBlocks,
+        double pavedHalfWidthBlocks,
         boolean bridge,
         boolean tunnel,
         int layer) {
+    /** Thin stripe astride the centerline itself -- "a centerline, not a whole lane" per John's styling ask. */
+    public static final double CENTERLINE_HALF_WIDTH_BLOCKS = 0.5;
+    /** Narrow gravel shoulder immediately outside the paved surface, on both edges. */
+    public static final double SHOULDER_WIDTH_BLOCKS = 1.0;
+
+    /** Which part of this road's cross-section a column falls into, if any; see {@link #crossSectionAt}. */
+    public enum CrossSection { CENTERLINE, PAVED, SHOULDER, OFF_ROAD }
+
     public RoadSegment {
         if (centerline.length < 2) throw new IllegalArgumentException("A road segment needs at least two points");
-        if (!(halfWidthBlocks > 0)) throw new IllegalArgumentException("halfWidthBlocks must be positive");
+        if (!(pavedHalfWidthBlocks > 0)) throw new IllegalArgumentException("pavedHalfWidthBlocks must be positive");
         if (nodeIds.length != 0 && nodeIds.length != centerline.length) {
             throw new IllegalArgumentException("nodeIds must be empty or match centerline length 1:1");
         }
     }
 
     /** Minimal constructor for geometry that predates class/junction/bridge tracking (MINECRAFT-564's pinned fixture, and tests). */
-    public RoadSegment(String name, GeoPoint[] centerline, double halfWidthBlocks) {
-        this(0L, name, RoadClass.SECONDARY, centerline, new long[0], halfWidthBlocks, false, false, 0);
+    public RoadSegment(String name, GeoPoint[] centerline, double pavedHalfWidthBlocks) {
+        this(0L, name, RoadClass.SECONDARY, centerline, new long[0], pavedHalfWidthBlocks, false, false, 0);
+    }
+
+    /** The full footprint's own half-width, paved surface plus the gravel shoulder on each side. */
+    public double totalHalfWidthBlocks() {
+        return pavedHalfWidthBlocks + SHOULDER_WIDTH_BLOCKS;
+    }
+
+    /**
+     * {@link CrossSection#OFF_ROAD} beyond {@link #totalHalfWidthBlocks()}; otherwise whichever of
+     * {@link CrossSection#CENTERLINE}/{@link CrossSection#PAVED}/{@link CrossSection#SHOULDER} this
+     * column's {@link #distanceBlocks} falls into. See this record's own class doc for why nesting
+     * all three zones against the SAME distance value (rather than three independent checks) is
+     * what guarantees the centerline is always a subset of the paved surface.
+     */
+    public CrossSection crossSectionAt(MercatorGrid grid, int x, int z) {
+        double distance = distanceBlocks(grid, x, z);
+        if (distance > totalHalfWidthBlocks()) return CrossSection.OFF_ROAD;
+        if (roadClass.hasCenterline && distance <= CENTERLINE_HALF_WIDTH_BLOCKS) return CrossSection.CENTERLINE;
+        if (distance <= pavedHalfWidthBlocks) return CrossSection.PAVED;
+        return CrossSection.SHOULDER;
     }
 
     /**
      * The closest distance, in blocks, from the column centre {@code (x + 0.5, z + 0.5)} to this
      * road's centerline, projected into {@code grid}'s block space. {@link Double#MAX_VALUE} is
-     * never returned; callers compare against {@link #halfWidthBlocks} themselves.
+     * never returned; callers compare against {@link #pavedHalfWidthBlocks}/{@link #totalHalfWidthBlocks()} themselves.
      */
     public double distanceBlocks(MercatorGrid grid, int x, int z) {
         double px = x + 0.5, pz = z + 0.5;
@@ -61,14 +103,15 @@ public record RoadSegment(
         return best;
     }
 
+    /** The WHOLE footprint, paved surface and gravel shoulder alike -- see {@link #crossSectionAt}. */
     public boolean coversColumn(MercatorGrid grid, int x, int z) {
-        return distanceBlocks(grid, x, z) <= halfWidthBlocks;
+        return distanceBlocks(grid, x, z) <= totalHalfWidthBlocks();
     }
 
     /**
      * This way's bounding box in latitude/longitude, used by {@link RoadNetwork}'s spatial index to
      * place the segment in every grid cell it can possibly reach (centerline cells plus one cell of
-     * margin for {@code halfWidthBlocks}), so a column's cell lookup is a short local list, not a
+     * margin for {@link #totalHalfWidthBlocks()}), so a column's cell lookup is a short local list, not a
      * scan of every mapped way.
      */
     public double minLat() {

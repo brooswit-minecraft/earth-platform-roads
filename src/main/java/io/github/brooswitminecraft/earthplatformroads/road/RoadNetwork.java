@@ -508,7 +508,7 @@ public final class RoadNetwork {
                             + "; foot trails must not be ingested as roads");
         }
         int lanes = tags.has("lanes") ? parseLanes(tags.get("lanes").getAsString()) : 0;
-        double halfWidth = roadClass.halfWidthBlocks(lanes);
+        double halfWidth = roadClass.pavedHalfWidthBlocks(lanes);
 
         JsonArray centerlineJson = way.getAsJsonArray("centerline");
         GeoPoint[] centerline = new GeoPoint[centerlineJson.size()];

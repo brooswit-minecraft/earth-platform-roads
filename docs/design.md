@@ -471,6 +471,84 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   attempted earlier in this work returned "502 Gateway Timeout -- at capacity" (see
   `docs/road-data-provenance.md`); that attempt is now superseded context, not a blocking gap.
 
+## MINECRAFT-566: road width, centerline and shoulder styling (comment 55484)
+
+A deliberately SEPARATE slice from the readiness/bounded-worker work above -- John explicitly asked
+for this to be queued as its own commit so it would not displace that in-flight work, after live
+playtest feedback on `a632bdc`: "present roads look about half as wide as expected", wanting a
+yellow-terracotta centerline and gravel shoulders.
+
+- **Width.** `RoadClass.defaultPavedHalfWidthBlocks` is roughly doubled per class (e.g. MOTORWAY
+  5.0 -> 10.0, SECONDARY 3.0 -> 6.0, SERVICE 1.5 -> 3.0), and the lanes-based formula
+  (`pavedHalfWidthBlocks(lanes)`, was `lanes/2.0 + 2.0`) doubled the same way (`lanes + 4.0`).
+  Renamed from `halfWidthBlocks` throughout to `pavedHalfWidthBlocks` -- the width was never
+  persisted in any region/tile JSON to begin with (`RoadSegment.toWayJson` never wrote it;
+  `RoadNetwork.parseWay`/`OverpassWayParser` always recompute it fresh from `roadClass` + `lanes`
+  at load time), so changing the formula affects every already-bundled, external, AND already-
+  fetched-and-cached tile on its very next load, with zero migration of any kind needed. An
+  already-GENERATED, saved cube is still never retrofitted (the existing, unrelated
+  "no retrofit" limitation) -- this only ever affects fresh generation.
+- **Cross-section.** `RoadSegment.crossSectionAt` is the one place that decides which zone a column
+  falls into, nesting three thresholds against the exact same `distanceBlocks` value:
+  `CENTERLINE_HALF_WIDTH_BLOCKS` (0.5, classes with `RoadClass.hasCenterline` only) <
+  `pavedHalfWidthBlocks` < `totalHalfWidthBlocks()` (paved + `SHOULDER_WIDTH_BLOCKS`, 1.0).
+  `coversColumn` (used by `segmentCoveringColumn`, and therefore the bridge/tunnel exclusion check
+  too) now means the WHOLE footprint, shoulder included, not just the paved surface. Using ONE
+  distance value with nested thresholds, rather than separately re-deriving each zone's own check,
+  is what guarantees the centerline can never read as outside the paved surface -- John's named
+  acceptance requirement -- regardless of how a curve's or junction's nearest-segment selection
+  behaves; `RoadCrossSectionTest.theCenterlineNeverExtendsPastThePavedSurfaceEvenAtASharpBend`
+  checks this explicitly at a real (if synthetic) 90-degree bend, not just a straight stretch.
+  `RoadClass.SERVICE` is the one class with `hasCenterline = false` -- a driveway/service road
+  reads as a narrow, unstriped path even at its own (still-widened) paved width, matching real-world
+  road-marking convention; `RoadCrossSectionTest.aServiceRoadNeverReturnsCenterlineRegardlessOfDistance`
+  checks it.
+- **Materials.** `EarthGeneratorRoadMixin` picks blackstone/yellow-terracotta/gravel (plus the
+  SAME `RoadSurfaceLayering` decayed-layer treatment for whichever one applies, so slope-layering
+  continuity now holds for all three, not just blackstone) from the zone `crossSectionAt` returns.
+  `under()` differs by zone too: blackstone under the centerline (a painted line ON pavement, not a
+  full-depth material change) and under the paved surface itself, but GRAVEL under the gravel
+  shoulder (a real shoulder is gravel a few layers down, not pavement with a gravel skin) --
+  `EarthGenerator` reads `under()` at depths 1-3, per the ticket's existing instruction.
+  `LayeredSlopesCompat` registers two more compat-owned `LayeredBlock`s the exact same way as the
+  existing blackstone one (`LAYERED_YELLOW_TERRACOTTA` over `Blocks.YELLOW_TERRACOTTA`,
+  `LAYERED_GRAVEL` over `Blocks.GRAVEL`), each with their own copied-and-retextured block/item
+  models and blockstate (identical per-layer-count geometry to the blackstone variant; only the
+  texture reference differs) under `assets/earthplatformroads`. **No falling gravel**: confirmed by
+  reading `LayeredBlock`'s own class declaration directly -- it extends plain
+  `net.minecraft.world.level.block.Block`, not `FallingBlock`, so `LAYERED_GRAVEL` never has
+  falling-block physics regardless of what it rests on; `RoadCrossSectionTest
+  .layeredGravelHasNoFallingBlockPhysics` asserts this structurally (via the class hierarchy
+  itself), not just a comment claiming it.
+- **Candidate-query margin across tile/cube seams** (an explicit ask): already safe, no change
+  needed. `RoadNetwork.buildIndex`'s spatial-index margin is a FIXED `CELL_DEGREES`-sized margin
+  (~1.1km) around every segment, chosen to be generous regardless of a way's own width -- even the
+  widest new footprint (MOTORWAY, 10.0 paved + 1.0 shoulder = 11 blocks, ~11m) is utterly dwarfed by
+  that margin, so a column's cell lookup already finds every segment that could possibly reach it,
+  before and after this change.
+- **Verification on a non-private fixture.** All of the above was checked against the bundled
+  Yosemite Southside Drive extract (`data/earthplatformroads/roads/regions/yosemite_valley.json`,
+  SECONDARY class, `hasCenterline = true`) -- never John's own private location.
+  `RoadGenerationTest.theRealGeneratedCrossSectionGoesYellowThenBlackstoneThenGravelThenNatural`
+  walks away from the pinned centerline through REAL generation (not just the geometry check
+  `RoadCrossSectionTest` already covers) and asserts the real blocks actually go yellow-terracotta
+  -> polished blackstone -> gravel -> natural terrain, in that order, with a distinct material at
+  each zone. `RoadCrossSectionTest.theCrossSectionGoesCenterlineThenPavedThenShoulderThenOffRoad...`
+  checks the same ordering property purely geometrically (no game bootstrap). Diagonal/curve
+  behavior specifically: the bent-geometry test above, plus the existing
+  `theRoadIsContinuousAcrossACubeBoundary`/`aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff`
+  real-generation tests (now exercised against the new, wider footprint) continue to pass unchanged.
+  No world/cache migration, and no already-saved terrain touched -- see "Width" above.
+- **Not attempted this pass:** junction-specific cross-section behavior (what happens where two
+  differently-classed ways' shoulders/centerlines overlap at a mapped junction) beyond what the
+  existing per-segment, independent `crossSectionAt` evaluation already does implicitly (whichever
+  segment `segmentCoveringColumn` picks first wins that column, same as before this change) --  no
+  bundled fixture currently has two crossing/joining ways to exercise this directly, and a dedicated
+  junction fixture is listed as a known gap already (see "Still only one bundled region" above).
+  A real in-game visual/collision confirmation of the new width and materials, matching the
+  existing blackstone layering's own disposable-profile playtest, was not attempted here either --
+  this agent's environment has no running Minecraft client.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

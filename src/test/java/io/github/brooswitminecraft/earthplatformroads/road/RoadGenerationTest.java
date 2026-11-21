@@ -51,9 +51,18 @@ class RoadGenerationTest {
     /** A point on the pinned centerline (data/earthplatformroads/roads/regions/yosemite_valley.json), -119.6367003,37.7206145. */
     private static final double ON_ROAD_LAT = 37.7206145, ON_ROAD_LON = -119.6367003;
 
-    /** Either the original always-full polished blackstone, or MINECRAFT-566's layered compat block over the same base texture. */
+    /**
+     * Any of this mod's three road-surface materials (MINECRAFT-566 comment 55484's styling ask:
+     * paved blackstone, the yellow-terracotta centerline, or the gravel shoulder), full-block or
+     * MINECRAFT-566's layered compat block over the same base texture. The tests below check
+     * CONTINUITY/COVERAGE generically (a road column vs. natural terrain), not which specific zone
+     * applies -- {@code RoadCrossSectionTest} and {@code RoadGenerationTest}'s own width/zone tests
+     * cover that distinction directly.
+     */
     private static boolean isRoadSurface(BlockState state) {
-        return state.is(Blocks.POLISHED_BLACKSTONE) || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get());
+        return state.is(Blocks.POLISHED_BLACKSTONE) || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                || state.is(Blocks.YELLOW_TERRACOTTA) || state.is(LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                || state.is(Blocks.GRAVEL) || state.is(LayeredSlopesCompat.LAYERED_GRAVEL.get());
     }
 
     @BeforeAll
@@ -282,5 +291,50 @@ class RoadGenerationTest {
         var state = surfaceBlockAt(justOutside.latitude(), justOutside.longitude());
         assertTrue(!isRoadSurface(state),
                 "A column just past the half-width edge (" + x + "," + z + ") must not be road surface, got " + state);
+    }
+
+    /**
+     * MINECRAFT-566 comment 55484's styling ask, verified on a NON-private fixture (the bundled
+     * Yosemite Southside Drive extract, never John's own location): real generated blocks, not
+     * just the geometry check {@code RoadCrossSectionTest} already covers, actually go
+     * yellow-terracotta (centerline) -&gt; polished blackstone (paved) -&gt; gravel (shoulder) -&gt;
+     * natural terrain, moving away from the pinned centerline -- a distinct palette at each zone,
+     * never off-road, exactly the three real materials the mixin paints.
+     */
+    @Test
+    void theRealGeneratedCrossSectionGoesYellowThenBlackstoneThenGravelThenNatural() {
+        int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
+        var grid = generator.grid();
+        var centerState = surfaceBlockAtXZ(onRoad[0], onRoad[1]);
+        assertTrue(centerState.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                        || centerState.is(LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get()),
+                "Expected the pinned centerline column to generate the real yellow-terracotta centerline material, got " + centerState);
+
+        boolean sawBlackstone = false, sawGravel = false, sawNatural = false;
+        int x = onRoad[0], z = onRoad[1];
+        for (int dz = 0; dz <= 30; dz++) {
+            int cz = z - dz;
+            var segment = RoadNetwork.segmentCoveringColumn(grid, x, cz);
+            var state = surfaceBlockAtXZ(x, cz);
+            if (segment == null) {
+                sawNatural = true;
+                break;
+            }
+            var zone = segment.crossSectionAt(grid, x, cz);
+            if (zone == RoadSegment.CrossSection.PAVED) {
+                assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                                || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                        "Expected a PAVED column to generate real blackstone, got " + state);
+                sawBlackstone = true;
+            } else if (zone == RoadSegment.CrossSection.SHOULDER) {
+                assertTrue(state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                                || state.is(LayeredSlopesCompat.LAYERED_GRAVEL.get()),
+                        "Expected a SHOULDER column to generate real gravel, got " + state);
+                sawGravel = true;
+            }
+        }
+        assertTrue(sawBlackstone, "Expected to actually generate a real blackstone PAVED column moving away from the centerline");
+        assertTrue(sawGravel, "Expected to actually generate a real gravel SHOULDER column moving away from the centerline");
+        assertTrue(sawNatural, "Expected to eventually leave the road and generate natural terrain");
     }
 }

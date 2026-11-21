@@ -39,9 +39,22 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * {@link RoadSurfaceLayering#MAX_NEIGHBOR_DISTANCE} same-road columns in each of 4 directions for
  * the nearest column with a lower ground height, and decays this column's own layer count by that
  * distance, rather than comparing only immediate neighbors (which left a new, almost-as-bad gap one
- * column past the actual step). {@code under()} always stays a full block (never layered) because
- * {@code EarthGenerator} uses it at depths 1-3 under the column, per the ticket's explicit
- * instruction.
+ * column past the actual step).
+ *
+ * <p>MINECRAFT-566's road-styling ask (comment 55484, John's live-playtest feedback: roads read as
+ * too narrow, wants a yellow centerline and gravel shoulders): the material painted now depends on
+ * {@link RoadSegment#crossSectionAt} -- {@code CENTERLINE} (thin, astride the centerline, classes
+ * that opt in only) paints {@link LayeredSlopesCompat#LAYERED_YELLOW_TERRACOTTA} over a blackstone
+ * {@code under()} (a painted line ON pavement, not a full-depth material change); {@code PAVED}
+ * paints blackstone exactly as before; {@code SHOULDER} (the new narrow band outside the paved
+ * edge) paints {@link LayeredSlopesCompat#LAYERED_GRAVEL} over a gravel {@code under()} (gravel the
+ * whole way down a few layers, like a real shoulder, not pavement with a gravel skin) -- never
+ * vanilla falling gravel, since {@code LayeredBlock} extends plain {@code Block}, not
+ * {@code FallingBlock} (confirmed by reading the class). The SAME {@link RoadSurfaceLayering} decay
+ * applies to every zone's material, so the slope-layering continuity this mixin already provides
+ * for blackstone carries over to the centerline and shoulder too, not just the paved surface.
+ * {@code under()} always stays a full block (never layered) because {@code EarthGenerator} uses it
+ * at depths 1-3 under the column, per the ticket's explicit instruction.
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorRoadMixin {
@@ -57,18 +70,38 @@ public abstract class EarthGeneratorRoadMixin {
         EarthGenerator self = (EarthGenerator) (Object) this;
         RoadSegment segment = RoadNetwork.segmentCoveringColumn(self.grid(), x, z);
         if (segment == null) return;
+        RoadSegment.CrossSection crossSection = segment.crossSectionAt(self.grid(), x, z);
+        if (crossSection == RoadSegment.CrossSection.OFF_ROAD) return; // excluded (bridge/tunnel) way's own footprint check already ran in segmentCoveringColumn
         SurfaceGenerator.Surface original = cir.getReturnValue();
-        BlockState under = Blocks.POLISHED_BLACKSTONE.defaultBlockState();
-        BlockState top = topSurfaceFor(self, segment, x, z, y);
+        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y);
+        int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(distance);
+        BlockState under = underSurfaceFor(crossSection);
+        BlockState top = topSurfaceFor(crossSection, layers);
         cir.setReturnValue(new SurfaceGenerator.Surface(original.biome(), top, under, 0, 0, 0, 0, 0, false));
     }
 
-    /** Full block when no same-road neighbor within range is lower; a fractional layered block that decays by distance to one that is. */
-    private static BlockState topSurfaceFor(EarthGenerator self, RoadSegment segment, int x, int z, int y) {
-        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y);
-        int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(distance);
-        if (layers >= LayerMath.MAX_LAYERS) return Blocks.POLISHED_BLACKSTONE.defaultBlockState();
-        return LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get().defaultBlockState()
+    /** The full-depth material under this zone's top surface -- blackstone under a painted centerline, gravel under a gravel shoulder. */
+    private static BlockState underSurfaceFor(RoadSegment.CrossSection crossSection) {
+        return crossSection == RoadSegment.CrossSection.SHOULDER
+                ? Blocks.GRAVEL.defaultBlockState()
+                : Blocks.POLISHED_BLACKSTONE.defaultBlockState();
+    }
+
+    /** Full block when no same-road neighbor within range is lower; a fractional layered block of this zone's own material that decays by distance to one that is. */
+    private static BlockState topSurfaceFor(RoadSegment.CrossSection crossSection, int layers) {
+        var layeredBlock = switch (crossSection) {
+            case CENTERLINE -> LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA;
+            case SHOULDER -> LayeredSlopesCompat.LAYERED_GRAVEL;
+            case PAVED, OFF_ROAD -> LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE;
+        };
+        if (layers >= LayerMath.MAX_LAYERS) {
+            return switch (crossSection) {
+                case CENTERLINE -> Blocks.YELLOW_TERRACOTTA.defaultBlockState();
+                case SHOULDER -> Blocks.GRAVEL.defaultBlockState();
+                case PAVED, OFF_ROAD -> Blocks.POLISHED_BLACKSTONE.defaultBlockState();
+            };
+        }
+        return layeredBlock.get().defaultBlockState()
                 .setValue(LayeredBlock.ANCHOR, Anchor.FLOOR)
                 .setValue(LayeredBlock.LAYERS, layers);
     }

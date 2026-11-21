@@ -51,7 +51,7 @@ final class OverpassWayParser {
             int layer = tags.has("layer") ? parseLayer(tags.get("layer").getAsString()) : 0;
 
             ways.add(new RoadSegment(obj.get("id").getAsLong(), name(tags, obj), roadClass, centerline, nodeIds,
-                    roadClass.halfWidthBlocks(lanes), bridge, tunnel, layer));
+                    roadClass.pavedHalfWidthBlocks(lanes), bridge, tunnel, layer));
         }
         return ways;
     }

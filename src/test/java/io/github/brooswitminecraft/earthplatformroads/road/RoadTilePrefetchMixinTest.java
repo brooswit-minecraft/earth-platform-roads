@@ -281,7 +281,11 @@ class RoadTilePrefetchMixinTest {
             var section = generator.generate(northColumn[0] >> 4, groundY >> 4, northColumn[1] >> 4);
             var state = section.getBlockState(northColumn[0] & 15, groundY & 15, northColumn[1] & 15);
             assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
-                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
                     "Expected real generation to paint road surface at the boundary column, got " + state);
         } finally {
             stub.stop(0);
@@ -340,7 +344,11 @@ class RoadTilePrefetchMixinTest {
         var section = generator.generate(interiorColumn[0] >> 4, groundY >> 4, interiorColumn[1] >> 4);
         var state = section.getBlockState(interiorColumn[0] & 15, groundY & 15, interiorColumn[1] & 15);
         assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
-                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                        || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                        || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
                 "Expected real generation to paint road surface deep in the interior, got " + state);
     }
 
@@ -458,7 +466,11 @@ class RoadTilePrefetchMixinTest {
             var section = generator.generate(pastAColumn[0] >> 4, groundY >> 4, pastAColumn[1] >> 4);
             var state = section.getBlockState(pastAColumn[0] & 15, groundY & 15, pastAColumn[1] & 15);
             assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
-                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
                     "Expected a real road-surface block past A's endpoint, on way B's own continuation, got " + state);
         } finally {
             stub.stop(0);

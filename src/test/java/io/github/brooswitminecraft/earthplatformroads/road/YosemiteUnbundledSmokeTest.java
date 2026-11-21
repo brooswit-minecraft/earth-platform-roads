@@ -92,7 +92,11 @@ class YosemiteUnbundledSmokeTest {
 
     private static boolean isRoadSurface(net.minecraft.world.level.block.state.BlockState state) {
         return state.is(Blocks.POLISHED_BLACKSTONE)
-                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get());
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                || state.is(Blocks.YELLOW_TERRACOTTA)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                || state.is(Blocks.GRAVEL)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get());
     }
 
     @Test

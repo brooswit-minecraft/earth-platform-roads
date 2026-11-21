@@ -117,6 +117,25 @@ bump: minor
   `adoptReady`/`retryAt` seam instead of a one-shot bounded wait) needs a new Mixin accessor into a
   private record constructor and is not attempted this pass -- see `docs/design.md`.
 
+### Changed (comment 55484, a separate styling slice from the readiness work above)
+- Roughly doubled every `RoadClass`'s paved half-width (and the lanes-based formula the same way)
+  per John's live-playtest feedback that roads read as too narrow. Never required any migration:
+  width was always recomputed fresh from classification at load time, never persisted in any
+  region/tile file.
+- Added a thin yellow-terracotta centerline (classes that opt in; `RoadClass.SERVICE` stays
+  unstriped, matching real-world driveway/service-road convention) and a narrow gravel shoulder
+  outside the paved edge (`RoadSegment.crossSectionAt`, nesting all three zones against the same
+  distance value so the centerline can never read as outside the paved surface, including at a
+  sharp bend). `coversColumn` now means the whole footprint, shoulder included.
+- Both new materials get the same slope-layering continuity the paved surface already had, via two
+  new compat-owned `LayeredBlock`s (`LAYERED_YELLOW_TERRACOTTA`, `LAYERED_GRAVEL`) -- the gravel
+  variant has no falling-block physics at all (confirmed structurally: `LayeredBlock` extends plain
+  `Block`, not `FallingBlock`), unlike vanilla gravel.
+- Verified on the bundled, non-private Yosemite fixture: real generation actually produces
+  yellow-terracotta -> blackstone -> gravel -> natural terrain moving away from the pinned
+  centerline, and the candidate-query margin across tile/cube seams was already generous enough
+  (no change needed) for the new, wider footprint.
+
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a

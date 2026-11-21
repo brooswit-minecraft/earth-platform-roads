@@ -20,6 +20,16 @@ import net.neoforged.neoforge.registries.DeferredRegister;
  * the same registration pattern Layered Slopes uses for its own blocks, just under this mod's
  * registry namespace instead of {@code dynamicterrain}/{@code layeredslopes}, since this block has
  * no pre-split save/data-pack compatibility history to preserve.
+ *
+ * <p>MINECRAFT-566's road-styling ask (thin yellow terracotta centerline, gravel shoulders, both
+ * needing the same slope-layering continuity as the paved blackstone) adds two more of these, over
+ * {@link Blocks#YELLOW_TERRACOTTA} and {@link Blocks#GRAVEL} respectively, by the exact same
+ * pattern. {@link LayeredBlock} extends plain {@code Block} (confirmed by reading the class), not
+ * {@code net.minecraft.world.level.block.FallingBlock} -- so {@link #LAYERED_GRAVEL}, unlike vanilla
+ * gravel, never has falling-block physics at all, regardless of what it rests on. Each has its own
+ * copied-and-retextured block/item models and blockstate under
+ * {@code assets/earthplatformroads/models}/{@code blockstates} (identical geometry per layer count
+ * to the blackstone variant -- only the texture reference differs).
  */
 public final class LayeredSlopesCompat {
     public static final DeferredRegister.Blocks BLOCKS = DeferredRegister.createBlocks(EarthPlatformRoadsMod.MODID);
@@ -30,8 +40,24 @@ public final class LayeredSlopesCompat {
             LayeredBlock::new,
             BlockBehaviour.Properties.ofFullCopy(Blocks.POLISHED_BLACKSTONE).noOcclusion());
 
+    public static final DeferredBlock<LayeredBlock> LAYERED_YELLOW_TERRACOTTA = BLOCKS.registerBlock(
+            "layered_yellow_terracotta",
+            LayeredBlock::new,
+            BlockBehaviour.Properties.ofFullCopy(Blocks.YELLOW_TERRACOTTA).noOcclusion());
+
+    public static final DeferredBlock<LayeredBlock> LAYERED_GRAVEL = BLOCKS.registerBlock(
+            "layered_gravel",
+            LayeredBlock::new,
+            BlockBehaviour.Properties.ofFullCopy(Blocks.GRAVEL).noOcclusion());
+
     public static final DeferredItem<BlockItem> LAYERED_POLISHED_BLACKSTONE_ITEM =
             ITEMS.registerSimpleBlockItem(LAYERED_POLISHED_BLACKSTONE);
+
+    public static final DeferredItem<BlockItem> LAYERED_YELLOW_TERRACOTTA_ITEM =
+            ITEMS.registerSimpleBlockItem(LAYERED_YELLOW_TERRACOTTA);
+
+    public static final DeferredItem<BlockItem> LAYERED_GRAVEL_ITEM =
+            ITEMS.registerSimpleBlockItem(LAYERED_GRAVEL);
 
     private LayeredSlopesCompat() {}
 

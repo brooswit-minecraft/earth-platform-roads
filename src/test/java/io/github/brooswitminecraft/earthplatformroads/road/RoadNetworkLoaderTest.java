@@ -48,7 +48,7 @@ class RoadNetworkLoaderTest {
     void laneCountDrivesHalfWidthOverTheClassDefault() {
         RoadSegment twoLane = RoadNetwork.parseWay(way("secondary", "2"));
         RoadSegment fourLane = RoadNetwork.parseWay(way("secondary", "4"));
-        assertTrue(fourLane.halfWidthBlocks() > twoLane.halfWidthBlocks(),
+        assertTrue(fourLane.pavedHalfWidthBlocks() > twoLane.pavedHalfWidthBlocks(),
                 "A four-lane way must be wider than a two-lane way of the same class");
     }
 
