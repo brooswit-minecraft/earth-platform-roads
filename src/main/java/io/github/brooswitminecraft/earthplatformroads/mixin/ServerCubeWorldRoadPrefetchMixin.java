@@ -284,6 +284,20 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      * an explicit, deliberate fail-open: accept whatever the last attempt produced, exactly like any
      * other pending/failed cell already does, never an unbounded stall of this generation worker
      * thread.
+     *
+     * <p><b>Comment 55534, a real gap in the 55532 fix itself:</b> John's own native checks found
+     * two more real issues. First, the deadline was computed AFTER the first accepted
+     * {@code generate()} call had already returned, so this window only ever bounded the RETRY's
+     * own slice, not the method's real total extra time (initial dispatch wait + first
+     * {@code generate()} + retry wait) -- observed concretely: a held response failed open at
+     * 4.26s against this "3s" window. Fixed by capturing the deadline once, before the INITIAL
+     * dispatch, so this window genuinely is the aggregate budget it was always meant to be. Second,
+     * the initial dispatch itself (not just this retry) now shares the exact same
+     * {@code hasLiveTileSource}/{@code cubeContainsNaturalSurface} gate -- the first version of
+     * that gate only ever covered this retry, so a deep/sky cube (Y-irrelevant) still sent its own
+     * initial fetch POST, and a cache-only source (no live-fetch capability, but still non-null)
+     * still entered this method's wait scheduling despite sending zero POSTs. See
+     * {@code RoadPrefetch.hasLiveTileSource}'s own updated doc for the cache-only distinction.
      */
     private static final Duration PENDING_DEFER_WINDOW = Duration.ofSeconds(3);
 
@@ -327,7 +341,22 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // this method needs the same center point too.
         int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
         int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
-        if (!SynchronousLoadGuard.isActive()) { // loadNow's arrival path: never fetch here
+        // MINECRAFT-566 comment 55534: John's own native checks found the INITIAL dispatch below
+        // sending its own POST for a deep/sky cube whose Y-range can never contain a road (only the
+        // later defer snapshot was Y-gated), and a cache-only source (no live-fetch capability, but
+        // still a non-null RoadTileSource) sending zero POSTs yet still entering this method's wait
+        // scheduling. Both gates below are the SAME ones the defer snapshot already uses -- computed
+        // once, here, and reused for both so the two can never drift apart.
+        boolean liveAndRelevant = RoadPrefetch.hasLiveTileSource()
+                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeY, centerBlockX, centerBlockZ);
+        // MINECRAFT-566 comment 55534: "the reported 3s is not an aggregate worker bound" -- the
+        // prior version computed this deadline AFTER the first accepted generate() call returned,
+        // so PENDING_DEFER_WINDOW only ever bounded the retry's OWN slice, not the real total extra
+        // time this method can spend (initial dispatch wait + first generate() + retry wait), which
+        // is why a held response was observed failing open at 4.26s against a nominal 3s window.
+        // Captured here, before the initial dispatch, so the window is a genuine aggregate budget.
+        Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
+        if (!SynchronousLoadGuard.isActive() && liveAndRelevant) { // loadNow's arrival path: never fetch here
             // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
             // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
             // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
@@ -363,8 +392,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // fact would correctly, but uselessly, see "not pending" and never retry at all. See
         // PENDING_DEFER_WINDOW's own doc for the full reasoning.
         boolean wasPendingBeforeAcceptedAttempt = !SynchronousLoadGuard.isActive()
-                && RoadPrefetch.hasLiveTileSource()
-                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeY, centerBlockX, centerBlockZ)
+                && liveAndRelevant
                 && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ);
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
         List<CompoundTag> attemptEntities = new ArrayList<>();
@@ -399,7 +427,6 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // cell already does, never an unbounded stall of this generation worker thread. A single
         // retry attempt is enough: once resolved and regenerated, there is nothing further to gain.
         if (wasPendingBeforeAcceptedAttempt) {
-            Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
             Instant now = Instant.now();
             if (now.isBefore(deferDeadline)) {
                 Duration remaining = Duration.between(now, deferDeadline);

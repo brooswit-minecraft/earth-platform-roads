@@ -983,6 +983,68 @@ is verified directly against `RoadPrefetch`'s own new detectors/gates; actual pa
 native save/reopen will be reverified on John's own infrastructure. Not yet confirmed ready for
 Zippy.
 
+## MINECRAFT-566: two more real gaps in the 55532 fix (comment 55534)
+
+John's native checks against `54cc747` confirmed the race fix itself holds (one POST, correct
+stripe, correct native reopen, both controlled PENDING->READY timings), but found two more real
+issues in the surrounding gating:
+
+1. **Initial dispatch wasn't gated.** The `liveAndRelevant` gate (`hasLiveTileSource` +
+   `cubeContainsNaturalSurface`) only ever covered the LATER defer retry; the INITIAL
+   `RoadPrefetch.forColumnBounded` dispatch before the first accepted `generate()` call ran
+   unconditionally whenever `!SynchronousLoadGuard.isActive()`. John's native checks: a deep cube
+   and a sky cube each still sent their own initial POST. Fixed by computing the gate once, before
+   the initial dispatch, and reusing it for both call sites.
+
+2. **`hasLiveTileSource` conflated "exists" with "can fetch."** A cache-only install
+   (`allowNetwork=false` -- e.g. the "not opted into the preview provider" default) is a real,
+   non-null `RoadTileSource` that serves already-cached reads correctly, but every fetch attempt on
+   it returns `DISPATCH_SUPPRESSED` immediately -- it can never resolve a pending cell through its
+   own network call. The plain non-null check reported such an instance as "live," so John's native
+   check against one found it making zero POSTs while still entering this mixin's wait scheduling.
+   Fixed with a new `RoadTileSource.canFetchLive()` accessor (`allowNetwork` itself) that
+   `RoadPrefetch.hasLiveTileSource()` now checks instead of mere non-null existence --
+   `isPendingForColumn`'s own cached-read behavior is deliberately untouched, so a cache-only
+   install's already-fetched data still reads normally.
+
+Also fixed while addressing (1): the defer window's deadline was computed via `Instant.now()`
+AFTER the first accepted `generate()` call had already returned, so `PENDING_DEFER_WINDOW` (3s)
+only ever bounded the retry's own slice of time, not the method's real total extra latency
+(initial dispatch wait + first `generate()` + retry wait). John's own check: a held response failed
+open at 4.26s against the nominally-3s window. Fixed by capturing the deadline once, before the
+initial dispatch, so the window is now a genuine aggregate budget across the whole method.
+
+89/89 tests pass (one updated to cover the cache-only-is-not-live distinction directly, alongside
+a new positive case for an actually live-capable configured source).
+
+## MINECRAFT-566: default-cadence native finding not yet fixed (comment 55535)
+
+John's next native round, against the SAME `54cc747` commit (pre-55534-fix), ran under the
+provider's own DEFAULT steady request cadence (longer than this mixin's fixed 3s
+`PENDING_DEFER_WINDOW`) rather than a held/controlled response. Two shapes:
+
+- A "fast" shape (one request resolves shortly before a second, unrelated demand needs a
+  different/nearby cell) worked correctly: one POST, correct stripe, correct reopen.
+- The original "slow speculative" shape still fails: a queued fetch job for the demanded cell got
+  delayed behind an earlier request by the steady cadence itself (not a bug, just real rate
+  limiting), the generation's own bounded defer window ran out well before the cadence's own cooldown
+  cleared, generated grass, and -- because `produce`'s storage-read fast path means an already-saved
+  cube never reaches this injection again -- that grass is PERMANENT on reopen. A later, explicit
+  fetch after the real cooldown correctly resolves the cell for a FRESH cube, confirming the data
+  and fetch path are fine; only the timing budget is too short relative to normal (not pathological)
+  request cadence.
+
+**Not yet fixed.** John's own framing: keep this draft out of the next playtest cutoff "until
+ordinary outstanding immediate demand survives valid cadence and the old slow-speculation fixture
+passes within a deliberate finite outage policy" -- i.e., the fix needs to let an immediate demand's
+defer/retry survive a normal cooldown interval (not just a short, fixed worst-case guess), while
+still eventually giving up during a genuine, sustained provider outage rather than stalling a
+generation worker thread indefinitely. This needs real design work (likely: sizing the wait against
+the source's own actual steady interval / `nextEligibleRequestAt`, combined with `sustainedOutage()`
+as the actual "stop waiting, this is a real outage" signal, rather than a single fixed duration
+constant) -- not attempted in this same pass; see the ticket for the next round once designed.
+Explicitly: no server-thread HTTP and no bypassing request cadence, in whatever shape this takes.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

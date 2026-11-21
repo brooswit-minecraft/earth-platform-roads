@@ -131,6 +131,21 @@ public final class RoadTileSource {
     }
 
     /**
+     * MINECRAFT-566 comment 55534: whether this instance can EVER actually reach the network --
+     * distinct from merely existing. A cache-only instance ({@code allowNetwork=false}, e.g. the
+     * "not opted into the preview provider" default) is a perfectly real, non-null
+     * {@code RoadTileSource} that still serves already-cached reads correctly, but every
+     * {@code attemptFetch} on it returns {@code DISPATCH_SUPPRESSED} immediately -- nothing waiting
+     * on it will ever resolve through a fetch. {@code RoadPrefetch.hasLiveTileSource} uses this
+     * (not a plain non-null check) so a cache-only install never enters defer/wait scheduling for a
+     * cell that can only ever be resolved by someone else's fetch populating the shared on-disk
+     * cache, never its own network call.
+     */
+    public boolean canFetchLive() {
+        return allowNetwork;
+    }
+
+    /**
      * Cells enqueued for best-effort, rate-limited catch-up fetching -- MINECRAFT-566 comment
      * 55460: a road continuing as a SECOND, different OSM way ID (sharing only a node with the
      * first) whose geometry lies entirely in a neighbor cell cannot be found by the read-side

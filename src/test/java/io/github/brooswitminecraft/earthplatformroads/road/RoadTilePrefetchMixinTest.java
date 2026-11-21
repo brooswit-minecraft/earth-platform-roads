@@ -1185,9 +1185,16 @@ class RoadTilePrefetchMixinTest {
         // anywhere in this run has triggered it, so "no override set yet" does not imply "no live
         // source at all" -- the only reliably-testable property is the post-configuration state below.
         java.nio.file.Files.createDirectories(roadCache);
-        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
-        RoadNetwork.setTileSourceForTests(tileSource);
-        assertTrue(RoadPrefetch.hasLiveTileSource(), "Expected a configured tile source to be reported as live");
+        // MINECRAFT-566 comment 55534: a cache-only source (allowNetwork=false) is a real, non-null
+        // RoadTileSource that must NOT be reported as live -- hasLiveTileSource now checks actual
+        // live-fetch capability (RoadTileSource.canFetchLive), not mere non-null existence.
+        RoadTileSource cacheOnlySource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(cacheOnlySource);
+        assertTrue(!RoadPrefetch.hasLiveTileSource(), "Expected a cache-only (allowNetwork=false) tile source to NOT be reported as live");
+
+        RoadTileSource liveSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, true, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(liveSource);
+        assertTrue(RoadPrefetch.hasLiveTileSource(), "Expected a configured, live-capable tile source to be reported as live");
 
         EarthGenerator generator = bootAndBuildGenerator(demCache);
         double lat = 49.0005, lon = -114.0005;

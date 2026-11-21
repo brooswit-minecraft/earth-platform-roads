@@ -253,6 +253,20 @@ bump: minor
   a total budget). `MAX_PENDING_DEFER_ATTEMPTS` removed entirely -- the corrected, snapshot-gated
   design only ever needs one retry attempt, not a bounded count of them. No change to `loadNow`'s
   forced-load path (still an explicit separate control) or to any no-HTTP saved/forced semantics.
+- Fixed two more real gaps in that same fix, found by John's native checks (comment 55534): (1)
+  the INITIAL prefetch dispatch (before the first accepted `generate()` call) was never gated by
+  Y-relevance or live-fetch capability -- only the later defer retry was -- so a deep/sky cube
+  still sent its own initial fetch POST, and (2) `RoadPrefetch.hasLiveTileSource()` reported `true`
+  for any non-null `RoadTileSource`, including a cache-only instance (`allowNetwork=false`) that
+  can never resolve a fetch -- such an instance made zero POSTs but still entered this mixin's own
+  wait scheduling. Fixed by a new `RoadTileSource.canFetchLive()` accessor (checks `allowNetwork`
+  directly) that `hasLiveTileSource()` now uses instead of a plain non-null check, and by computing
+  the live-and-relevant gate once and sharing it between the initial dispatch and the defer
+  snapshot so the two can never drift apart again. Also fixed the defer window's own deadline to be
+  captured BEFORE the initial dispatch rather than after the first `generate()` call returns, so
+  `PENDING_DEFER_WINDOW` is now a genuine aggregate budget across the whole method -- the prior
+  version let a held response fail open at 4.26s against a nominal 3s window, since the window only
+  ever covered the retry's own slice.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it

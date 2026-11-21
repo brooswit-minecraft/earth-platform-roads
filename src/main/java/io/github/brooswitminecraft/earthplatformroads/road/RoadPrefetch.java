@@ -91,9 +91,20 @@ public final class RoadPrefetch {
      * an EXPLICIT gate for {@code ServerCubeWorldRoadPrefetchMixin}'s pending-surface-cube defer,
      * rather than relying only on {@link #isPendingForColumn}'s own implicit {@code null}-source
      * check (correct in effect, but John's own review asked this be an explicit, named condition).
+     *
+     * <p><b>Comment 55534, a real gap in the first version:</b> a plain non-null check also reports
+     * {@code true} for a cache-only instance ({@code RoadTileSource.canFetchLive() == false}, e.g.
+     * the "not opted into the preview provider" default) -- a real, non-null source that serves
+     * already-cached reads correctly but can never resolve a genuinely pending cell through its own
+     * fetch, so deferring/waiting for one is pure waste (independently observed: zero POSTs sent,
+     * but the defer path still entered its own wait scheduling). Fixed to check actual live-fetch
+     * capability, not mere existence -- {@link #isPendingForColumn}'s own cached-read behavior is
+     * deliberately untouched by this change, so a cache-only install's already-fetched data still
+     * reads normally; only THIS explicit "is it worth deferring for" gate changed.
      */
     public static boolean hasLiveTileSource() {
-        return RoadNetwork.liveTileSourceForPrefetch() != null;
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        return tiles != null && tiles.canFetchLive();
     }
 
     /**
