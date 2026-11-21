@@ -110,12 +110,27 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * {@code columns} map) plus {@link RoadPrefetch#surfaceGeneratorColumnKey} (replicating
  * {@code SurfaceGenerator}'s own private {@code columnKey} exactly, via the same real, public
  * fastutil {@code HashCommon.mix} it uses -- no accessor needed for that part): this injection now
- * evicts exactly the one column about to be generated, unconditionally, right before
- * {@code generate()} runs -- narrow, per-column invalidation, never a global cache clear, and free
- * in the ordinary case (nothing to evict yet, since {@code produce} only runs once per column
- * normally). Applies to BOTH the ordinary-streaming path and {@code loadNow}'s own arrival path
- * (not gated by {@link SynchronousLoadGuard}): the staleness risk is not specific to either one,
- * and evicting a map entry is not HTTP.
+ * evicts exactly the one column about to be generated, unconditionally -- narrow, per-column
+ * invalidation, never a global cache clear, and free in the ordinary case (nothing to evict yet,
+ * since {@code produce} only runs once per column normally). Applies to BOTH the
+ * ordinary-streaming path and {@code loadNow}'s own arrival path (not gated by
+ * {@link SynchronousLoadGuard}): the staleness risk is not specific to either one, and evicting a
+ * map entry is not HTTP.
+ *
+ * <h2>A real ordering bug in that fix, found by comment 55492 through pure logical review</h2>
+ * The first version evicted BEFORE dispatching/waiting on the fetch, leaving a window (up to
+ * {@link #PREFETCH_WAIT_BOUND}) during which some OTHER concurrent caller -- a {@code lowestGround}
+ * survey on the server tick thread, for example -- could re-populate this exact column's cache
+ * with ANOTHER premature decision, undoing the eviction before {@code generate()} ever benefited
+ * from it. Fixed by reordering: the dispatch/wait now runs first, and the eviction is the very
+ * LAST statement in this method, immediately before falling through into {@code generate()}.
+ * {@code loadNow}'s own arrival path has no wait to race against, so this reordering does not
+ * affect it. <b>Known, disclosed residual race, not fully closed:</b> {@code SurfaceGenerator}'s
+ * own {@code column()} cache fills via a plain, non-atomic get-then-compute-then-put, not
+ * {@code computeIfAbsent} -- a DIFFERENT, already-in-flight concurrent computation for this exact
+ * column, started before this eviction ran, can still publish its own (also premature) result
+ * AFTER this eviction, winning the race anyway. Closing that fully would mean owning
+ * {@code SurfaceGenerator}'s own caching logic entirely, not attempted here.
  *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
@@ -162,33 +177,48 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
                     target = "Lio/earthplatform/minecraft/cubic/gen/CubeGenerator;generate(IIILjava/util/List;Ljava/util/List;)Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
     private void earthplatformroads$prefetchBeforeOrdinaryGenerate(long key, int cubeX, int y, int cubeZ, CallbackInfoReturnable<?> cir) {
         if (!(generator instanceof EarthGenerator earthGenerator)) return;
+        // MINECRAFT-566 comment 55492, a real bug in the first version of this fix: evicting
+        // BEFORE the bounded wait below left a window (up to PREFETCH_WAIT_BOUND) during which
+        // some OTHER concurrent caller -- a lowestGround survey on the server tick thread, for
+        // example -- could re-populate this exact column's cache with ANOTHER premature decision,
+        // undoing the eviction before generate() ever benefited from it. The dispatch/wait must
+        // run FIRST; the eviction must be the very LAST thing this method does, as close as
+        // possible to the generate() call it is about to fall through into.
+        if (!SynchronousLoadGuard.isActive()) { // loadNow's arrival path: never fetch here
+            // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
+            // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
+            // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
+            // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
+            // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
+            // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
+            // time. Fixed by converting to this cube's own center block coordinate before dispatching --
+            // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
+            // center avoids ever landing exactly on a tile-boundary column by construction.
+            int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
+            int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
+            // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
+            // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
+            // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
+            // network wait happening on a dedicated background thread, never this one.
+            RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
+        }
         // MINECRAFT-566 comment 55486/55487, a real, independently-reproduced staleness bug found
         // in Earth Platform's own code: SurfaceGenerator permanently memoizes this column's whole
         // Surface[] decision the first time ANYTHING asks for it (lowestGround/ColumnSurvey, called
         // every tick for flying logic, well before road data need be ready) -- once cached, this
         // very generate() call about to run would hit that stale entry and never re-invoke
         // surface() at all, no matter how fresh the road data now is. Evict just this one column
-        // (never a global clear) right before generate() runs, unconditionally -- this is NOT
-        // gated by SynchronousLoadGuard, since it is not HTTP and the exact same staleness risk
-        // applies equally to loadNow's own arrival generate() call. Free in the ordinary case:
-        // produce() only ever runs once per column, so there was nothing legitimate to evict yet.
+        // (never a global clear), unconditionally -- this is NOT gated by SynchronousLoadGuard,
+        // since it is not HTTP and the exact same staleness risk applies equally to loadNow's own
+        // arrival generate() call. Free in the ordinary case: produce() only ever runs once per
+        // column, so there was nothing legitimate to evict yet.
+        //
+        // Known, disclosed residual race (comment 55492, not fully closed): SurfaceGenerator's own
+        // column() cache is filled via a plain, non-atomic get-then-compute-then-put, not
+        // computeIfAbsent -- a DIFFERENT, already-in-flight concurrent computation for this exact
+        // column, started before this eviction ran, can still publish its own (also premature)
+        // result AFTER this eviction, winning the race anyway. Narrowing this further would mean
+        // owning SurfaceGenerator's own caching logic entirely, not attempted here.
         RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
-        if (SynchronousLoadGuard.isActive()) return; // loadNow's arrival path: never fetch here
-        // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
-        // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
-        // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
-        // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
-        // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
-        // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
-        // time. Fixed by converting to this cube's own center block coordinate before dispatching --
-        // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
-        // center avoids ever landing exactly on a tile-boundary column by construction.
-        int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
-        int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
-        // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
-        // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
-        // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
-        // network wait happening on a dedicated background thread, never this one.
-        RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
     }
 }

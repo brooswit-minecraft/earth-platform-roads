@@ -523,6 +523,35 @@ generator instance, after `evictStaleSurfaceDecision`, correctly paints the real
 work) -- the mechanism (the accessor, the key replication, the eviction) is proven directly instead,
 against a real generator.
 
+### A real ordering bug in the eviction fix, found by comment 55492 through pure logical review
+
+The first version evicted BEFORE dispatching/waiting on the fetch (`RoadPrefetch.forColumnBounded`),
+not after. That left a window, up to `PREFETCH_WAIT_BOUND` wide, during which some OTHER
+concurrent caller -- a `lowestGround` survey landing on the server tick thread, for example --
+could re-populate this exact column's cache with ANOTHER premature decision, undoing the eviction
+before `generate()` ever actually benefited from it. **Fixed** by reordering
+`ServerCubeWorldRoadPrefetchMixin`'s injection: the dispatch/wait now runs first (skipped entirely
+during `loadNow`'s own arrival path, same as before), and the eviction is the very LAST statement
+in the method, immediately before falling through into `generate()`.
+
+**Known, disclosed residual race, still not fully closed:** `SurfaceGenerator`'s own `column()`
+cache fills via a plain, non-atomic get-then-compute-then-put (confirmed by reading its bytecode
+again), not `computeIfAbsent` -- a DIFFERENT, already-in-flight concurrent computation for this
+exact column, started before this eviction ran, can still publish its own (also premature) result
+AFTER this eviction, winning the race anyway. Closing that fully would mean owning
+`SurfaceGenerator`'s own caching logic entirely (e.g. replacing `column()` wholesale via Mixin), not
+attempted here -- a materially bigger, riskier change than a targeted reorder.
+
+**Verified** by `RoadTilePrefetchMixinTest
+.evictingAfterTheBoundedWaitSurvivesALowestGroundSurveyRacingInTheMiddleOfIt`, built exactly to
+John's own suggested methodology: a real HTTP stub holds its response back deliberately; the real
+dispatch sequence (`forColumnBounded` then, after it returns, `evictStaleSurfaceDecision` -- the
+SAME order `ServerCubeWorldRoadPrefetchMixin` now uses) runs on a background thread; once the
+request is confirmed actually in flight and holding, a `lowestGround` call for the SAME column
+deliberately races into the middle of the wait; the response is then released (comfortably before
+the bound); and the test asserts the real road still paints correctly despite that race -- proving
+the reorder, not just asserting it.
+
 ## MINECRAFT-566: road width, centerline and shoulder styling (comment 55484)
 
 A deliberately SEPARATE slice from the readiness/bounded-worker work above -- John explicitly asked

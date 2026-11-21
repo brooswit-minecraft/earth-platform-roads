@@ -1004,4 +1004,85 @@ class RoadTilePrefetchMixinTest {
                 || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
                 || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get());
     }
+
+    /**
+     * MINECRAFT-566 comment 55492, John's own suggested methodology: "hold a loopback response,
+     * trigger lowestGround on the same cold column after worker dispatch, then release READY
+     * before timeout and assert actual paint". Reproduces the exact race the first version of the
+     * eviction fix missed (evicting BEFORE the bounded wait, not after): drives the REAL dispatch
+     * sequence {@code ServerCubeWorldRoadPrefetchMixin} now uses -- {@code forColumnBounded}
+     * (dispatch+wait) FIRST, {@code evictStaleSurfaceDecision} LAST -- against a real
+     * {@code EarthGenerator}, with a {@code lowestGround} survey call deliberately landing in the
+     * MIDDLE of the wait (while the loopback response is held back), exactly modelling a
+     * concurrent {@code ColumnSurvey} tick racing the in-flight fetch.
+     */
+    @Test
+    void evictingAfterTheBoundedWaitSurvivesALowestGroundSurveyRacingInTheMiddleOfIt(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 44.0005, lon = -109.0005; // a fresh, never-used cell: 4400_-10900
+
+        var responseHeld = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555050,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Race Repro Street"},
+                  "geometry":[{"lat":44.0003,"lon":-109.0007},{"lat":44.0007,"lon":-109.0003}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            try {
+                responseHeld.await(); // held back until the test deliberately releases it
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] block = generator.block(lat, lon);
+            int columnX = block[0] >> 4, columnZ = block[1] >> 4;
+
+            // Exactly ServerCubeWorldRoadPrefetchMixin's own sequence: dispatch+wait FIRST, on a
+            // background thread (modelling the real generation-worker thread), with a bound long
+            // enough to outlast this test's own deliberate delay below.
+            Duration bound = Duration.ofSeconds(5);
+            var waitThread = new Thread(() -> RoadPrefetch.forColumnBounded(generator, block[0], block[1], bound));
+            waitThread.start();
+
+            // Wait for the real request to actually be dispatched and holding (not just
+            // "started the thread") before racing lowestGround into the middle of it.
+            for (int i = 0; i < 100 && requests.get() == 0; i++) Thread.sleep(20);
+            assertEquals(1, requests.get(), "Sanity: the request must already be dispatched and holding before the race below");
+
+            // While that fetch is still in flight (response held back), a lowestGround survey for
+            // the SAME column lands in the middle of the wait -- modelling ColumnSurvey's own
+            // every-tick call racing the in-flight fetch, on what would be the server thread.
+            generator.lowestGround(columnX, columnZ);
+
+            // Now release the held response -- READY arrives comfortably before the bound expires.
+            responseHeld.countDown();
+            waitThread.join(bound.toMillis() + 2000);
+            assertTrue(!waitThread.isAlive(), "Expected the bounded wait to have actually returned");
+
+            // Exactly ServerCubeWorldRoadPrefetchMixin's own sequence: eviction LAST, after the wait.
+            RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+
+            int ground = generator.surfaceY(block[0], block[1]);
+            int cubeY = ground >> 4;
+            var state = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+            assertTrue(isAnyRoadSurfaceMaterial(state),
+                    "Expected the real road to paint despite the lowestGround survey racing in the middle of the wait, got " + state);
+        } finally {
+            responseHeld.countDown(); // in case of an early assertion failure, never leave the stub thread blocked
+            stub.stop(0);
+        }
+    }
 }

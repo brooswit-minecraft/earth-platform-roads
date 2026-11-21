@@ -127,6 +127,18 @@ bump: minor
   `produce()`-triggered `generate()` call, both the ordinary-streaming and arrival paths. Verified
   by directly reproducing John's own methodology against a real `EarthGenerator`.
 
+### Fixed (comment 55492)
+- A real ordering bug in the eviction fix above: it evicted BEFORE dispatching/waiting on the
+  fetch, not after, leaving a window during which a concurrent `lowestGround` survey (or similar)
+  could re-populate the same column's stale decision before `generate()` ever benefited from the
+  eviction. Fixed by reordering: dispatch/wait first, eviction last, immediately before
+  `generate()`. Verified with a test built to the exact suggested methodology: a held-back HTTP
+  response, a `lowestGround` call deliberately racing into the middle of the wait, then release
+  before the bound -- proving the real road still paints despite the race. A narrower, disclosed
+  residual race (an already-in-flight, non-atomic `SurfaceGenerator` cache computation that started
+  before the eviction can still publish after it) remains open; closing it fully would mean owning
+  that upstream caching logic entirely.
+
 ### Changed (comment 55484, a separate styling slice from the readiness work above)
 - Roughly doubled every `RoadClass`'s paved half-width (and the lanes-based formula the same way)
   per John's live-playtest feedback that roads read as too narrow. Never required any migration:
