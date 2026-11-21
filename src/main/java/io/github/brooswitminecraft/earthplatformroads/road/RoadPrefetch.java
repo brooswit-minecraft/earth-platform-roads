@@ -21,11 +21,34 @@ import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 public final class RoadPrefetch {
     private RoadPrefetch() {}
 
+    /**
+     * @param x BLOCK x-coordinate (NOT a cube/chunk index) -- passed straight into
+     *          {@code EarthGenerator.grid().geographic(x, z)}, which expects block coordinates.
+     *          MINECRAFT-566 comment 55476: {@code ServerCubeWorldRoadPrefetchMixin}'s first version
+     *          passed {@code ServerCubeWorld.produce}'s raw CUBE index here instead (confirmed by
+     *          reading {@code ServerCubeWorld} itself -- {@code loadNow}'s own block-to-cube shift
+     *          feeds that exact parameter), silently querying the wrong map tile on almost every
+     *          call. Any caller with a cube/chunk index, not a block coordinate, MUST convert first
+     *          (e.g. {@code (cubeX << 4) + 8} for that cube's own center) before calling this.
+     * @param z BLOCK z-coordinate -- see {@code x}'s own doc; the same contract applies.
+     */
     public static void forColumn(EarthGenerator generator, int x, int z) {
         RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
         if (tiles == null) return;
         GeoPoint point = generator.grid().geographic(x, z);
         tiles.waysForCell(point.latitude(), point.longitude());
         tiles.enqueueLookahead(point.latitude(), point.longitude());
+    }
+
+    /**
+     * A cube/chunk index's own center BLOCK coordinate along one axis -- the conversion
+     * {@code ServerCubeWorldRoadPrefetchMixin} needs before calling {@link #forColumn} with
+     * {@code ServerCubeWorld.produce}'s cube indices (see comment 55476, and that mixin's own doc).
+     * Pulled out as its own named, directly testable function rather than left inline, specifically
+     * so a regression test can assert the exact converted coordinate (and bbox it leads to) without
+     * needing a real {@code ServerCubeWorld}/{@code ServerLevel} to exercise the mixin itself.
+     */
+    public static int cubeIndexToBlockCenter(int cubeIndex) {
+        return (cubeIndex << 4) + 8;
     }
 }

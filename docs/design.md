@@ -327,6 +327,36 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   injection points actually weave and fire as written against the real `ServerCubeWorld` class;
   NeoForge's `gameTestServer` run (a real dedicated server) is the sanctioned mechanism for that and
   is not attempted here.
+- **A real "wrong tile" bug in the fix above, found by comment 55476 through pure logical review of
+  both codebases -- no Zippy access needed.** `produce`'s `x`/`z` are CUBE indices (confirmed by
+  `loadNow`'s own `pos.getX() >> 4` block-to-cube shift feeding that exact parameter), not the BLOCK
+  coordinates `RoadPrefetch.forColumn` actually expects (the same contract `prepare`/`prepareNear`'s
+  own callers already honor) -- the first version of `ServerCubeWorldRoadPrefetchMixin` passed the
+  raw cube index straight through, querying entirely the wrong map tile (off by a factor of 16) on
+  almost every call. **Fixed** by a new `RoadPrefetch.cubeIndexToBlockCenter(int)` (`(cubeIndex << 4)
+  + 8`), pulled out as its own named, directly testable function rather than left inline, called on
+  both `x` and `z` before dispatching; `RoadPrefetch.forColumn`'s own javadoc now names the block-
+  coordinate contract explicitly to prevent a repeat. `RoadTilePrefetchMixinTest
+  .ordinaryStreamingPrefetchConvertsCubeIndexToBlockCoordinatesNotTheRawCubeBbox` proves it: an
+  off-origin, nonzero/negative cube index, a real HTTP stub, asserting the real POST bbox matches
+  the CORRECT (block-center) cell and explicitly asserting ZERO requests match the buggy raw-cube-
+  index bbox (not just "some bbox was sent").
+  **Also raised by 55476, deliberately NOT attempted this pass (named, not hidden):** (1) a tall
+  column spans many cube-Y layers, each independently missing storage and calling this same
+  dispatch for the same X/Z -- correct (per-cell lock/memory cache dedupe it) but potentially
+  wasteful, and on a small worker pool could have several worker threads blocked on one cell's lock
+  at once; 55476 asks for demand to be coalesced per X/Z without blocking generation workers at all,
+  a materially bigger redesign than this pass's scope. (2) 55476's suggestion to bracket the guard
+  with `finally` rather than HEAD/RETURN: `loadNow`'s only other call, `adoptReady`, is NOT fully
+  wrapped in try/catch internally (e.g. `server.getPoiManager().checkConsistencyWithBlocks`,
+  `BlockEntity.loadStatic` can throw) -- an uncaught exception there would skip the RETURN-site
+  `exit()`, leaving that one thread's `SynchronousLoadGuard` stuck active forever. Plain Mixin
+  `@Inject` has no built-in try/finally-equivalent injection point; a real fix needs either a
+  bytecode-level wrap or restructuring the guard's lifecycle, neither attempted here. The failure
+  direction is safe (that thread would simply stop prefetching, never incorrectly fetch during an
+  arrival), and `loadNow` is documented as a direct, synchronous call (not dispatched through
+  `workers`), so this is believed not to reach the ordinary-streaming worker threads in practice --
+  but this is a belief, not something this pass verified, and is named here rather than left silent.
 - **Not attempted this pass, named explicitly as still-open:** separate readiness handling for
   Chunky pre-generation specifically (`ServerCubeWorld.pregenerate`/`ChunkyCompat.pregenerate` call
   `generate()` directly, off the travel/teleport path `prepareNear` covers -- and now off the

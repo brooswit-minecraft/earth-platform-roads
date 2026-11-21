@@ -66,6 +66,17 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * <p>{@code pregenerate} (Chunky's own direct-{@code generate()} path, a separately disclosed gap)
  * is untouched by this mixin, as is anything on the server tick thread itself.
  *
+ * <h2>A real "wrong tile" bug, found by comment 55476 through pure logical review of both
+ * codebases -- no Zippy access needed</h2>
+ * The injected method's {@code x}/{@code z} parameters are {@code produce}'s own, which are CUBE
+ * indices (confirmed by {@code loadNow}'s own {@code pos.getX() >> 4} block-to-cube shift feeding
+ * that exact same parameter), not the BLOCK coordinates {@link RoadPrefetch#forColumn} actually
+ * expects (the same contract {@code EarthGeneratorPrepareMixin}'s {@code prepare}/{@code prepareNear}
+ * callers already honor). The first version of this mixin passed the raw cube index straight
+ * through, querying entirely the wrong map tile (off by a factor of 16) on almost every call. Fixed
+ * by converting to the cube's own center block coordinate, {@code (cubeX << 4) + 8} /
+ * {@code (cubeZ << 4) + 8}, before dispatching -- see the injection method's own inline comment.
+ *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
  * {@code loadNow} methods themselves: doing so needs a real {@code ServerLevel}, which (unlike
@@ -99,9 +110,20 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
     @Inject(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
             at = @At(value = "INVOKE",
                     target = "Lio/earthplatform/minecraft/cubic/gen/CubeGenerator;generate(IIILjava/util/List;Ljava/util/List;)Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
-    private void earthplatformroads$prefetchBeforeOrdinaryGenerate(long key, int x, int y, int z, CallbackInfoReturnable<?> cir) {
+    private void earthplatformroads$prefetchBeforeOrdinaryGenerate(long key, int cubeX, int y, int cubeZ, CallbackInfoReturnable<?> cir) {
         if (SynchronousLoadGuard.isActive()) return; // loadNow's arrival path: never fetch here
         if (!(generator instanceof EarthGenerator earthGenerator)) return;
-        RoadPrefetch.forColumn(earthGenerator, x, z);
+        // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
+        // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
+        // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but
+        // RoadPrefetch.forColumn (shared with EarthGeneratorPrepareMixin, whose prepare/prepareNear
+        // callers supply real BLOCK coordinates) expects block coordinates. Passing a cube index
+        // straight through queried entirely the wrong map tile (off by a factor of 16) almost every
+        // time. Fixed by converting to this cube's own center block coordinate before dispatching --
+        // any point inside the cube is fine for a tile-granularity (CELL_DEGREES) lookup, and the
+        // center avoids ever landing exactly on a tile-boundary column by construction.
+        int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
+        int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
+        RoadPrefetch.forColumn(earthGenerator, centerBlockX, centerBlockZ);
     }
 }

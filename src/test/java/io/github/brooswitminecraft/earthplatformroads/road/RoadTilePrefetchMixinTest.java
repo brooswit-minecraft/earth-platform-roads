@@ -553,6 +553,77 @@ class RoadTilePrefetchMixinTest {
     }
 
     /**
+     * MINECRAFT-566 comment 55476: a confirmed "wrong tile" bug -- {@code ServerCubeWorld.produce}'s
+     * x/z are CUBE indices, not the BLOCK coordinates {@code RoadPrefetch.forColumn} actually
+     * expects (the same contract {@code prepare}/{@code prepareNear}'s own callers already honor).
+     * This drives the exact fixed call sequence (cube index -&gt;
+     * {@code RoadPrefetch.cubeIndexToBlockCenter} -&gt; {@code RoadPrefetch.forColumn}) with an
+     * off-origin, nonzero/negative cube index against a real HTTP stub, asserting the real POST
+     * bbox matches the CORRECT (block-center) cell and explicitly RULING OUT the wrong, raw-cube-
+     * index bbox the original bug would have requested instead -- not just that some bbox was sent.
+     */
+    @Test
+    void ordinaryStreamingPrefetchConvertsCubeIndexToBlockCoordinatesNotTheRawCubeBbox(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        var grid = generator.grid();
+
+        // An off-origin, nonzero/negative cube index pair -- large enough in magnitude that treating
+        // it AS a block coordinate (the bug) and converting it to its real block-center (the fix)
+        // land in two entirely different, non-adjacent 0.01-degree cells (a difference of ~15*16
+        // blocks here is many kilometres, far more than one cell's own ~1.1km span).
+        int cubeX = -12345, cubeZ = 6789;
+        int fixedBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
+        int fixedBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
+        assertEquals(cubeX, fixedBlockX >> 4, "Sanity: the converted block coordinate must still round-trip to the same cube index");
+        assertEquals(cubeZ, fixedBlockZ >> 4, "Sanity: the converted block coordinate must still round-trip to the same cube index");
+
+        var correctPoint = grid.geographic(fixedBlockX, fixedBlockZ);
+        var buggyPoint = grid.geographic(cubeX, cubeZ); // what the ORIGINAL bug would have queried: the raw cube index used as a block coordinate
+        long correctCellLat = (long) Math.floor(correctPoint.latitude() / RoadNetwork.CELL_DEGREES);
+        long correctCellLon = (long) Math.floor(correctPoint.longitude() / RoadNetwork.CELL_DEGREES);
+        long buggyCellLat = (long) Math.floor(buggyPoint.latitude() / RoadNetwork.CELL_DEGREES);
+        long buggyCellLon = (long) Math.floor(buggyPoint.longitude() / RoadNetwork.CELL_DEGREES);
+        assertTrue(correctCellLat != buggyCellLat || correctCellLon != buggyCellLon,
+                "Sanity: the chosen cube index must make the buggy and fixed cells genuinely different, or this test cannot distinguish them");
+
+        AtomicInteger correctCellRequests = new AtomicInteger(), buggyCellRequests = new AtomicInteger();
+        double correctMinLat = correctCellLat * RoadNetwork.CELL_DEGREES, correctMinLon = correctCellLon * RoadNetwork.CELL_DEGREES;
+        double buggyMinLat = buggyCellLat * RoadNetwork.CELL_DEGREES, buggyMinLon = buggyCellLon * RoadNetwork.CELL_DEGREES;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        stub.createContext("/", exchange -> {
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            if (matcher.find()) {
+                double minLat = Double.parseDouble(matcher.group(1)), minLon = Double.parseDouble(matcher.group(2));
+                if (Math.abs(minLat - correctMinLat) < 1e-9 && Math.abs(minLon - correctMinLon) < 1e-9) correctCellRequests.incrementAndGet();
+                if (Math.abs(minLat - buggyMinLat) < 1e-9 && Math.abs(minLon - buggyMinLon) < 1e-9) buggyCellRequests.incrementAndGet();
+            }
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            // Exactly what ServerCubeWorldRoadPrefetchMixin's injection does after its fix. (Also
+            // triggers one opportunistic lookahead-neighbor request, same as prepare/prepareNear's
+            // own prefetch -- irrelevant to this test, which only cares about the correct vs. buggy
+            // cell, not the total request count.)
+            RoadPrefetch.forColumn(generator, fixedBlockX, fixedBlockZ);
+
+            assertTrue(correctCellRequests.get() >= 1, "Expected at least one request matching the CORRECT (block-center) cell's bbox");
+            assertEquals(0, buggyCellRequests.get(), "Expected NO request matching the buggy raw-cube-index bbox");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
      * MINECRAFT-566 comment 55464's explicit ask: a cooldown-declined lookahead-queue entry must
      * stay pending/eligible for a LATER attempt (never permanently lost), repeated calls during the
      * same cooldown window must not create duplicate queue entries or a burst of requests ("without
