@@ -422,14 +422,41 @@ bump: minor
   version (tracking exactly which column actually depends on which cell) would narrow this further
   but was not attempted, since the coarse version is already safe in the one direction that matters
   (never under-evicts) and the measured "vertical sibling" case above shows it already eliminates
-  the real repeated-work stampede for the common case this comment described. The "hot cached
-  two-world" half of John's own ask (a SECOND, separately-booted generator/world sharing the same
-  on-disk cache root) is covered by the existing `aFreshSourceOverTheSameCacheRootDoesNotRefetch`-
-  style "native reopen" tests above, which already prove a fresh instance reads real disk state
-  correctly and never shares stale in-memory state across instances; a full second-world fixture
-  exercising the actual ordinary-movement mixin end to end (rather than `RoadTileSource` directly)
-  was not additionally built, for the same disclosed "no real `ServerCubeWorld`/`ServerLevel`
-  harness" gap named throughout this whole file.
+  the real repeated-work stampede for the common case this comment described.
+
+### Fixed (comment 55564, two real bugs found by John's own independent native QA of 5bb0b6c)
+- **Bug 1, cross-generator isolation:** the eviction-generation tracking map above was keyed by
+  packed column X/Z ALONE, in a single `static` map shared by every `EarthGenerator` instance. Two
+  SEPARATE generators (two different worlds, or a fresh instance after a world reload) touching the
+  identical column X/Z could suppress EACH OTHER's first eviction, even though evicting is always
+  scoped to whichever generator instance is actually passed in -- generator B's own `
+  SurfaceGenerator` cache was never touched by generator A's eviction at all, yet B's own first
+  touch would have been wrongly skipped. This directly contradicted the previous round's own
+  disclosure above, which incorrectly claimed the "hot cached two-world" case was already covered by
+  the existing `RoadTileSource`-level "native reopen" tests -- those tests prove `RoadTileSource`
+  itself is correctly scoped per instance, but never exercised the SEPARATE, newly-added
+  `RoadPrefetch`-level tracking map at all, which is where this real bug actually lived. Fixed by
+  rescoping the tracking to a `WeakHashMap<EarthGenerator, ...>` outer map (identity-keyed --
+  `EarthGenerator` is a real `final` class that never overrides `equals`/`hashCode`, confirmed by
+  reading it, so default reference identity is exactly right; a discarded generator's own entry can
+  also be reclaimed once nothing else references it, bounding growth across world reloads). Proven
+  by a new test, `twoSeparateGeneratorsAtTheIdenticalColumnDoNotSuppressEachOthersFirstEviction`:
+  two real, separately-booted generators at the identical column X/Z each get their own genuinely
+  first eviction.
+- **Bug 2, record-before-evict ordering:** the new generation was recorded in the tracking map
+  BEFORE the eviction itself ran, leaving a window in which a competing, already-in-flight `column()`
+  computation (the same residual race comment 55496's own doc section discloses, at a different
+  point in the same pipeline) could publish a stale result into the now-recorded-fresh slot --
+  every LATER call at that same generation would then trust the stale cache without ever
+  re-evicting to catch it. Fixed by reordering to evict first, record second, narrowing (not
+  eliminating -- this is the same already-disclosed residual race class, not a new one) the window,
+  matching the identical reordering precedent comment 55492 already established for the sibling
+  eviction call site.
+- "Preserve scoped warm reuse," "do not wait... keep [the other two fixes] independently shippable":
+  both honored -- the inner per-generator map's own shape/semantics, and the already-landed one-pass
+  scan and `RoadTileSource` memory-cache fixes from comment 55562, are entirely unchanged by this
+  round; only which generator instance's own map gets consulted, and the record/evict order, changed.
+  98/98 tests pass (`./gradlew compileJava compileTestJava test --rerun`).
 
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just

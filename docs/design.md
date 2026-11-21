@@ -1421,11 +1421,48 @@ was removed, never a correctness check.
 
 Not attempted this round, disclosed explicitly: `resolvedGeneration`'s coarseness (see Bug 1's own
 fix above); a full second-"world" fixture exercising the real ordinary-movement mixin end to end
-through an actual `ServerCubeWorld`/`ServerLevel` for the "hot cached two-world" half of John's own
-ask (the same disclosed "no real `ServerCubeWorld`/`ServerLevel` test harness" gap named throughout
-this whole file) -- the "native reopen" tests above cover the same underlying claim
-(`RoadTileSource` itself never shares stale in-memory state across a restart) at the layer this
-harness can actually drive directly.
+through an actual `ServerCubeWorld`/`ServerLevel`.
+
+## MINECRAFT-566: two real bugs in the eviction-gating mechanism above, found by John's own independent native QA of 5bb0b6c (comment 55564)
+
+This round's own disclosure above claimed the "hot cached two-world" case was already covered by
+the "native reopen" tests proving `RoadTileSource` never shares stale in-memory state across a
+restart -- that claim was WRONG about where the actual risk lived. Those tests prove
+`RoadTileSource` itself is correctly scoped per instance; they never exercised the SEPARATE,
+newly-added `RoadPrefetch`-level eviction-generation tracking map at all, which is exactly where
+John's own independent native QA found a real bug.
+
+**Bug 1 -- cross-generator isolation.** The tracking map (`lastEvictedGenerationByColumn` in the
+previous version) was keyed by packed column X/Z alone, in a single `static` map shared by every
+`EarthGenerator` instance. Two SEPARATE generators (two different worlds, or a fresh instance after
+a world reload -- the same "stale generator instance" scenario comments 55486/55487 already
+established is real) touching the identical column X/Z could suppress EACH OTHER's first eviction:
+generator A records generation N for column (3,5); generator B, an entirely different instance that
+also happens to touch column (3,5) at its own generation N, would see "already evicted this exact
+generation" and wrongly skip -- even though evicting is always scoped to whichever generator
+instance is actually passed in, and B's own `SurfaceGenerator` cache was never touched by A's
+eviction at all. Fixed by rescoping to a `WeakHashMap<EarthGenerator, ConcurrentHashMap<Long,Long>>`
+(identity-keyed outer map -- `EarthGenerator` is a real `final` class that never overrides
+`equals`/`hashCode`, confirmed by reading it, so default reference identity is exactly right; a
+discarded generator's own entry can also be reclaimed once nothing else references it, bounding
+growth across world reloads -- answering "the map also grows as new columns are visited" at the
+per-generator level, though one long-lived generator's own inner map still grows with the columns it
+actually visits, same as originally accepted). Proven directly:
+`twoSeparateGeneratorsAtTheIdenticalColumnDoNotSuppressEachOthersFirstEviction`.
+
+**Bug 2 -- record-before-evict ordering.** The new generation was recorded in the tracking map
+BEFORE the eviction itself ran, leaving a window in which a competing, already-in-flight `column()`
+computation (the same residual race comment 55496's own doc section discloses, at a different point
+in the same pipeline) could publish a stale result into the now-recorded-fresh slot -- every LATER
+call at that same generation would then trust the stale cache without ever re-evicting to catch it.
+Fixed by reordering to evict first, record second: this narrows (does not eliminate -- the same
+already-disclosed residual race class, not a new one) the window, matching the identical reordering
+precedent comment 55492 already established for the sibling eviction call site in
+`ServerCubeWorldRoadPrefetchMixin` itself.
+
+Per John's own explicit instruction, the other two fixes from comment 55562 (the one-pass scan
+dedup, the `RoadTileSource` memory cache) were NOT held up waiting on this -- both ship unchanged
+in the same commit as these two fixes, on the same already-opened PR #4. 98/98 tests pass.
 
 ## Compile/test-time-only dependency, not a fork
 

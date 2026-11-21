@@ -1475,4 +1475,48 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55564, the first of two real bugs John's own independent native QA
+     * found in the eviction-gating mechanism above: the first version keyed its tracking by packed
+     * X/Z ALONE, in a single map shared by every {@code EarthGenerator} instance -- so two SEPARATE
+     * generators (two different worlds, or a fresh instance after a reload) touching the identical
+     * column could suppress EACH OTHER's first eviction, even though evicting is always scoped to
+     * whichever generator instance is actually passed in, and generator B's own {@code
+     * SurfaceGenerator} cache was never touched by generator A's eviction at all. Proves the fix
+     * directly: two real, separately-booted generators at the IDENTICAL column X/Z each get their
+     * own genuinely-first eviction -- generator B's own first touch must NOT be skipped just because
+     * generator A already touched that same X/Z.
+     */
+    @Test
+    void twoSeparateGeneratorsAtTheIdenticalColumnDoNotSuppressEachOthersFirstEviction(
+            @TempDir Path demCacheA, @TempDir Path demCacheB, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadPrefetch.clearEvictionTrackingForTests();
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+
+        // Two entirely separate EarthGenerator instances (modelling two separate worlds), each with
+        // its OWN demCache -- but deliberately evicting at the SAME column X/Z index on both, since
+        // the bug is specifically about two DIFFERENT generator instances colliding on identical
+        // column coordinates.
+        EarthGenerator generatorA = bootAndBuildGenerator(demCacheA);
+        EarthGenerator generatorB = bootAndBuildGenerator(demCacheB);
+        int columnX = 777, columnZ = -333; // arbitrary, shared by both generators on purpose
+
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
+                "Expected generator A's first touch of this column to evict");
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
+                "Expected generator A's own sibling touch of the SAME column to still be correctly skipped");
+
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorB, columnX, columnZ, true),
+                "Expected generator B's first touch of the IDENTICAL column X/Z to evict too -- a DIFFERENT generator instance must never be suppressed by A's own already-recorded eviction");
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorB, columnX, columnZ, true),
+                "Expected generator B's own sibling touch to now be correctly skipped, scoped to B alone");
+
+        // Confirms A's own tracking is still intact and independent of B's: A should still correctly
+        // skip (no real resolution happened anywhere since A's own last eviction).
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
+                "Expected generator A's own tracking to remain correctly skipped, unaffected by generator B's activity");
+    }
 }
