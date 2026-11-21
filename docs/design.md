@@ -1290,6 +1290,74 @@ John's own native control describes (A active, B queued, C challenging at the fi
 -- the same disclosed harness gap as the rest of this class; his own native infrastructure is what
 found this and will confirm the fix.
 
+## MINECRAFT-566: the first forced-caller slice -- Earth Platform geographic travel only (comments 55551/55552)
+
+Once the ordinary-movement mechanism was confirmed native (comment 55549), John asked for the next
+forced-caller slice as its own SEPARATE candidate, deliberately narrow: Earth Platform's own
+`/earth travel` arrival queue only -- not generic `loadNow`, portal placement, respawn, or Sable,
+all explicitly out of scope.
+
+**Reading the real, decompiled `CubicEvents` class** confirmed the exact mechanism John's own
+comments described: `CubicEvents.arrive` (called every tick) walks a static `ARRIVALS` queue; for
+each entry it computes the landing column's ground height and calls `cubes.readyAround(pos)` -- a
+cheap, non-blocking check of whether the destination's 3x3x3 cube neighborhood already exists in
+memory. If not ready and the arrival has waited fewer than 200 ticks (`ARRIVAL_PATIENCE`, ~10s at
+20 TPS), it just increments `waited` and tries again next tick -- already an async, never-blocks
+pattern, built into Earth Platform itself. Only once ready, or that patience exhausts, does it call
+`standOn` -> `loadAround` -> Earth Platform's own synchronous, forcing `loadNow` fallback, then
+teleport. The gap: `readyAround` only ever asks about TERRAIN, never this mod's own road data for
+the same footprint -- a destination whose terrain generates quickly but whose road tile is still
+pending falls through the unrelated 200-tick clock into the same forced-adopt-and-permanently-save
+bug comment 55549 already confirmed natively for this exact command.
+
+**The fix extends the SAME existing wait rather than building a new one** (per John's own explicit
+warning in comment 55552 against a new token/callback and its lifecycle risks): a new
+`CubicEventsArrivalRoadGateMixin` redirects exactly the two calls `arrive` already makes for this
+purpose, both scoped to that one method:
+- `ServerCubeWorld.readyAround(BlockPos)`: calls the real method first (terrain readiness,
+  unchanged), and if terrain IS ready, additionally checks
+  `RoadPrefetch.isAnyRelevantCellPendingNearBlock` across the SAME 3x3x3 cube neighborhood
+  `readyAround`/`loadAround` both traverse -- confirmed by John's own source review (comment 55552)
+  to be identical, never a broader speculative one. Dispatches
+  (`RoadPrefetch.dispatchRelevantCellFetchesNearBlock`, fire-and-forget) so the fetch actually gets
+  a chance to happen. If road data is pending, reports "not ready" even though terrain is, and sets
+  a plain static flag for the very next statement this same tick.
+- The ONE `List.set(int, Object)` call `arrive` makes right after a "not ready" result (persisting
+  the incremented `waited` back into the queue): when that flag was just set, this is a deliberate
+  no-op (returns the list's own current, unincremented element instead) -- `waited` never advances
+  while road data is the actual reason for waiting, so the 200-tick patience genuinely never
+  exhausts for that reason. An ordinary terrain-not-ready tick is completely untouched.
+
+This single-tick, stateless design deliberately avoids comment 55552's own token/lifecycle concern
+entirely: there is no callback or persistent per-arrival object that could outlive a tick, supersede
+a newer trip, or need releasing on disconnect/cancel/world-unload -- nothing survives past the one
+`List.set` redirect that consumes the flag each tick. Player disconnect is handled by `arrive`'s
+own, completely unmodified `isRemoved()` check, which runs before this mixin's hooks are reached
+again for that arrival.
+
+**Verification:** `./gradlew compileJava` succeeds against the real `libs/earthplatform-0.1.0-alpha.73.jar`
+dependency -- Mixin's own annotation processor validates injector target descriptors (method
+signatures, field/call targets) against the ACTUAL target classpath at compile time, so a clean
+compile here is meaningfully stronger evidence than ordinary javac success alone that these exact
+redirect targets (`arrive`'s own descriptor, `readyAround`'s, `List.set`'s) are real. A new
+`RoadTilePrefetchMixinTest` case directly proves the two new `RoadPrefetch` methods
+(`isAnyRelevantCellPendingNearBlock`/`dispatchRelevantCellFetchesNearBlock`) against a real,
+entirely-cold synthetic fixture. 92/92 tests pass.
+
+**Known, disclosed limitations of this exact candidate:**
+- The two new `RoadPrefetch` methods re-scan the full 3x3x3 neighborhood's natural-height footprint
+  fresh on EVERY tick an arrival stays held, rather than resolving and caching that footprint once
+  (John's own "resolve the spot/footprint off-thread, use cheap readiness checks in the tick"
+  framing asks for the latter). Not attempted here, given how few concurrent arrivals this queue
+  realistically ever holds -- a disclosed, not-yet-attempted optimization, not a correctness gap.
+- No test in this repository drives the real, compiled `CubicEvents.arrive` method itself, for the
+  same reason no test drives `ServerCubeWorld.produce` directly -- the same disclosed harness gap
+  as every mixin in this mod. John's own described native boundary fixture (seed a real arrival at
+  `waited=199` with a cold loopback tile, instrument `standOn` to confirm it does not run at tick
+  200 while pending, and does run once after the footprint resolves) is exactly the right test for
+  this and is not something this harness can reproduce -- his own native infrastructure is what
+  will confirm whether these exact Mixin redirects actually weave and fire as written.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

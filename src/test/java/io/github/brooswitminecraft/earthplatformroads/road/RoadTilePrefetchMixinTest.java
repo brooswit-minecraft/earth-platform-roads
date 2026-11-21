@@ -1286,4 +1286,61 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55551: {@code CubicEventsArrivalRoadGateMixin} needs the SAME
+     * pending/dispatch questions {@code isAnyRelevantCellPending}/{@code dispatchRelevantCellFetches}
+     * answer, but around a real BLOCK position (an arrival's own landing column) rather than a cube
+     * index -- John's own source confirmation (comment 55552): {@code readyAround}/{@code
+     * loadAround} both traverse the identical 3x3x3 cube neighborhood around that position. Entirely
+     * cold boot, mirroring the cube-level test: no fixture, no cache file, real HTTP stub.
+     */
+    @Test
+    void isAnyRelevantCellPendingNearBlockAndItsDispatchCounterpartWorkCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555099,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Arrival Test Road"},
+                  "geometry":[{"lat":48.0010,"lon":-118.0050},{"lat":48.0060,"lon":-118.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 48.0035, lon = -118.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int ground = generator.surfaceY(block[0], block[1]);
+
+            assertTrue(RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
+                    "Expected the 3x3x3 cube neighborhood around this never-fetched landing column to be reported pending");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground + 500, block[1]),
+                    "Expected a landing position far ABOVE natural ground to NOT be reported pending regardless of cell state");
+
+            RoadPrefetch.dispatchRelevantCellFetchesNearBlock(generator, block[0], ground, block[1]); // fire-and-forget: must not block this thread
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchRelevantCellFetchesNearBlock to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
+                    "Expected the SAME landing position to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
 }

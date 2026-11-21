@@ -244,6 +244,41 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55551: the geographic-travel arrival wait needs the SAME "is relevant
+     * road data pending" question {@link #isAnyRelevantCellPending} answers for a generation-time
+     * cube, but asked around a real BLOCK position rather than a cube index -- John's own source
+     * confirmation (comment 55552): {@code ServerCubeWorld.readyAround}/{@code loadAround} both
+     * traverse the identical 3x3x3 CUBE neighborhood around {@code (x >> 4, y >> 4, z >> 4)}, so
+     * this checks that exact same neighborhood, never a broader one.
+     */
+    public static boolean isAnyRelevantCellPendingNearBlock(EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        int cx = blockX >> 4, cy = blockY >> 4, cz = blockZ >> 4;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    if (isAnyRelevantCellPending(generator, cx + dx, cy + dy, cz + dz)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55551: the dispatch counterpart to
+     * {@link #isAnyRelevantCellPendingNearBlock}, for the exact same 3x3x3 cube neighborhood.
+     */
+    public static void dispatchRelevantCellFetchesNearBlock(EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        int cx = blockX >> 4, cy = blockY >> 4, cz = blockZ >> 4;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    dispatchRelevantCellFetches(generator, cx + dx, cy + dy, cz + dz);
+                }
+            }
+        }
+    }
+
+    /**
      * A cube/chunk index's own center BLOCK coordinate along one axis -- the conversion
      * {@code ServerCubeWorldRoadPrefetchMixin} needs before calling {@link #forColumn} with
      * {@code ServerCubeWorld.produce}'s cube indices (see comment 55476, and that mixin's own doc).
