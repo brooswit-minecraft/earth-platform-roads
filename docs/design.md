@@ -1061,6 +1061,47 @@ instead of one sample point, which the new tests directly exercise. 89/89 tests 
 cases, one updated to the new 3-argument signature with a real on-road fixture rather than an
 arbitrary off-road sample point).
 
+## MINECRAFT-566: the Y-filter cannot require mapped geometry before a fetch (comment 55539)
+
+John's native checks against `0c4521c` ran an "exact cold-bootstrap" regression: no bundled or
+adjacent geometry, no cache files, no earlier prepare call -- a genuinely fresh install's first walk
+into fresh terrain, with a healthy loopback provider ready to respond. BOTH real workers (a plain
+flat case, and the 55537 upper-first case) saved grass with ZERO prefetch calls and ZERO POSTs at
+all, tile left genuinely PENDING. A separate, explicit fixture-only fetch then correctly painted
+yellow pavement in fresh versions of both -- confirming the provider and data path are fine; only
+this gate's own precondition was wrong.
+
+**Root cause:** the 55537 fix required each sampled column to be `RoadNetwork.segmentCoveringColumn`
+-covered before its natural ground height counted toward relevance at all. But mapped geometry for
+a cell only exists AFTER that cell has been successfully fetched -- a cell that is still genuinely
+PENDING (never fetched) has NO geometry yet, by construction. Requiring geometry to decide whether
+this cube is even worth fetching FOR is circular: the gate was being asked "is there a road here"
+using exactly the information a successful fetch is what would produce. Every ordinary, healthy,
+never-before-visited cube failed this check and the entire defer mechanism (including the INITIAL
+dispatch, now that 55534 shares the same gate) was skipped -- the worst possible regression for
+precisely the ordinary-movement-into-uncached-tiles case this whole ticket exists to fix.
+
+**Fix**, per John's own direction ("use natural-only support relevance before fetch... reserve
+mapped geometry for resolved tiles if useful"): `RoadPrefetch.cubeContainsNaturalSurface` no longer
+calls `RoadNetwork.segmentCoveringColumn` or looks at `CrossSection` at all. It scans the cube's own
+16x16 column footprint for NATURAL ground height alone (via `EarthGenerator.surfaceY`, already
+geometry-independent), padded the same fixed `BASE_PAVING_PADDING_BLOCKS` (3) below. This is more
+permissive than "a road is mapped here" -- it cannot know that before a fetch resolves -- but still
+correctly excludes a cube that is genuinely deep underground or high in the sky relative to this
+whole footprint's own natural terrain, which is the only question this gate can safely answer
+before a fetch. Using mapped geometry to narrow this further once a tile IS already resolved is a
+disclosed possible future refinement, not required to fix this bug and not attempted.
+
+Also fixed per the same comment: `liveAndRelevant` now short-circuits on
+`SynchronousLoadGuard.isActive()` FIRST, so `loadNow`'s own arrival path never pays for the (now a
+real 16x16 scan) cost of computing this gate at all -- it was previously computed unconditionally
+even though its result was never used on that path.
+
+The test is rewritten to an entirely cold boot: no fixture file, no cache file, no HTTP stub, the
+tile source genuinely `PENDING` throughout (asserted directly), proving the gate reports a cube
+relevant using nothing but natural terrain -- exactly the precondition this bug violated. 89/89
+tests pass.
+
 ## MINECRAFT-566: default-cadence native finding not yet fixed (comment 55535)
 
 John's next native round, against the SAME `54cc747` commit (pre-55534-fix), ran under the

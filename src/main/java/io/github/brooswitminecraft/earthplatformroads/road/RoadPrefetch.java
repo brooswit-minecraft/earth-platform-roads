@@ -123,36 +123,46 @@ public final class RoadPrefetch {
      * MINECRAFT-566 comment 55532: "gate by... actual surface relevance (current loop has no Y
      * filter)" -- a road is only ever painted AT a column's own natural ground height
      * ({@code EarthGeneratorRoadMixin}'s {@code surface()} hook never touches any other Y), so a
-     * cube whose own Y-range does not even come close to any road-covered column's natural ground
-     * height can never show a road regardless of whether the tile is pending -- deferring/retrying
-     * generation for such a cube would be pure waste.
+     * cube whose own Y-range does not even come close to any natural ground height in its own
+     * footprint can never show a road regardless of whether the tile is pending -- deferring/
+     * retrying generation for such a cube would be pure waste.
      *
      * <p><b>Comment 55534, a real gap in the first version:</b> the first version checked only the
      * CUBE's own single center column's ground height. John's native "upper-first" fixture found a
-     * real road footprint is not flat: an off-center column within the SAME footprint (e.g. the
-     * paved edge or shoulder, not the sampled center point) can have its own natural ground height
-     * a block or more different from the center's -- so a cube that is Y-irrelevant for the center
+     * real road footprint is not flat: an off-center column within the same footprint (e.g. the
+     * paved edge or shoulder, not the sampled center point) can have its own natural ground height a
+     * block or more different from the center's -- so a cube that is Y-irrelevant for the center
      * column alone can still be exactly where a DIFFERENT, still-within-footprint column's own road
-     * surface needs to be painted. The center cube fetched and painted correctly; the "upper" cube
-     * (irrelevant only by the old center-only check) was skipped entirely, adopted grass with no
-     * dispatch, and that grass was permanent on reopen. Fixed by scanning this CUBE's own full 16x16
-     * column grid (the same per-column pattern {@link #sectionLooksStale} already uses, deliberately
-     * NOT the road's own cross-section geometry, which would need a second, different RoadNetwork
-     * lookup) for ANY road-covered column (skipping {@code CrossSection.OFF_ROAD}) whose own natural
-     * ground height, padded by {@link #BASE_PAVING_PADDING_BLOCKS} below, falls inside this cube's
-     * Y-range -- "relevant if ANY real road column in this cube's own footprint could plausibly need
-     * this cube," not just the one center sample point.
+     * surface needs to be painted.
+     *
+     * <p><b>Comment 55537, the fix attempted for that gap, filtered by mapped geometry:</b> the first
+     * fix scanned this cube's own 16x16 column grid but required each sampled column to actually be
+     * {@code RoadNetwork.segmentCoveringColumn}-covered before its ground height counted at all.
+     *
+     * <p><b>Comment 55539, a real, more fundamental bug in THAT fix:</b> requiring mapped geometry to
+     * exist before this gate will even consider a cube relevant is circular for the exact case this
+     * whole mechanism exists to help -- a genuinely cold, never-fetched (PENDING) tile has NO mapped
+     * geometry yet at all, by definition, so {@code segmentCoveringColumn} returned {@code null} for
+     * EVERY column, making this gate report every cube irrelevant and skip dispatch entirely, even
+     * on an entirely ordinary, healthy cold-bootstrap walk into fresh terrain -- confirmed natively:
+     * both a flat case and the 55537 upper-first case saved grass with ZERO prefetch calls and zero
+     * POSTs, tile left PENDING, while a fresh, explicit, fixture-only fetch correctly painted both.
+     * Fixed per John's own direction ("use natural-only support relevance before fetch... reserve
+     * mapped geometry for resolved tiles if useful"): this gate is now geometry-INDEPENDENT --
+     * every column in the cube's own 16x16 footprint is sampled for its NATURAL ground height alone
+     * (never filtered by whether a road is actually mapped there), padded by
+     * {@link #BASE_PAVING_PADDING_BLOCKS} below. This is deliberately more permissive than "a road
+     * is mapped here" (it cannot know that before a fetch resolves), but still correctly excludes a
+     * genuinely irrelevant cube (deep underground below, or high in the sky above, this whole
+     * footprint's own natural terrain) -- the only question this gate can safely answer before a
+     * fetch resolves. Reusing mapped geometry to narrow this further once a tile IS already resolved
+     * is a possible future refinement, not attempted here (not required to fix this bug).
      */
     public static boolean cubeContainsNaturalSurface(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
-        MercatorGrid grid = generator.grid();
         int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
         for (int lx = 0; lx < 16; lx++) {
             for (int lz = 0; lz < 16; lz++) {
-                int worldX = baseX + lx, worldZ = baseZ + lz;
-                RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, worldX, worldZ);
-                if (segment == null) continue;
-                if (segment.crossSectionAt(grid, worldX, worldZ) == RoadSegment.CrossSection.OFF_ROAD) continue;
-                int groundY = generator.surfaceY(worldX, worldZ);
+                int groundY = generator.surfaceY(baseX + lx, baseZ + lz);
                 int localY = groundY - baseY;
                 if (localY + BASE_PAVING_PADDING_BLOCKS >= 0 && localY <= 15) return true;
             }

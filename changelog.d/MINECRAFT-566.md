@@ -285,6 +285,21 @@ bump: minor
   seam exists to force it deterministically) -- the new scan-based detector's correctness does not
   depend on which specific column in the cube has the differing height, only that scanning the whole
   footprint (not one sample point) finds it, which the new test does directly prove.
+- Fixed a real, more fundamental bug in that same fix (comment 55539, found by John's own
+  cold-bootstrap native regression): requiring mapped road geometry to already exist before
+  `cubeContainsNaturalSurface` would report a cube relevant at all is circular for the exact case
+  this whole mechanism exists to help -- a genuinely cold, never-fetched (PENDING) tile has NO
+  mapped geometry yet, by definition, so the check reported every cube irrelevant and skipped
+  dispatch entirely on an ordinary, healthy walk into fresh terrain. Confirmed natively: both a flat
+  case and the 55537 upper-first case saved grass with zero prefetch calls and zero POSTs, tile left
+  PENDING; an explicit fixture-only fetch then correctly painted both. Fixed per John's own
+  direction ("use natural-only support relevance before fetch... reserve mapped geometry for
+  resolved tiles if useful"): the gate is now geometry-INDEPENDENT, scanning the cube's own 16x16
+  footprint for NATURAL ground height alone (never filtered by whether a road is actually mapped
+  there). Also short-circuits on `SynchronousLoadGuard.isActive()` first, so `loadNow`'s own arrival
+  path never pays for the scan at all. The test rewritten to an entirely cold boot (no fixture, no
+  cache file, tile genuinely PENDING throughout) proving the gate works with nothing but natural
+  terrain.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it

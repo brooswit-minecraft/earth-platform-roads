@@ -347,7 +347,11 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // still a non-null RoadTileSource) sending zero POSTs yet still entering this method's wait
         // scheduling. Both gates below are the SAME ones the defer snapshot already uses -- computed
         // once, here, and reused for both so the two can never drift apart.
-        boolean liveAndRelevant = RoadPrefetch.hasLiveTileSource()
+        // MINECRAFT-566 comment 55539: short-circuit on SynchronousLoadGuard FIRST -- loadNow's own
+        // arrival path never dispatches regardless of this gate's answer, so there is no reason to
+        // pay for the (now a real 16x16 scan) cost of computing it at all on that path.
+        boolean liveAndRelevant = !SynchronousLoadGuard.isActive()
+                && RoadPrefetch.hasLiveTileSource()
                 && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ);
         // MINECRAFT-566 comment 55534: "the reported 3s is not an aggregate worker bound" -- the
         // prior version computed this deadline AFTER the first accepted generate() call returned,
@@ -356,7 +360,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // is why a held response was observed failing open at 4.26s against a nominal 3s window.
         // Captured here, before the initial dispatch, so the window is a genuine aggregate budget.
         Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
-        if (!SynchronousLoadGuard.isActive() && liveAndRelevant) { // loadNow's arrival path: never fetch here
+        if (liveAndRelevant) { // already excludes loadNow's own arrival path -- see liveAndRelevant's own doc
             // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
             // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
             // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
@@ -391,8 +395,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // after the accepted attempt had already produced grass), and a check made only after the
         // fact would correctly, but uselessly, see "not pending" and never retry at all. See
         // PENDING_DEFER_WINDOW's own doc for the full reasoning.
-        boolean wasPendingBeforeAcceptedAttempt = !SynchronousLoadGuard.isActive()
-                && liveAndRelevant
+        boolean wasPendingBeforeAcceptedAttempt = liveAndRelevant // already excludes loadNow's own arrival path
                 && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ);
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
         List<CompoundTag> attemptEntities = new ArrayList<>();
