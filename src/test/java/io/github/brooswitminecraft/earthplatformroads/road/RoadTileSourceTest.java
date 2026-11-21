@@ -495,4 +495,76 @@ class RoadTileSourceTest {
         for (int i = 0; i < 20 && requests.get() == 0; i++) Thread.sleep(50);
         assertEquals(1, requests.get(), "Expected the real lookahead dispatch to have actually happened in the background");
     }
+
+    /**
+     * MINECRAFT-566 comment 55481, a real bug: the first version registered
+     * {@code inFlightByCell}'s cleanup callback INSIDE {@code computeIfAbsent}'s own mapping
+     * function, which can race a synchronously-fast completion and leave a stale, already-resolved
+     * future permanently pinned -- every later call for that cell would then keep reusing it
+     * forever instead of ever dispatching a fresh fetch. A zero-delay stub maximizes the chance of
+     * hitting that exact race; this asserts the FIXED behavior holds regardless: a second call for
+     * the same cell, after the first's (failed, still-pending) fetch has settled, genuinely
+     * dispatches its own new request rather than silently reusing the first's stale result.
+     */
+    @Test
+    void aSecondCallForTheSameStillPendingCellDispatchesItsOwnFreshRequestNotAStalePinnedOne(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 0, "service unavailable", 503); // zero delay: maximizes the chance of the race this guards against
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        source.waysForCellWithBoundedWait(48.0, 18.0, Duration.ofSeconds(2));
+        // Let the first fetch's cleanup fully settle before the second call.
+        for (int i = 0; i < 20 && source.inFlightCellCountForTests() > 0; i++) Thread.sleep(25);
+        assertEquals(0, source.inFlightCellCountForTests(), "Expected the first (failed) fetch's entry to have been cleaned up");
+
+        source.waysForCellWithBoundedWait(48.0, 18.0, Duration.ofSeconds(2));
+        assertEquals(2, requests.get(), "Expected the second call to dispatch its OWN fresh request, not reuse a stale pinned future from the first");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55481's "coalesce lookahead submissions before admission" ask: models a
+     * tall column's many cube-Y layers all calling {@code enqueueLookaheadAsync} for the exact same
+     * center cell in a tight burst, before the first dispatched task has a chance to even start
+     * (a slow stub holds it open). The first version submitted a brand-new task to the executor's
+     * own unbounded queue on EVERY call; this asserts only one is actually admitted at a time.
+     */
+    @Test
+    void manyRapidLookaheadCallsForTheSameColumnCoalesceRatherThanFloodTheQueue(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 300, EMPTY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        for (int i = 0; i < 20; i++) source.enqueueLookaheadAsync(49.0, 19.0);
+
+        assertEquals(1, source.pendingLookaheadDispatchCountForTests(),
+                "Expected the 19 later calls for the SAME center cell to be skipped (coalesced), leaving only the first one's task pending");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55481's "cap pending tiles" ask: a burst of many DISTINCT, simultaneously
+     * cold cells must not grow {@code inFlightByCell} without bound. A slow stub keeps every admitted
+     * fetch in flight long enough to observe the cap before any of them can resolve and free a slot.
+     */
+    @Test
+    void distinctSimultaneousColdCellsAreCappedRatherThanGrowingWithoutBound(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 2000, EMPTY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        int callers = 20; // far more than the cap
+        var threads = new java.util.ArrayList<Thread>();
+        for (int i = 0; i < callers; i++) {
+            double lat = 50.0 + i * 0.5; // each a genuinely distinct, far-apart cell
+            Thread t = new Thread(() -> source.waysForCellWithBoundedWait(lat, 20.0, Duration.ofMillis(300)));
+            threads.add(t);
+            t.start();
+        }
+        for (Thread t : threads) t.join();
+
+        // A best-effort, not strictly atomic, cap (see MAX_IN_FLIGHT_TILES's own doc) -- asserts a
+        // real bound exists (nowhere near all 20 callers), with slack for the inherent admission
+        // check-then-insert race, rather than an exact count.
+        assertTrue(source.inFlightCellCountForTests() <= 16,
+                "Expected the number of simultaneously in-flight distinct cells to stay meaningfully capped, got " + source.inFlightCellCountForTests());
+    }
 }

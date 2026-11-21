@@ -102,6 +102,21 @@ bump: minor
   resolve, fail-open-but-keep-running on timeout, request coalescing across 5 concurrent callers,
   and non-blocking async lookahead).
 
+### Fixed (comment 55481)
+- Three real bugs in the bounded-worker fix above: (1) the in-flight cleanup callback was
+  registered INSIDE `computeIfAbsent`'s mapping function, racing a synchronously-fast completion
+  and potentially pinning a stale, resolved future forever for that cell -- fixed by registering it
+  only after `computeIfAbsent` actually publishes the entry; (2) the async lookahead dispatch
+  submitted a brand-new, unbounded task on every call -- fixed with a small coalescing set so a
+  tall column's many cube-Y layers share one pending dispatch; (3) distinct simultaneously-cold
+  cells could grow the in-flight map without bound -- fixed with a best-effort cap (`MAX_IN_FLIGHT_TILES`,
+  8). Three new `RoadTileSourceTest` cases prove each. Also independently reproduced in a real
+  isolated worker: a 4.2s loopback response (longer than the 2s bound) correctly fetched the right
+  bbox, but the column had already committed as grass -- a live instance of the already-disclosed
+  fail-open tradeoff, not a new bug category. The suggested real fix (reuse `ServerCubeWorld`'s own
+  `adoptReady`/`retryAt` seam instead of a one-shot bounded wait) needs a new Mixin accessor into a
+  private record constructor and is not attempted this pass -- see `docs/design.md`.
+
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a

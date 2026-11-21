@@ -164,6 +164,41 @@ public final class RoadTileSource {
     private final ConcurrentHashMap<Long, CompletableFuture<List<RoadSegment>>> inFlightByCell = new ConcurrentHashMap<>();
 
     /**
+     * MINECRAFT-566 comment 55481's "cap pending tiles" ask: an unbounded burst of distinct,
+     * simultaneously-cold cells (e.g. a player flying fast across many never-touched columns at
+     * once) could otherwise queue an unbounded number of distinct {@link #inFlightByCell} entries
+     * on {@link #ASYNC_FETCH_EXECUTOR}'s own unbounded work queue. A NEW cell is admitted only while
+     * fewer than this many are already in flight; beyond that, {@link #waysForCellWithBoundedWait}
+     * fails open immediately rather than queuing yet another one -- a soft, best-effort cap (the
+     * admission check and the actual insert are not atomic together), not a hard guarantee, but
+     * enough to keep this bounded rather than growing without limit.
+     */
+    private static final int MAX_IN_FLIGHT_TILES = 8;
+
+    /** Test-only: the current number of distinct cells with a real fetch in flight, to assert {@link #MAX_IN_FLIGHT_TILES} is actually honored. */
+    int inFlightCellCountForTests() {
+        return inFlightByCell.size();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55481's "coalesce lookahead submissions before admission" ask: a tall
+     * column's many cube-Y layers would otherwise each call {@link #enqueueLookaheadAsync} for the
+     * exact same center cell, each submitting its OWN task to {@link #ASYNC_FETCH_EXECUTOR}'s
+     * unbounded queue before any of them actually run -- not bounded by {@link #LOOKAHEAD_QUEUE_CAPACITY}
+     * at all, since that cap only bounds the NEIGHBOR cells a single {@link #enqueueLookahead} call
+     * enqueues, not how many TIMES {@link #enqueueLookaheadAsync} itself gets invoked. Tracks which
+     * center cells currently have an undispatched async lookahead task pending, so a later call for
+     * the SAME center cell while one is already queued is simply skipped (free, no task submitted)
+     * rather than piling on another.
+     */
+    private final java.util.Set<Long> pendingLookaheadDispatches = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Test-only: the current number of distinct center cells with an undispatched async lookahead task pending, to assert coalescing actually happened. */
+    int pendingLookaheadDispatchCountForTests() {
+        return pendingLookaheadDispatches.size();
+    }
+
+    /**
      * One dedicated, shared, daemon background thread that performs every ACTUAL network wait
      * {@link #waysForCellWithBoundedWait} and {@link #enqueueLookaheadAsync} trigger -- never a
      * generation worker thread. A single thread is enough: {@link #networkLock} already permits only
@@ -191,16 +226,29 @@ public final class RoadTileSource {
      * anything touches this cell) still sees the result once it actually resolves. Never invoked
      * from {@code loadNow}'s synchronous arrival path -- see
      * {@code ServerCubeWorldRoadPrefetchMixin}'s own doc.
+     *
+     * <p>MINECRAFT-566 comment 55481, a real bug found by pure logical review: the first version
+     * registered the {@code inFlightByCell.remove} cleanup callback INSIDE the
+     * {@link ConcurrentHashMap#computeIfAbsent} mapping function, before that function had actually
+     * returned -- {@code computeIfAbsent} does not publish the new entry into the map until its
+     * mapping function returns, so if the dispatched future happened to complete synchronously fast
+     * enough that the cleanup callback ran before that return, {@code remove} would find nothing
+     * yet to remove (a silent no-op), and {@code computeIfAbsent} would then go ahead and publish
+     * the (already-completed) future anyway -- permanently pinning it in the map, so every later
+     * caller for that cell would keep reusing that one stale, already-resolved future forever rather
+     * than ever dispatching a fresh fetch again. Fixed by registering the cleanup only AFTER
+     * {@code computeIfAbsent} returns, when the entry is guaranteed to actually be published.
      */
     public List<RoadSegment> waysForCellWithBoundedWait(double lat, double lon, Duration bound) {
         List<RoadSegment> alreadyResolved = cachedWaysForCellOrEmpty(lat, lon);
         if (!alreadyResolved.isEmpty() || cellState(lat, lon) != CellState.PENDING) return alreadyResolved; // ready, or genuinely confirmed-empty: no wait needed
         long key = cellKeyOf(lat, lon);
-        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k -> {
-            CompletableFuture<List<RoadSegment>> dispatched = CompletableFuture.supplyAsync(() -> waysForCell(lat, lon), ASYNC_FETCH_EXECUTOR);
-            dispatched.whenComplete((result, error) -> inFlightByCell.remove(key, dispatched));
-            return dispatched;
-        });
+        if (!inFlightByCell.containsKey(key) && inFlightByCell.size() >= MAX_IN_FLIGHT_TILES) {
+            return List.of(); // at capacity: fail open rather than admit yet another distinct in-flight cell
+        }
+        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k ->
+                CompletableFuture.supplyAsync(() -> waysForCell(lat, lon), ASYNC_FETCH_EXECUTOR));
+        future.whenComplete((result, error) -> inFlightByCell.remove(key, future));
         try {
             return future.get(bound.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
@@ -213,9 +261,23 @@ public final class RoadTileSource {
         }
     }
 
-    /** {@link #enqueueLookahead}, dispatched onto {@link #ASYNC_FETCH_EXECUTOR} so the calling (generation worker) thread never waits on it at all. */
+    /**
+     * {@link #enqueueLookahead}, dispatched onto {@link #ASYNC_FETCH_EXECUTOR} so the calling
+     * (generation worker) thread never waits on it at all -- coalesced via
+     * {@link #pendingLookaheadDispatches} so a tall column's many cube-Y-layer calls for the exact
+     * same center cell submit at most ONE undispatched task at a time (MINECRAFT-566 comment 55481:
+     * the first version submitted a brand new task EVERY call, unbounded).
+     */
     public void enqueueLookaheadAsync(double lat, double lon) {
-        ASYNC_FETCH_EXECUTOR.execute(() -> enqueueLookahead(lat, lon));
+        long key = cellKeyOf(lat, lon);
+        if (!pendingLookaheadDispatches.add(key)) return; // already queued for this exact center cell; skip rather than pile on another
+        ASYNC_FETCH_EXECUTOR.execute(() -> {
+            try {
+                enqueueLookahead(lat, lon);
+            } finally {
+                pendingLookaheadDispatches.remove(key);
+            }
+        });
     }
 
     private static long cellKeyOf(double lat, double lon) {

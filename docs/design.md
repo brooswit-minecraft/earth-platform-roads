@@ -370,6 +370,46 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   actually finishes (polled, not assumed); five concurrent callers for the same cell share exactly
   one real request; and the async lookahead dispatch returns near-instantly while still actually
   firing in the background.
+- **Three real bugs in the bounded-worker fix above, found by comment 55481 through pure logical
+  review -- no Zippy access needed.** (1) `inFlightByCell`'s cleanup callback was registered INSIDE
+  `computeIfAbsent`'s own mapping function, before that function had returned; `computeIfAbsent`
+  does not publish the new entry until the mapping function returns, so a fetch that happened to
+  complete synchronously fast enough could run its cleanup (a no-op, since nothing was published
+  yet) BEFORE `computeIfAbsent` went ahead and published the (already-completed) future anyway --
+  permanently pinning a stale, resolved future, so every later caller for that cell would reuse it
+  forever instead of ever dispatching a fresh fetch again. **Fixed** by registering the cleanup only
+  AFTER `computeIfAbsent` returns, when publication is guaranteed. (2) `enqueueLookaheadAsync`
+  submitted a brand-new task to `ASYNC_FETCH_EXECUTOR`'s own unbounded queue on EVERY call -- a tall
+  column's many cube-Y-layer misses would each submit their own, unbounded by
+  `LOOKAHEAD_QUEUE_CAPACITY` (which only bounds the neighbor cells one `enqueueLookahead` call
+  enqueues, not how many times the ASYNC wrapper itself gets invoked). **Fixed** by a new
+  `pendingLookaheadDispatches` set: a later call for the SAME center cell while one is already
+  queued is skipped for free, not piled on. (3) Distinct, simultaneously-cold cells (e.g. a player
+  moving fast across many never-touched columns) could grow `inFlightByCell` without bound.
+  **Fixed** by `MAX_IN_FLIGHT_TILES` (8): admission for a genuinely NEW cell is refused (fails open
+  immediately) once that many are already in flight -- a soft, best-effort cap (the check and the
+  insert are not atomic together), not a hard guarantee, but enough to keep this bounded. Three new
+  `RoadTileSourceTest` cases prove each fix: a zero-delay stub (maximizing the chance of hitting
+  bug (1)'s race) followed by a second call for the same cell, asserting it dispatches its own fresh
+  request rather than reusing a stale one; 20 rapid same-column lookahead calls, asserting only one
+  task is ever actually pending; and 20 threads for 20 distinct cold cells against a slow stub,
+  asserting the in-flight count stays meaningfully bounded (not literally 20).
+  **Independently reproduced in a real isolated worker, same comment:** a 4.2s loopback response
+  (longer than `PREFETCH_WAIT_BOUND`'s 2s) correctly fetched the right bbox, but the column had
+  already committed as grass by the time the real data became ready -- "the road placement decision
+  can already be stale before adoption" -- a live, concrete instance of the ALREADY-disclosed
+  fail-open tradeoff (an ordinary late response still commits roadless terrain), not a new category
+  of bug. 55481 asks this be addressed next by reusing "the upstream stream retry seam" --
+  `ServerCubeWorld.adoptReady`'s own existing behavior for a `Ready` with a `null` section (`"Leave
+  a gap and try again shortly rather than stall"`, scheduling a real retry via `retryAt` a few
+  seconds later) -- rather than this mixin's own bounded wait being the only chance a column gets.
+  **Not attempted this pass:** doing this would mean cancelling `produce`'s own `generate()` call
+  from this mixin's injection and constructing a `ServerCubeWorld.Ready` with a `null` section
+  instead, so the EXISTING retry seam picks the column back up shortly after -- `Ready` is a
+  *private* record with a non-trivial field list (confirmed by reading it directly), so doing this
+  correctly needs a NEW Mixin accessor (e.g. `@Invoker`) exposing its constructor, carefully matched
+  against its exact real signature, not attempted in the same pass as the three fixes above. This is
+  understood to be the real next step, not a vague gesture at "more work later."
   **Still NOT attempted (named, not hidden):** 55476's suggestion to bracket the guard with
   `finally` rather than HEAD/RETURN: `loadNow`'s only other call, `adoptReady`, is NOT fully wrapped
   in try/catch internally (e.g. `server.getPoiManager().checkConsistencyWithBlocks`,
