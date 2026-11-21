@@ -402,6 +402,31 @@ bump: minor
   resulting min/max cell-lat/lon -- typically 1 to 4 cells, correctly catching a boundary cutting
   through the middle of the neighborhood, not just its center. 92/92 tests pass.
 
+### Fixed (comment 55558, two real release blockers found by math/logic review)
+- **Antimeridian bug:** `intersectingCells` computed a naive min/max across its 4 corners' raw
+  longitude values. A footprint straddling longitude +-180 degrees (John's own exact figures: at 1
+  meter/block, a landing near Web Mercator's own `X=20037508` gives corner longitudes
+  `+179.999817`/`-179.999761`) made that naive min/max span ~36,000 cells instead of the true
+  2-cell local span (his own cited keys: `17999` and `-18000`) -- every pending-check/dispatch near
+  the antimeridian would have enumerated and queried ~36,000 cells, twice per tick, per held
+  arrival. Fixed by detecting the wrap and "unwrapping" (shifting negative corner longitudes by
+  +360 before taking min/max), then normalizing the resulting per-cell query longitude back into
+  -180..180 before use. Hand-verified against John's own exact figures to produce precisely cell
+  longitudes 17999/18000 (matching his own cited correct answer); not independently reproduced as
+  an automated test in this harness (would need a fixture landing exactly at the antimeridian with
+  a precisely known geographic reference origin, not attempted this pass).
+- **Wasted dispatch when already fully ready:** the mixin checked (and dispatched for) road data
+  even when the real `readyAround` already reported the whole neighborhood ready -- but then there
+  is no fresh generation at risk at all. Fixed to return immediately once the real `readyAround` is
+  `true`, before the road-pending check or dispatch ever run.
+- Also narrowed, per "qualify only missing natural-surface-relevant cubes rather than blocking on
+  every X/Z tile unconditionally": added a cheap pre-check (`RoadPrefetch.cubeContainsNaturalSurface`,
+  reused as-is, against just the landing position's own CENTER cube) before the cell-intersection
+  check runs at all -- an arrival landing deep underground or far up in open sky gains nothing from
+  holding. A fuller "which of the 27 cubes are missing" breakdown was not attempted (no clear
+  existing `ServerCubeWorld` API found for it); this is a reasonable, cheap partial step, not the
+  full ask. 92/92 tests pass.
+
 ### Known gaps
 - `CubicEventsArrivalRoadGateMixin` (comments 55551 through 55556) is not yet independently
   verified natively -- the real `CubicEvents.arrive` pipeline, and whether MixinExtras's

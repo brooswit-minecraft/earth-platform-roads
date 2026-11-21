@@ -273,7 +273,7 @@ public final class RoadPrefetch {
         if (tiles == null) return false;
         for (long[] cell : intersectingCells(generator, blockX, blockZ)) {
             double lat = (cell[0] + 0.5) * RoadNetwork.CELL_DEGREES;
-            double lon = (cell[1] + 0.5) * RoadNetwork.CELL_DEGREES;
+            double lon = normalizeLongitude((cell[1] + 0.5) * RoadNetwork.CELL_DEGREES);
             if (tiles.cellState(lat, lon) == RoadTileSource.CellState.PENDING) return true;
         }
         return false;
@@ -290,10 +290,20 @@ public final class RoadPrefetch {
         if (tiles == null) return;
         for (long[] cell : intersectingCells(generator, blockX, blockZ)) {
             double lat = (cell[0] + 0.5) * RoadNetwork.CELL_DEGREES;
-            double lon = (cell[1] + 0.5) * RoadNetwork.CELL_DEGREES;
+            double lon = normalizeLongitude((cell[1] + 0.5) * RoadNetwork.CELL_DEGREES);
             tiles.dispatchCellFetch(lat, lon);
             tiles.enqueueLookaheadAsync(lat, lon);
         }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55558: {@link #intersectingCells}'s own antimeridian "unwrap" can
+     * produce a cell index whose derived center longitude lands outside the ordinary -180..180
+     * range (e.g. 180.01) -- this brings any such value back into that range before it is ever
+     * used as a real query longitude.
+     */
+    private static double normalizeLongitude(double lon) {
+        return ((lon + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
     }
 
     /**
@@ -314,15 +324,47 @@ public final class RoadPrefetch {
         int cx = blockX >> 4, cz = blockZ >> 4;
         int minBlockX = cubeIndexToBlockCenter(cx - 1) - 8, maxBlockX = cubeIndexToBlockCenter(cx + 1) + 7;
         int minBlockZ = cubeIndexToBlockCenter(cz - 1) - 8, maxBlockZ = cubeIndexToBlockCenter(cz + 1) + 7;
-        double minLat = Double.MAX_VALUE, maxLat = -Double.MAX_VALUE, minLon = Double.MAX_VALUE, maxLon = -Double.MAX_VALUE;
+        double minLat = Double.MAX_VALUE, maxLat = -Double.MAX_VALUE;
+        double[] cornerLons = new double[4];
+        int i = 0;
         for (int x : new int[] {minBlockX, maxBlockX}) {
             for (int z : new int[] {minBlockZ, maxBlockZ}) {
                 GeoPoint point = grid.geographic(x, z);
                 minLat = Math.min(minLat, point.latitude());
                 maxLat = Math.max(maxLat, point.latitude());
-                minLon = Math.min(minLon, point.longitude());
-                maxLon = Math.max(maxLon, point.longitude());
+                cornerLons[i++] = point.longitude();
             }
+        }
+        // MINECRAFT-566 comment 55558: a landing footprint straddling the antimeridian (longitude
+        // +-180 degrees) has corners whose RAW longitude values jump from near +180 to near -180 --
+        // a plain min/max across them spans almost the entire -180..180 range (~36000 cells,
+        // natively confirmed by exact math: a real landing near Web Mercator's own X=20037508
+        // produces corner longitudes +179.999817 / -179.999761) instead of the true, tiny local
+        // span (just the 2 real cells on either side of the antimeridian). Detected by checking
+        // whether the raw corners' own span exceeds 180 degrees -- impossible for a genuinely local,
+        // 48-block-wide footprint under any non-wrapped projection -- and fixed by "unwrapping":
+        // shifting every negative corner longitude by +360 so the whole set becomes one contiguous,
+        // short interval before taking min/max (the resulting cell range may then extend past the
+        // ordinary 18000-cell boundary; {@link #normalizeLongitude} brings each actual query
+        // longitude back into -180..180 before it is ever used).
+        double rawMinLon = cornerLons[0], rawMaxLon = cornerLons[0];
+        for (double lon : cornerLons) {
+            rawMinLon = Math.min(rawMinLon, lon);
+            rawMaxLon = Math.max(rawMaxLon, lon);
+        }
+        double minLon, maxLon;
+        if (rawMaxLon - rawMinLon > 180.0) {
+            double unwrappedMin = Double.MAX_VALUE, unwrappedMax = -Double.MAX_VALUE;
+            for (double lon : cornerLons) {
+                double unwrapped = lon < 0 ? lon + 360.0 : lon;
+                unwrappedMin = Math.min(unwrappedMin, unwrapped);
+                unwrappedMax = Math.max(unwrappedMax, unwrapped);
+            }
+            minLon = unwrappedMin;
+            maxLon = unwrappedMax;
+        } else {
+            minLon = rawMinLon;
+            maxLon = rawMaxLon;
         }
         long minCellLat = (long) Math.floor(minLat / RoadNetwork.CELL_DEGREES);
         long maxCellLat = (long) Math.floor(maxLat / RoadNetwork.CELL_DEGREES);

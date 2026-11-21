@@ -144,12 +144,33 @@ public abstract class CubicEventsArrivalRoadGateMixin {
             ServerCubeWorld cubes, BlockPos pos, Operation<Boolean> operation,
             @Share("roadHeld") LocalBooleanRef roadHeld) {
         boolean terrainReady = operation.call(cubes, pos);
+        if (terrainReady) {
+            // MINECRAFT-566 comment 55558, release blocker 2: if the real readyAround already says
+            // every cube in this neighborhood exists, there is no FRESH terrain at stake at all --
+            // nothing here is about to be generated-and-saved for the first time, so there is
+            // nothing this mod's own defer could protect by holding, and no reason to pay for the
+            // road-pending check or dispatch at all. Must return before either.
+            roadHeld.set(false);
+            return true;
+        }
         CubeGenerator generator = cubes.generator();
         boolean roadPending = generator instanceof EarthGenerator earthGenerator
                 && RoadPrefetch.hasLiveTileSource()
+                && isCenterCubeNaturallyRelevant(earthGenerator, pos)
                 && isRoadPendingAndDispatch(earthGenerator, pos);
         roadHeld.set(roadPending);
-        return terrainReady && !roadPending;
+        return false; // terrainReady is already known false here
+    }
+
+    private static boolean isCenterCubeNaturallyRelevant(EarthGenerator earthGenerator, BlockPos pos) {
+        // MINECRAFT-566 comment 55558: "qualify only missing natural-surface-relevant cubes rather
+        // than blocking on every X/Z tile unconditionally." A single, cheap check (one 256-column
+        // scan, not scanning every cube in the neighborhood) against the CENTER cube -- the one the
+        // arrival's own landing position actually sits in -- rather than treating the whole 3x3
+        // neighborhood as uniformly relevant regardless of whether any of it could plausibly show
+        // natural surface at all (e.g. an arrival whose own landing column is deep underground or
+        // far up in open sky gains nothing from holding for road data).
+        return RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
     }
 
     private static boolean isRoadPendingAndDispatch(EarthGenerator earthGenerator, BlockPos pos) {

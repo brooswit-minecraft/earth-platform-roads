@@ -1393,6 +1393,57 @@ a real, entirely-cold synthetic fixture. 92/92 tests pass.
   run once after the footprint is adopted, plus removed-player and direct-spawn controls) is
   exactly the right test for this and needs his own native infrastructure to confirm.
 
+## MINECRAFT-566: two release blockers found by math/logic review of 7095fc4 (comment 55558)
+
+While native core testing proceeded in parallel, John's own independent source/math review of
+`7095fc4` found two real, confirmed-by-exact-math blockers, plus a further narrowing.
+
+**Blocker 1, the antimeridian bug:** `intersectingCells` computed a naive `min`/`max` across its 4
+corners' RAW longitude values. For a landing footprint that straddles the antimeridian (longitude
++-180 degrees -- John's own exact figures: at 1 meter/block, a landing at Web Mercator's own
+`X=20037508` gives corner longitudes `+179.999817`/`-179.999761`), that naive min/max spans almost
+the ENTIRE -180..180 range (`(179.999817 - (-179.999761)) / 0.01 ~ 36000` cells -- the exact count
+John cited) instead of the true, tiny 2-cell local span either side of the antimeridian (his own
+cited keys: `17999` and `-18000`). Every pending-check and dispatch call near the antimeridian
+would have enumerated and queried ~36,000 cells, twice per tick, for every held arrival -- a severe
+performance and correctness bug. Fixed by detecting the wrap (the 4 corners' own raw span exceeding
+180 degrees is impossible for a genuinely local 48-block-wide footprint under any non-wrapped
+projection), "unwrapping" by shifting negative corner longitudes by +360 before taking min/max (so
+the true, short interval is computed correctly), and normalizing the resulting per-cell query
+longitude back into -180..180 via a standard wrap formula before it is ever used. Verified by hand
+against John's own exact figures: the corrected computation yields exactly cell longitudes 17999
+and 18000 (which normalizes to longitude ~-179.995, the same cell his own "-18000" key names) --
+matching his own cited correct answer precisely. Not independently reproduced as an automated test
+in this harness (constructing a real `EarthGenerator` fixture landing exactly at the antimeridian
+would need knowing that fixture's own geographic reference origin precisely, which was not
+attempted this pass) -- confidence here rests on the hand-verified match against John's own cited
+exact values, not a new test.
+
+**Blocker 2:** "if native readyAround returns true, all cubes are already loaded and no fresh
+terrain is at stake: return immediately before dispatch." The mixin's own `@WrapOperation` was
+checking (and dispatching for) road-pending data even when the real, underlying `readyAround`
+already reported the whole neighborhood ready -- but if every cube already exists, there is no
+FRESH generation at risk at all; nothing this mechanism exists to protect is actually happening, so
+paying for the check or sending a dispatch is pure waste (and, worse, could needlessly hold an
+arrival that gains nothing from waiting). Fixed by returning immediately once the real
+`readyAround` is `true`, before the road-pending check or dispatch ever run.
+
+**Further narrowing**, per "for partial footprints qualify only missing natural-surface-relevant
+cubes rather than blocking on every X/Z tile unconditionally": added a single, cheap pre-check
+(`RoadPrefetch.cubeContainsNaturalSurface`, reused as-is -- one 256-column scan against just the
+CENTER cube the landing position itself sits in, not all 27) before the (already cheap,
+antimeridian-fixed) cell-intersection check runs at all -- an arrival whose own landing column is
+deep underground or far up in open sky gains nothing from holding for road data, so this skips the
+whole mechanism for that case rather than treating every X/Z tile in the neighborhood as uniformly
+relevant regardless. A fuller "which of the 27 cubes are actually missing" breakdown (as opposed to
+just the center) was not attempted -- no clear, already-available `ServerCubeWorld` API for that
+per-cube breakdown was found in this pass; this narrower, single-cube version is a reasonable,
+cheap, well-justified partial step using existing, already-tested infrastructure, not the full ask.
+
+92/92 tests pass (`./gradlew compileJava` confirms the unchanged Mixin target descriptors still
+validate against the real dependency; no new automated test added for the antimeridian fix itself,
+per the disclosed reasoning above).
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
