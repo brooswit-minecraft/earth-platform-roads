@@ -247,6 +247,47 @@ class RoadCrossSectionTest {
         assertTrue(sawBothSidesOfTheBoundary, "Sanity: expected this fixture's own width to actually straddle a cube boundary (x=15/16)");
     }
 
+    /**
+     * MINECRAFT-566 comment 55516 (independent compiled-build finding): on John's own cross-slope
+     * fixture, the natural-high column (x=11, already AT the shared height -- nothing to raise) must
+     * still be flagged {@code crossSlopeDetected}, so {@code RoadDeck.buildSupportAndDeck} knows to
+     * repaint its cap too, rather than leaving it as whatever partial layered material
+     * {@code surface()} originally painted there (the real bug: raised neighbors got a full cap at
+     * the same Y while the natural-high column kept a near-decayed layer, both at Y=75). A station
+     * with no actual height variation across its own width must NOT be flagged, so a flat/uniform
+     * road is never touched at all.
+     */
+    @Test
+    void stationFlagsCrossSlopeOnlyWhenTheWidthActuallyVaries() {
+        MercatorGrid grid = GRID;
+        GeoPoint a = grid.geographic(6.0, 0.0), b = grid.geographic(6.0, 100.0);
+        RoadSegment slopedRoad = new RoadSegment(1L, "cross-slope test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+        int worldZ = 50;
+        java.util.function.BiFunction<Integer, Integer, Integer> slopedHeight = (x, z) -> 64 + x;
+        java.util.function.BiPredicate<Integer, Integer> sameRoad =
+                (x, z) -> slopedRoad.crossSectionAt(grid, x, z) != CrossSection.OFF_ROAD;
+
+        // x=11 is the natural-high column of this exact fixture -- its OWN height already equals
+        // the shared max, yet the station it belongs to is still genuinely cross-sloped.
+        var highColumn = RoadDeck.computeStation(slopedRoad, grid, 11, worldZ, slopedHeight, sameRoad);
+        assertEquals(75, highColumn.height());
+        assertEquals(75, slopedHeight.apply(11, worldZ), "Sanity: x=11 must actually already be at the shared height");
+        assertTrue(highColumn.crossSlopeDetected(), "Expected the natural-high column to still be flagged cross-sloped, "
+                + "so its cap gets repainted to match its raised neighbors rather than keeping a stale partial layer");
+
+        // A perfectly flat road (same construction, but every sampled column shares one height) must
+        // never be flagged -- the common case, which must stay a complete no-op.
+        RoadSegment flatRoad = new RoadSegment(1L, "flat test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+        java.util.function.BiFunction<Integer, Integer, Integer> flatHeight = (x, z) -> 70;
+        java.util.function.BiPredicate<Integer, Integer> sameFlatRoad =
+                (x, z) -> flatRoad.crossSectionAt(grid, x, z) != CrossSection.OFF_ROAD;
+        var flatColumn = RoadDeck.computeStation(flatRoad, grid, 5, worldZ, flatHeight, sameFlatRoad);
+        assertEquals(70, flatColumn.height());
+        assertTrue(!flatColumn.crossSlopeDetected(), "Expected a perfectly flat road to never be flagged cross-sloped");
+    }
+
     @Test
     void layeredGravelHasNoFallingBlockPhysics() {
         // LayeredBlock extends plain Block, not FallingBlock -- confirmed structurally here so a

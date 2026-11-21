@@ -230,6 +230,18 @@ bump: minor
   filled dip currently shows a drop to the shoulder's own natural height at the paved edge. Not an
   in-game visual confirmation either. A "prototype," per the ticket's own framing, not a finished
   feature.
+- Per John's independent compiled-build review of `d179c93` (comment 55516): the natural-high
+  column of a cross-raised station keeps `RoadSurfaceLayering`'s own pre-existing (partial) layer
+  count instead of matching its raised neighbors' plain full cap (reported layer counts
+  `[16,16,...,16,1]` across one station). A first fix attempt (repaint that column too whenever its
+  station is cross-sloped) was tried and REVERTED: it broke the existing, already-verified
+  `aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff` longitudinal
+  slope-continuity test. Reconciling flat-across with smooth-along needs a real 2D blended height
+  field; `RoadDeck.Station.crossSlopeDetected` (correct, directly tested) is kept as a building
+  block for that future fix. Also not addressed this pass, per the same comment: shoulder gravel at
+  the supported edge of a large raise, and the diagonal test's weaker (integer-Y-only, not
+  fractional-collision) longitudinal check. `b7ff716` (canopy clearance only) remains the actual
+  ready candidate; this deck work stays an explicitly disclosed, not-yet-ready prototype.
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
   does not verify the road material was actually painted under a column (that would mean
   re-deriving it the way the currently-disabled `RoadPrefetch.sectionLooksStale` does). On the rare

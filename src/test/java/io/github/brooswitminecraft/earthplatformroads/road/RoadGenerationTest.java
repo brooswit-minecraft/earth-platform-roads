@@ -494,7 +494,7 @@ class RoadGenerationTest {
         assertTrue(naturalY >> 4 != deckY >> 4, "Sanity: naturalY and deckY must actually land in different cubes");
 
         LevelChunkSection lowerCube = new LevelChunkSection(biomeRegistry);
-        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerCube, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerCube, 0, 0, naturalY, deckY, true, RoadSegment.CrossSection.PAVED);
         for (int localY = (naturalY & 15) + 1; localY <= 15; localY++) {
             var state = lowerCube.getBlockState(0, localY, 0);
             assertTrue(state.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS),
@@ -502,7 +502,7 @@ class RoadGenerationTest {
         }
 
         LevelChunkSection upperCube = new LevelChunkSection(biomeRegistry);
-        RoadDeck.buildSupportAndDeck(deckY >> 4, upperCube, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        RoadDeck.buildSupportAndDeck(deckY >> 4, upperCube, 0, 0, naturalY, deckY, true, RoadSegment.CrossSection.PAVED);
         int deckLocalY = deckY & 15;
         for (int localY = 0; localY < deckLocalY; localY++) {
             var state = upperCube.getBlockState(0, localY, 0);
@@ -515,10 +515,41 @@ class RoadGenerationTest {
 
         // "Reopening" (regenerating each cube's own section fresh again) must give the identical result.
         LevelChunkSection lowerAgain = new LevelChunkSection(biomeRegistry);
-        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerAgain, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerAgain, 0, 0, naturalY, deckY, true, RoadSegment.CrossSection.PAVED);
         for (int localY = 0; localY <= 15; localY++) {
             assertEquals(lowerCube.getBlockState(0, localY, 0), lowerAgain.getBlockState(0, localY, 0),
                     "Expected the lower cube's own slice to regenerate identically, at local Y=" + localY);
         }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55516: the natural-high column of a cross-raised station is NOT
+     * repainted -- {@code buildSupportAndDeck} still leaves {@code surface()}'s own pre-existing
+     * material completely alone whenever {@code deckY == naturalY} for THIS column, regardless of
+     * {@code crossSlopeDetected}. This is the confirmed, disclosed layer-count mismatch from 55516
+     * (a raised column gets a plain full cap while the natural-high column keeps its old partial
+     * layer) -- a first attempt at fixing it by forcing a repaint here was tried and reverted, since
+     * it broke the existing, already-verified longitudinal slope-layering continuity test
+     * ({@code aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff}). This
+     * test pins the CURRENT (imperfect, disclosed) behavior so a future attempt at the real fix has
+     * a clear regression signal for what it is actually changing.
+     */
+    @Test
+    void theNaturalHighColumnOfACrossRaisedStationIsNotYetRepainted() {
+        int y = 10;
+        var staleLayeredStandIn = LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get().defaultBlockState();
+
+        LevelChunkSection crossSloped = new LevelChunkSection(biomeRegistry);
+        crossSloped.setBlockState(0, y, 0, staleLayeredStandIn, false);
+        RoadDeck.buildSupportAndDeck(0, crossSloped, 0, 0, y, y, true, RoadSegment.CrossSection.PAVED);
+        var stillStale = crossSloped.getBlockState(0, y, 0);
+        assertEquals(staleLayeredStandIn, stillStale,
+                "Documenting the current, disclosed-not-fixed behavior: the natural-high column's existing material is left untouched even when crossSlopeDetected is true");
+
+        LevelChunkSection flat = new LevelChunkSection(biomeRegistry);
+        flat.setBlockState(0, y, 0, staleLayeredStandIn, false);
+        RoadDeck.buildSupportAndDeck(0, flat, 0, 0, y, y, false, RoadSegment.CrossSection.PAVED);
+        var untouched = flat.getBlockState(0, y, 0);
+        assertEquals(staleLayeredStandIn, untouched, "Expected a non-cross-sloped column's existing material to be left completely untouched");
     }
 }

@@ -901,6 +901,59 @@ per call, and `RoadDeck.buildAll`/`RoadCanopyClearance.clear` each still call th
 column (reusing the exact same deterministic function rather than caching a value between them, per
 the existing "pure function" pattern this whole mixin pair already relies on for correctness).
 
+## MINECRAFT-566: three further gaps found on d179c93, one attempted and reverted (comment 55516)
+
+John independently compiled `d179c93` against his own fixture and confirmed the transverse sampler
+now yields a correct flat Y and that support/cap survive a close/reopen without regenerating the
+lower section -- but found three further, real problems:
+
+1. **Layer-count mismatch.** Actual layer counts across the twelve paved columns came back
+   `[16,16,16,16,16,16,16,16,16,16,16,1]`: the natural-high column (already AT the shared height,
+   so `buildSupportAndDeck` never touches it) keeps whatever partial slope-compat layer
+   `RoadSurfaceLayering` had already decided for it, while its now-raised neighbors get a plain full
+   cap at the same Y -- visually a thin sliver sitting beside eleven full blocks.
+
+   **Attempted and REVERTED.** `RoadDeck.computeStation`/`Station` now tracks
+   `crossSlopeDetected` (true whenever ANY sample across the width differs in natural height from
+   any other, detected via min != max among qualifying samples) -- correct and directly verified
+   (`RoadCrossSectionTest.stationFlagsCrossSlopeOnlyWhenTheWidthActuallyVaries`). The first attempt
+   at using it made `buildSupportAndDeck` repaint even a non-raised column's cap whenever its own
+   station was cross-sloped, to force every column at the same station onto one uniform material.
+   This BROKE an existing, already-verified regression test --
+   `RoadGenerationTest.aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff`
+   started failing with a full-block gap at a real incline column, because forcing a flat cap on a
+   column just because its OWN cross-section happens to be sloped can introduce a NEW longitudinal
+   step against an adjacent, differently-raised station that `RoadSurfaceLayering` was correctly
+   smoothing before this change existed. Reconciling "flat across the road" with "smooth along the
+   road" at the SAME time needs a genuine 2D blended height field, not an independent per-column
+   repaint decision -- real design work, not available in the remaining time. The repaint was
+   reverted (`buildSupportAndDeck`'s guard is back to `deckY <= naturalY`, ignoring
+   `crossSlopeDetected`); `Station`'s detection itself is correct and kept as a building block for
+   whoever does that real fix, with
+   `RoadGenerationTest.theNaturalHighColumnOfACrossRaisedStationIsNotYetRepainted` pinning the
+   CURRENT, disclosed-imperfect behavior so that future fix has a clear regression signal.
+
+2. **Shoulder gravel at the supported edge.** The low-side shoulder keeps its own natural gravel at
+   its own (unraised) natural height, which can sit well below a large raise on the paved edge next
+   to it -- John: "suppress gravel only at the supported edge and retain grounded shoulders." Not
+   attempted this pass; shoulder handling was already an explicitly disclosed gap before this
+   comment, and extending it correctly (telling "the supported edge" apart from "a grounded
+   shoulder" needs the same per-station reasoning as item 1) is new design work, not a quick patch.
+
+3. **Diagonal longitudinal collision not actually established.** The existing diagonal test
+   (`sharedHeightStaysBoundedAndChangesGraduallyAlongADiagonalRoad`) only asserts the integer shared
+   height changes by at most one block between adjacent stations; John correctly points out this
+   does not establish smooth COLLISION continuity the way
+   `aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff` does for the
+   existing natural-height case (fractional collision-top gap, not just an integer Y). Not
+   strengthened this pass.
+
+**Disposition:** given the deadline and that this is now the third round of real correctness gaps
+found in three successive reviews of the SAME prototype, and given John's own explicit instruction
+("Keep b7ff716 as the ready fallback until these are addressed"), this flat-deck work stays an
+explicitly disclosed, NOT-ready prototype. `b7ff716` (canopy clearance only, independently verified
+clean on a real compiled build) remains the actual candidate for anything beyond continued review.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

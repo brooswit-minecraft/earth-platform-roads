@@ -63,23 +63,39 @@ public final class RoadDeck {
      * column -- passed in rather than re-looked-up, since every caller already has it in hand.
      */
     public static int deckY(EarthGenerator generator, MercatorGrid grid, RoadSegment segment, int worldX, int worldZ) {
-        return sharedHeight(segment, grid, worldX, worldZ, generator::surfaceY,
+        return station(generator, grid, segment, worldX, worldZ).height();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55516: whether a station's own transverse sample actually found a real
+     * cross-slope ({@code minSampledHeight != maxSampledHeight} among qualifying samples) -- NOT
+     * just whether THIS column itself needed raising. The natural-high column of a cross-raised
+     * station has {@code height() == naturalY} for ITSELF (nothing to raise), but still needs its
+     * OWN surface repainted to the same plain flat cap its raised neighbors get; a station with no
+     * cross-slope at all (the overwhelmingly common case) must leave {@code surface()}'s own
+     * material/layering completely alone. See {@link #buildSupportAndDeck}'s own use of this.
+     */
+    public record Station(int height, boolean crossSlopeDetected) {}
+
+    public static Station station(EarthGenerator generator, MercatorGrid grid, RoadSegment segment, int worldX, int worldZ) {
+        return computeStation(segment, grid, worldX, worldZ, generator::surfaceY,
                 (sx, sz) -> segment.equals(RoadNetwork.segmentCoveringColumn(grid, sx, sz)));
     }
 
     /**
-     * The pure geometry/sampling core {@link #deckY} delegates to, with the natural-height lookup and
-     * the "is this sample point still THIS road" check both injected -- lets
-     * {@code RoadCrossSectionTest} exercise the exact sampling/flattening logic against a fully
+     * The pure geometry/sampling core {@link #deckY}/{@link #station} delegate to, with the
+     * natural-height lookup and the "is this sample point still THIS road" check both injected --
+     * lets {@code RoadCrossSectionTest} exercise the exact sampling/flattening logic against a fully
      * synthetic, deterministic fixture (comment 55513's own acceptance case) without needing a real
      * {@code EarthGenerator} or a loaded {@code RoadNetwork} index. {@code sameRoad} should still
-     * check the SAME segment (never a nearby unrelated road); production's own {@link #deckY} does,
+     * check the SAME segment (never a nearby unrelated road); production's own {@link #station} does,
      * via the real spatial index.
      */
-    static int sharedHeight(RoadSegment segment, MercatorGrid grid, int worldX, int worldZ,
+    static Station computeStation(RoadSegment segment, MercatorGrid grid, int worldX, int worldZ,
             java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight,
             java.util.function.BiPredicate<Integer, Integer> sameRoad) {
-        int maxY = naturalHeight.apply(worldX, worldZ);
+        int here = naturalHeight.apply(worldX, worldZ);
+        int maxY = here, minY = here;
         RoadSegment.Projection projection = segment.projectOnto(grid, worldX, worldZ);
         double perpX = projection.perpendicularX(), perpZ = projection.perpendicularZ();
         double halfWidth = segment.pavedHalfWidthBlocks();
@@ -91,8 +107,20 @@ public final class RoadDeck {
             if (sampleZone != RoadSegment.CrossSection.PAVED && sampleZone != RoadSegment.CrossSection.CENTERLINE) continue; // never the shoulder
             int sy = naturalHeight.apply(sx, sz);
             if (sy > maxY) maxY = sy;
+            if (sy < minY) minY = sy;
         }
-        return maxY;
+        return new Station(maxY, minY != maxY);
+    }
+
+    /**
+     * Test-only convenience wrapping {@link #computeStation} to just the height, for existing tests
+     * written against the simpler shape -- production code should go through {@link #station}/
+     * {@link #deckY} so the cross-slope flag is available where it is needed.
+     */
+    static int sharedHeight(RoadSegment segment, MercatorGrid grid, int worldX, int worldZ,
+            java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight,
+            java.util.function.BiPredicate<Integer, Integer> sameRoad) {
+        return computeStation(segment, grid, worldX, worldZ, naturalHeight, sameRoad).height();
     }
 
     /**
@@ -102,13 +130,32 @@ public final class RoadDeck {
      * at natural height: that layering exists specifically to smooth a STEP between differently
      * -heighted neighbor columns, and a deck is flat by construction (every column in the same local
      * group shares the same {@code deckY}), so there is no step here to smooth and a plain full block
-     * is the materially correct choice, not a simplification. No-op if {@code deckY} is not above
-     * this column's own natural height (nothing to add). Confined to this one cube's own Y range --
-     * a deck/support column spanning more than one cube is built a cube's slice at a time, same
-     * per-cube pattern {@link RoadCanopyClearance} already uses.
+     * is the materially correct choice, not a simplification.
+     *
+     * <p>MINECRAFT-566 comment 55516 (independent compiled-build finding, NOT fixed this pass): the
+     * natural-high column of a cross-raised station keeps whatever material/layer count
+     * {@code surface()}'s own {@code RoadSurfaceLayering} had already painted there -- a VISIBLE
+     * mismatch against its raised neighbors' plain full caps at the same Y (reported as
+     * {@code [16,16,...,16,1]} layer counts across one station). A first attempt at fixing this
+     * (forcing a repaint whenever {@code crossSlopeDetected} is true, even for a column that is not
+     * itself being raised) was tried and REVERTED: it broke the existing, already-verified
+     * longitudinal slope-layering continuity test
+     * ({@code aGeneratedShortInclineClosesEveryAdjacentStepToASmallSeamNotAWholeBlockCliff} started
+     * failing with a full-block gap at a real incline column) -- repainting a column to a flat cap
+     * just because its OWN cross-section happens to be sloped elsewhere can introduce a NEW
+     * longitudinal step against an adjacent, differently-raised station that {@code RoadSurfaceLayering}
+     * was correctly smoothing before. Properly reconciling flat-ACROSS with smooth-ALONG needs a
+     * real 2D blended height field, not an independent per-column decision; {@code crossSlopeDetected}
+     * is kept on {@link Station} (and verified directly, see {@code RoadCrossSectionTest}) as a
+     * building block for that future work, but is deliberately NOT used to change what gets painted
+     * here yet. This gap is disclosed, not silently dropped -- see {@code docs/design.md}.
+     *
+     * <p>Confined to this one cube's own Y range -- a deck/support column spanning more than one
+     * cube is built a cube's slice at a time, same per-cube pattern {@link RoadCanopyClearance}
+     * already uses.
      */
     public static void buildSupportAndDeck(
-            int cubeY, LevelChunkSection section, int lx, int lz, int naturalY, int deckY, RoadSegment.CrossSection zone) {
+            int cubeY, LevelChunkSection section, int lx, int lz, int naturalY, int deckY, boolean crossSlopeDetected, RoadSegment.CrossSection zone) {
         if (deckY <= naturalY) return;
         int baseY = cubeY << 4;
         int from = Math.max(0, naturalY + 1 - baseY);
@@ -147,8 +194,8 @@ public final class RoadDeck {
                 int naturalY = generator.surfaceY(worldX, worldZ);
                 int waterY = generator.waterY(worldX, worldZ);
                 if (waterY != io.earthplatform.minecraft.cubic.gen.SurfaceGenerator.DRY && waterY >= naturalY) continue;
-                int deckY = deckY(generator, grid, segment, worldX, worldZ);
-                buildSupportAndDeck(cubeY, section, lx, lz, naturalY, deckY, zone);
+                Station station = station(generator, grid, segment, worldX, worldZ);
+                buildSupportAndDeck(cubeY, section, lx, lz, naturalY, station.height(), station.crossSlopeDetected(), zone);
             }
         }
     }
