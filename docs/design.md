@@ -341,14 +341,38 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   off-origin, nonzero/negative cube index, a real HTTP stub, asserting the real POST bbox matches
   the CORRECT (block-center) cell and explicitly asserting ZERO requests match the buggy raw-cube-
   index bbox (not just "some bbox was sent").
-  **Also raised by 55476, deliberately NOT attempted this pass (named, not hidden):** (1) a tall
-  column spans many cube-Y layers, each independently missing storage and calling this same
-  dispatch for the same X/Z -- correct (per-cell lock/memory cache dedupe it) but potentially
-  wasteful, and on a small worker pool could have several worker threads blocked on one cell's lock
-  at once; 55476 asks for demand to be coalesced per X/Z without blocking generation workers at all,
-  a materially bigger redesign than this pass's scope. (2) 55476's suggestion to bracket the guard
-  with `finally` rather than HEAD/RETURN: `loadNow`'s only other call, `adoptReady`, is NOT fully
-  wrapped in try/catch internally (e.g. `server.getPoiManager().checkConsistencyWithBlocks`,
+  Independently reproduced by John on a real compiled server (clean NeoForge/`combined-73` boot,
+  exact jar SHA-256 recorded, a real `request(key, true)` reaching the compiled worker with no
+  `prepare` call): the buggy build queried `(2.73,-6.58,2.74,-6.57)` for a synthetic signed cube
+  coordinate `(-561017,12,-232999)` whose correct block-center bbox was near
+  `(40.00794797,-105.27404946)` -- exactly the raw-cube-index projection. The SAME verifier rerun
+  against the corrected commit (`a632bdc`) requested exactly one loopback bbox,
+  `(40.000000,-105.280000,40.010000,-105.270000)`, zero raw-index requests, and the worker's `Ready`
+  section actually placed the road surface block at the expected column -- confirming the fix end
+  to end on a real compiled server, not just this repo's own unit tests.
+  **"Bounded-worker" follow-up, also from 55476, addressed next (same comment, continued as the next
+  draft on top):** a tall column spans many cube-Y layers, each independently missing storage and
+  otherwise each separately dispatching for the exact same cell -- correct (per-cell lock/memory
+  cache dedupe it) but potentially wasteful, and on a small worker pool could block several worker
+  threads on one cell's lock at once for up to the full network timeout. Fixed by
+  `RoadTileSource.waysForCellWithBoundedWait` (used only by `ServerCubeWorldRoadPrefetchMixin`, via
+  `RoadPrefetch.forColumnBounded` -- `EarthGeneratorPrepareMixin` keeps using the plain, fully
+  synchronous `forColumn`, preserving its own saved reads/cadence unchanged): every caller for the
+  SAME still-pending cell (every cube-Y layer of one column, concurrently) coalesces onto ONE real
+  fetch via a new `inFlightByCell` map; the actual network wait runs on one dedicated, shared,
+  daemon background thread (`ASYNC_FETCH_EXECUTOR`), never a generation worker; each CALLER only
+  waits up to a short bound (`PREFETCH_WAIT_BOUND`, 2s, versus the full 20s HTTP timeout) before
+  failing open -- the shared fetch keeps running regardless, so a later caller still benefits once
+  it resolves. The Moore-neighborhood lookahead is fully async too (`enqueueLookaheadAsync`): the
+  calling worker thread never waits on it at all. Four new `RoadTileSourceTest` cases prove this
+  with a real delayed HTTP stub: a fetch resolving within the bound returns fresh data promptly; one
+  that outlasts a short bound fails open quickly but still fills the cache once the background fetch
+  actually finishes (polled, not assumed); five concurrent callers for the same cell share exactly
+  one real request; and the async lookahead dispatch returns near-instantly while still actually
+  firing in the background.
+  **Still NOT attempted (named, not hidden):** 55476's suggestion to bracket the guard with
+  `finally` rather than HEAD/RETURN: `loadNow`'s only other call, `adoptReady`, is NOT fully wrapped
+  in try/catch internally (e.g. `server.getPoiManager().checkConsistencyWithBlocks`,
   `BlockEntity.loadStatic` can throw) -- an uncaught exception there would skip the RETURN-site
   `exit()`, leaving that one thread's `SynchronousLoadGuard` stuck active forever. Plain Mixin
   `@Inject` has no built-in try/finally-equivalent injection point; a real fix needs either a

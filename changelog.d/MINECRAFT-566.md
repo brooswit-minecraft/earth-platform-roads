@@ -86,7 +86,21 @@ bump: minor
   own callers already honor) -- the first version queried entirely the wrong map tile (off by a
   factor of 16) on almost every call. Fixed by a new, directly testable
   `RoadPrefetch.cubeIndexToBlockCenter(int)`; proven by a real-HTTP-stub test asserting the correct
-  cell's bbox is requested and the buggy raw-cube-index bbox is explicitly NOT.
+  cell's bbox is requested and the buggy raw-cube-index bbox is explicitly NOT. Independently
+  reproduced (pre-fix) and reconfirmed fixed (post-fix) by John on a real compiled NeoForge +
+  `combined-73` server, down to the exact bbox and the actual placed road-surface block.
+- The same comment's "bounded-worker" follow-up: a tall column's many cube-Y layers were each
+  independently dispatching the same cell's fetch, and a non-first caller would simply block on
+  the per-cell lock for up to the full network timeout. Fixed by
+  `RoadTileSource.waysForCellWithBoundedWait` (used only by the ordinary-streaming
+  `ServerCubeWorldRoadPrefetchMixin`, via `RoadPrefetch.forColumnBounded` --
+  `EarthGeneratorPrepareMixin` is unchanged): every caller for the same still-pending cell coalesces
+  onto one real fetch, the actual network wait runs on one dedicated background thread (never a
+  generation worker), and each caller bounds its own wait to 2s before failing open while the
+  shared fetch keeps running. The Moore-neighborhood lookahead dispatch is now fully async too.
+  Proven by four new `RoadTileSourceTest` cases against a real delayed HTTP stub (prompt return on
+  resolve, fail-open-but-keep-running on timeout, request coalescing across 5 concurrent callers,
+  and non-blocking async lookahead).
 
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
@@ -98,14 +112,11 @@ bump: minor
   so needs a real `ServerLevel`, which this project's `neoForge.unitTest` harness has no fixture
   for (nor does Earth Platform ship one). The new guard logic and the shared dispatch it gates are
   each covered directly instead; see `docs/design.md`'s own note on this for the full breakdown.
-- Per comment 55476, not yet addressed: a tall column's many cube-Y layers each independently
-  dispatch for the same X/Z (correct, deduplicated, but potentially wasteful and could contend
-  several worker threads on one cell's lock at once) -- coalescing that demand without blocking
-  generation workers is a bigger redesign than attempted this pass. Also: `SynchronousLoadGuard`'s
-  exit is wired to `loadNow`'s RETURN, not a true try/finally -- an uncaught exception from
-  `adoptReady` (which is not fully exception-safe internally) would leave that one thread's guard
-  stuck active (fail-safe direction: that thread simply stops prefetching, never incorrectly
-  fetches during an arrival). See `docs/design.md`'s own note for the full reasoning.
+- Per comment 55476, still not addressed: `SynchronousLoadGuard`'s exit is wired to `loadNow`'s
+  RETURN, not a true try/finally -- an uncaught exception from `adoptReady` (which is not fully
+  exception-safe internally) would leave that one thread's guard stuck active (fail-safe direction:
+  that thread simply stops prefetching, never incorrectly fetches during an arrival). See
+  `docs/design.md`'s own note for the full reasoning.
 - `RoadNetwork.segments()`/`junctions()`/`excludedBridgesAndTunnels()` only scan the preloaded
   bundled+external region list -- they do not see live-tile-sourced ways.
 - The tile cache is scoped to the whole game install, not per-save.

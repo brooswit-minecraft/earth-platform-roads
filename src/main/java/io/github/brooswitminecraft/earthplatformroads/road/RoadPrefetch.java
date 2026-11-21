@@ -2,6 +2,7 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 
 import io.earthplatform.geography.GeoPoint;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import java.time.Duration;
 
 /**
  * The one real dispatch -- {@code waysForCell} then {@code enqueueLookahead}, through
@@ -38,6 +39,25 @@ public final class RoadPrefetch {
         GeoPoint point = generator.grid().geographic(x, z);
         tiles.waysForCell(point.latitude(), point.longitude());
         tiles.enqueueLookahead(point.latitude(), point.longitude());
+    }
+
+    /**
+     * MINECRAFT-566 comment 55476's "bounded-worker" ask, for the ordinary-streaming path
+     * specifically ({@code ServerCubeWorldRoadPrefetchMixin}) -- {@link #forColumn} is left
+     * unchanged for {@code EarthGenerator.prepare}/{@code prepareNear} (already async-dispatched by
+     * Earth Platform itself; "preserve saved reads/cadence" per that comment). Bounds the own-cell
+     * wait to {@code bound} via {@link RoadTileSource#waysForCellWithBoundedWait} (coalesced across
+     * every cube-Y layer of the same column, real network wait on a dedicated background thread,
+     * never a generation worker) and dispatches the Moore-neighborhood lookahead fully
+     * asynchronously via {@link RoadTileSource#enqueueLookaheadAsync} -- the calling worker thread
+     * never waits on that at all.
+     */
+    public static void forColumnBounded(EarthGenerator generator, int x, int z, Duration bound) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return;
+        GeoPoint point = generator.grid().geographic(x, z);
+        tiles.waysForCellWithBoundedWait(point.latitude(), point.longitude(), bound);
+        tiles.enqueueLookaheadAsync(point.latitude(), point.longitude());
     }
 
     /**

@@ -10,6 +10,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -386,5 +387,112 @@ class RoadTileSourceTest {
         source.waysForCell(53.06, 13.0); // fails (request 4) -- only ONE failure since the reset
         assertTrue(!source.sustainedOutage(), "A single failure right after a success must not read as a sustained outage");
         assertEquals(4, requestNumber.get());
+    }
+
+    /**
+     * MINECRAFT-566 comment 55476's "bounded-worker" ask: {@code waysForCellWithBoundedWait}, used
+     * by {@code ServerCubeWorldRoadPrefetchMixin} for the ordinary-streaming path.
+     */
+    private HttpServer startDelayedStub(AtomicInteger requestCount, long delayMillis, String response, int statusCode) throws IOException {
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requestCount.incrementAndGet();
+            try {
+                Thread.sleep(delayMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(statusCode, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        this.server = stub;
+        return stub;
+    }
+
+    @Test
+    void boundedWaitReturnsFreshDataPromptlyWhenTheFetchResolvesWithinTheBound(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 100, ONE_WAY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        long start = System.nanoTime();
+        var result = source.waysForCellWithBoundedWait(44.0, 14.0, Duration.ofSeconds(2));
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(1, result.size(), "Expected the real fetched way once it resolved within the bound");
+        assertTrue(elapsedMillis < 1500, "Expected this call to return promptly once the fetch resolved, not wait out the full bound -- took " + elapsedMillis + "ms");
+        assertEquals(1, requests.get());
+    }
+
+    @Test
+    void boundedWaitFailsOpenOnTimeoutButTheFetchKeepsRunningInTheBackground(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 500, ONE_WAY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        long start = System.nanoTime();
+        var result = source.waysForCellWithBoundedWait(45.0, 15.0, Duration.ofMillis(100));
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        assertTrue(result.isEmpty(), "Expected to fail open (empty) once the short bound elapsed before the slower fetch resolved");
+        assertTrue(elapsedMillis < 450, "Expected this call to return at roughly the bound, not wait out the full 500ms fetch -- took " + elapsedMillis + "ms");
+
+        // The fetch this call gave up waiting on keeps running in the background: poll briefly for
+        // the cache to actually fill in, proving nothing was lost or fabricated by the timeout.
+        List<RoadSegment> eventual = List.of();
+        for (int i = 0; i < 20 && eventual.isEmpty(); i++) {
+            Thread.sleep(50);
+            eventual = source.cachedWaysForCellOrEmpty(45.0, 15.0);
+        }
+        assertEquals(1, eventual.size(), "Expected the background fetch to eventually populate the cache after this call gave up waiting");
+        assertEquals(1, requests.get(), "Expected only the one real request, not a second one from giving up and retrying");
+    }
+
+    @Test
+    void concurrentBoundedWaitCallsForTheSameStillPendingCellCoalesceIntoOneRealRequest(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 300, ONE_WAY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        // Models several of a tall column's cube-Y layers all independently missing storage at
+        // once: every caller asks for the SAME cell, concurrently, before the first fetch resolves.
+        int callers = 5;
+        var ready = new java.util.concurrent.CountDownLatch(callers);
+        var results = new java.util.concurrent.CopyOnWriteArrayList<List<RoadSegment>>();
+        List<Thread> threads = new java.util.ArrayList<>();
+        for (int i = 0; i < callers; i++) {
+            Thread t = new Thread(() -> {
+                ready.countDown();
+                results.add(source.waysForCellWithBoundedWait(46.0, 16.0, Duration.ofSeconds(2)));
+            });
+            threads.add(t);
+            t.start();
+        }
+        for (Thread t : threads) t.join();
+
+        assertEquals(callers, results.size());
+        for (var result : results) {
+            assertEquals(1, result.size(), "Expected every caller to see the real fetched way once it resolved");
+        }
+        assertEquals(1, requests.get(), "Expected exactly ONE real request shared across every concurrent caller for the same cell, not one per caller");
+    }
+
+    @Test
+    void enqueueLookaheadAsyncDoesNotBlockTheCallingThread(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startDelayedStub(requests, 300, EMPTY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        long start = System.nanoTime();
+        source.enqueueLookaheadAsync(47.0, 17.0);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        assertTrue(elapsedMillis < 100, "Expected enqueueLookaheadAsync to return immediately, not wait on the real (slow) fetch -- took " + elapsedMillis + "ms");
+
+        // The real dispatch still actually happens, just off this thread.
+        for (int i = 0; i < 20 && requests.get() == 0; i++) Thread.sleep(50);
+        assertEquals(1, requests.get(), "Expected the real lookahead dispatch to have actually happened in the background");
     }
 }

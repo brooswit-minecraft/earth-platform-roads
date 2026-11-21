@@ -16,7 +16,13 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -140,6 +146,83 @@ public final class RoadTileSource {
     private static final int LOOKAHEAD_QUEUE_CAPACITY = 64;
     private final java.util.Set<Long> queuedCellKeys = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final java.util.Deque<long[]> lookaheadQueue = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
+    /**
+     * MINECRAFT-566 comment 55476's "bounded-worker" ask: {@code ServerCubeWorld.produce} runs on a
+     * background worker-pool thread (see {@code ServerCubeWorldRoadPrefetchMixin}), but that pool is
+     * finite and shared across every generating column -- a tall column's many cube-Y layers each
+     * independently miss storage and would otherwise each call {@link #waysForCell} for the exact
+     * same cell, and whichever one is NOT first would simply block (waiting on {@link #cellLocks})
+     * for up to this source's full network timeout. {@link #waysForCellWithBoundedWait} fixes both
+     * problems at once: multiple callers for the SAME still-pending cell share (coalesce onto) ONE
+     * real fetch via this map, keyed exactly like every other cell-keyed map here, and the actual
+     * network wait happens on {@link #ASYNC_FETCH_EXECUTOR} (a single dedicated background thread,
+     * never a generation worker), while each CALLER only waits up to its own short, bounded
+     * interval before failing open -- the shared fetch keeps running regardless, so a later caller
+     * (another Y-level, or simply revisiting the cell) still benefits once it resolves.
+     */
+    private final ConcurrentHashMap<Long, CompletableFuture<List<RoadSegment>>> inFlightByCell = new ConcurrentHashMap<>();
+
+    /**
+     * One dedicated, shared, daemon background thread that performs every ACTUAL network wait
+     * {@link #waysForCellWithBoundedWait} and {@link #enqueueLookaheadAsync} trigger -- never a
+     * generation worker thread. A single thread is enough: {@link #networkLock} already permits only
+     * one real outbound request across this (or any) instance at a time, so there is never real
+     * parallel work for a second thread to pick up here. {@code static} (shared across every
+     * {@code RoadTileSource} instance, production included) rather than per-instance, since
+     * ordinarily there is exactly one production instance anyway and a per-instance pool would leak
+     * one thread per short-lived test instance; daemon so it never blocks JVM/test-runner shutdown.
+     */
+    private static final ExecutorService ASYNC_FETCH_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "earthplatformroads-road-tile-fetch");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /**
+     * {@link #waysForCell} for this cell, but bounded: if the cell is not already resolved
+     * (ready/confirmed-empty, checked first, free), the real fetch is dispatched onto
+     * {@link #ASYNC_FETCH_EXECUTOR} (coalesced via {@link #inFlightByCell} -- a second caller for
+     * the same still-unresolved cell shares the first caller's in-flight future rather than starting
+     * a second one) and this call waits at most {@code bound} for it. On timeout, returns an empty
+     * list WITHOUT cancelling the fetch -- it keeps running in the background exactly as an ordinary
+     * {@link #waysForCell} failure/pending case already would, so nothing is fabricated and the cell
+     * stays genuinely retryable; a later access (another Y-level's own call, or simply the next time
+     * anything touches this cell) still sees the result once it actually resolves. Never invoked
+     * from {@code loadNow}'s synchronous arrival path -- see
+     * {@code ServerCubeWorldRoadPrefetchMixin}'s own doc.
+     */
+    public List<RoadSegment> waysForCellWithBoundedWait(double lat, double lon, Duration bound) {
+        List<RoadSegment> alreadyResolved = cachedWaysForCellOrEmpty(lat, lon);
+        if (!alreadyResolved.isEmpty() || cellState(lat, lon) != CellState.PENDING) return alreadyResolved; // ready, or genuinely confirmed-empty: no wait needed
+        long key = cellKeyOf(lat, lon);
+        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k -> {
+            CompletableFuture<List<RoadSegment>> dispatched = CompletableFuture.supplyAsync(() -> waysForCell(lat, lon), ASYNC_FETCH_EXECUTOR);
+            dispatched.whenComplete((result, error) -> inFlightByCell.remove(key, dispatched));
+            return dispatched;
+        });
+        try {
+            return future.get(bound.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            return List.of(); // fail open: the shared future above keeps running regardless
+        } catch (ExecutionException e) {
+            return List.of(); // waysForCell itself never throws checked exceptions here, but guard anyway rather than propagate
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return List.of();
+        }
+    }
+
+    /** {@link #enqueueLookahead}, dispatched onto {@link #ASYNC_FETCH_EXECUTOR} so the calling (generation worker) thread never waits on it at all. */
+    public void enqueueLookaheadAsync(double lat, double lon) {
+        ASYNC_FETCH_EXECUTOR.execute(() -> enqueueLookahead(lat, lon));
+    }
+
+    private static long cellKeyOf(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        return (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+    }
 
     /**
      * The only origin+path this class will ever attach {@link #apiKey} to, regardless of what

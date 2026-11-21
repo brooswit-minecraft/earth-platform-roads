@@ -4,6 +4,7 @@ import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import io.github.brooswitminecraft.earthplatformroads.road.SynchronousLoadGuard;
+import java.time.Duration;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -51,15 +52,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * <p>The injection point inside {@code produce} is immediately BEFORE its call to
  * {@code CubeGenerator.generate(...)} -- after the storage-read fast path has already returned (a
  * saved/edited cube is read and returned above this point without ever reaching here, preserving
- * that fast path exactly as before), and before generation actually runs. This reuses the exact same
- * bounded, deduplicated, one-in-flight, rate-limited dispatch {@code EarthGeneratorPrepareMixin}
- * already uses ({@link RoadPrefetch#forColumn}) -- not a new parallel mechanism -- so a cell that is
- * not yet eligible to fetch (cooldown in effect, or another fetch already in flight) returns
- * immediately without blocking beyond what that path already bounds. Because this runs on the
- * background worker thread BEFORE {@code generate()}, a cell that IS eligible and DOES fetch
- * successfully makes its data available to {@code EarthGeneratorRoadMixin}'s {@code surface()} hook
- * during THIS SAME generation call -- not a retrofit of an already-saved cube, and not a second,
- * later generation pass. A cell that stays pending (not yet eligible, or a genuine network failure)
+ * that fast path exactly as before), and before generation actually runs. This dispatches through
+ * {@link RoadPrefetch#forColumnBounded} -- built on the exact same deduplicated, one-in-flight,
+ * rate-limited {@code RoadTileSource} machinery {@code EarthGeneratorPrepareMixin} already uses, not
+ * a second parallel mechanism -- but bounded (see {@link #PREFETCH_WAIT_BOUND} and comment 55476's
+ * "bounded-worker" ask, below) rather than fully synchronous, since this specific call site is a
+ * finite, shared generation-worker pool. Because this runs on the background worker thread BEFORE
+ * {@code generate()}, a cell that resolves within the bound makes its data available to
+ * {@code EarthGeneratorRoadMixin}'s {@code surface()} hook during THIS SAME generation call -- not a
+ * retrofit of an already-saved cube, and not a second, later generation pass. A cell that stays
+ * pending (not yet eligible, a genuine network failure, or simply still in flight past the bound)
  * generates with no road for this one column, exactly as every other pending/failed cell already
  * does -- never fabricated as confirmed-empty, still retryable the next time anything touches it.
  *
@@ -76,6 +78,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * through, querying entirely the wrong map tile (off by a factor of 16) on almost every call. Fixed
  * by converting to the cube's own center block coordinate, {@code (cubeX << 4) + 8} /
  * {@code (cubeZ << 4) + 8}, before dispatching -- see the injection method's own inline comment.
+ *
+ * <h2>The "bounded-worker" follow-up, also asked for in comment 55476</h2>
+ * Two related concerns about this call site specifically (the finite, shared generation-worker
+ * pool): a tall column spans many cube-Y layers, each independently missing storage and otherwise
+ * each separately dispatching for the exact same cell; and whichever such call is not first would
+ * simply BLOCK (on {@code RoadTileSource}'s own per-cell lock) for up to the full network timeout
+ * rather than failing open quickly. Both are addressed by routing through
+ * {@link RoadPrefetch#forColumnBounded} instead of the plain {@link RoadPrefetch#forColumn}
+ * {@code EarthGeneratorPrepareMixin} still uses: {@code RoadTileSource.waysForCellWithBoundedWait}
+ * coalesces every caller for the same still-pending cell onto ONE real fetch (keyed by cell, so
+ * every cube-Y layer of one column shares it), runs that fetch's actual network wait on one
+ * dedicated background thread (never a generation worker), and bounds each CALLER's own wait to
+ * {@link #PREFETCH_WAIT_BOUND} before failing open -- the shared fetch keeps running regardless, so
+ * a later caller still benefits once it resolves. The Moore-neighborhood lookahead dispatch is fully
+ * async too ({@code enqueueLookaheadAsync}): the calling worker thread never waits on it at all.
  *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
@@ -94,6 +111,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(targets = "io.earthplatform.minecraft.cubic.ServerCubeWorld")
 public abstract class ServerCubeWorldRoadPrefetchMixin {
+    /**
+     * MINECRAFT-566 comment 55476's "bounded-worker" ask: how long THIS generation worker thread
+     * may wait for a fresh fetch before failing open -- short relative to the full HTTP timeout
+     * ({@code RoadNetwork.TILE_FETCH_TIMEOUT}, 20s), long enough to usually catch a healthy
+     * provider's own response. See {@code RoadTileSource#waysForCellWithBoundedWait}'s own doc for
+     * why a timeout here never loses or fabricates anything -- the real fetch keeps running
+     * regardless, coalesced across every cube-Y layer of this same column.
+     */
+    private static final Duration PREFETCH_WAIT_BOUND = Duration.ofSeconds(2);
+
     @Shadow
     private CubeGenerator generator;
 
@@ -124,6 +151,10 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // center avoids ever landing exactly on a tile-boundary column by construction.
         int centerBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
         int centerBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
-        RoadPrefetch.forColumn(earthGenerator, centerBlockX, centerBlockZ);
+        // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
+        // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
+        // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
+        // network wait happening on a dedicated background thread, never this one.
+        RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
     }
 }
