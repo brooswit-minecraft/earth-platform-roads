@@ -2,6 +2,8 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 
 import io.earthplatform.geography.GeoPoint;
 import io.earthplatform.geography.globe.MercatorGrid;
+import io.earthplatform.minecraft.cubic.CubeKey;
+import io.earthplatform.minecraft.cubic.CubeWorld;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
 import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat;
@@ -297,6 +299,114 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55560: John's own independent native verification of commit 653e870
+     * found a real remaining release blocker in {@link #isAnyRelevantCellPendingNearBlock}/
+     * {@code dispatchRelevantCellFetchesNearBlock} as the gate mixin used them: that pair (and the
+     * mixin's own center-cube-only {@code isCenterCubeNaturallyRelevant} precheck it was gated by)
+     * treats the WHOLE 3x3x3 neighborhood as uniformly relevant once the single center cube passes,
+     * so a genuinely irrelevant neighbor cube (his own repro: remove just one upper cube, prove it
+     * has no natural surface) still ends up waited-for and dispatched, issuing a real unnecessary
+     * POST purely because it happens to share the neighborhood with a relevant, missing center cube.
+     *
+     * <p>Fixed per his own exact prescription: use {@code CubeWorld}'s own public, inherited
+     * {@code cube(long)} (confirmed by reading {@code CubeWorld} itself) together with
+     * {@code CubeKey.pack(cx+dx, cy+dy, cz+dz)} -- THE SAME key {@code ServerCubeWorld.readyAround}/
+     * {@code loadAround} compute internally, confirmed by reading their own real bytecode -- over
+     * all 27 of the final {@code dx,dy,dz} offsets, rather than one shared center-cube precheck.
+     * Only a cube that is BOTH still missing from {@code cubes}'s own loaded set ({@code cube(key)
+     * == null}: an already-loaded cube can never be at risk of a forced-generation side effect,
+     * regardless of whether its own footprint is road-relevant) AND naturally-surface-relevant (the
+     * existing, unchanged {@link #cubeContainsNaturalSurface} check) creates any map demand at all.
+     *
+     * <p>"Coalesce missing Y bands per X/Z" (his own phrase): grouped by {@code dx,dz} column --
+     * once any ONE of a column's three {@code dy} layers is found both missing and relevant, that
+     * whole column's own cell footprint ({@link #intersectingCellsForCube}) is queried/dispatched
+     * exactly once, never redundantly re-derived for each of its (up to three) missing Y layers.
+     * "Retain wrapped/outer strip and positive controls": the per-cube cell computation reuses
+     * {@link #intersectingCellsForCube}, which shares the SAME antimeridian-unwrap/normalize logic
+     * {@link #intersectingCells} already uses (see that method's own doc for the real math), and a
+     * cube with NO missing-relevant layer at all (e.g. one already fully loaded, or the known-
+     * irrelevant upper cube from his own repro) is simply excluded, never silently treated as
+     * "resolved" -- the ordinary, ALL-missing cold-boot case (no cube loaded at all) still reports
+     * every relevant column's cells exactly as the prior, whole-neighborhood check did.
+     */
+    public static boolean isAnyMissingRelevantCellPendingNearBlock(
+            CubeWorld cubes, EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return false;
+        for (long[] cell : missingRelevantIntersectingCells(cubes, generator, blockX, blockY, blockZ)) {
+            double lat = (cell[0] + 0.5) * RoadNetwork.CELL_DEGREES;
+            double lon = normalizeLongitude((cell[1] + 0.5) * RoadNetwork.CELL_DEGREES);
+            if (tiles.cellState(lat, lon) == RoadTileSource.CellState.PENDING) return true;
+        }
+        return false;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: the dispatch counterpart to
+     * {@link #isAnyMissingRelevantCellPendingNearBlock} -- see that method's own doc for the full
+     * "missing AND relevant, coalesced per X/Z column" reasoning this shares via
+     * {@link #missingRelevantIntersectingCells}.
+     */
+    public static void dispatchMissingRelevantCellFetchesNearBlock(
+            CubeWorld cubes, EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return;
+        for (long[] cell : missingRelevantIntersectingCells(cubes, generator, blockX, blockY, blockZ)) {
+            double lat = (cell[0] + 0.5) * RoadNetwork.CELL_DEGREES;
+            double lon = normalizeLongitude((cell[1] + 0.5) * RoadNetwork.CELL_DEGREES);
+            tiles.dispatchCellFetch(lat, lon);
+            tiles.enqueueLookaheadAsync(lat, lon);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: the real set of map cells worth any demand at all for this
+     * landing position's full 3x3x3 cube neighborhood -- see
+     * {@link #isAnyMissingRelevantCellPendingNearBlock}'s own doc for the full reasoning. Never
+     * touches {@code generator.surfaceY} itself here (that happens inside
+     * {@link #cubeContainsNaturalSurface}, unchanged); this method's own job is purely the
+     * missing/loaded check plus the per-column coalescing and cell deduplication.
+     */
+    private static List<long[]> missingRelevantIntersectingCells(
+            CubeWorld cubes, EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        int cx = blockX >> 4, cy = blockY >> 4, cz = blockZ >> 4;
+        java.util.Set<Long> seenCells = new java.util.LinkedHashSet<>();
+        List<long[]> cells = new java.util.ArrayList<>();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                boolean columnNeedsMapDemand = false;
+                for (int dy = -1; dy <= 1; dy++) {
+                    long key = CubeKey.pack(cx + dx, cy + dy, cz + dz);
+                    if (cubes.cube(key) != null) continue; // already loaded: never at risk of a forced side effect
+                    if (cubeContainsNaturalSurface(generator, cx + dx, cy + dy, cz + dz)) {
+                        columnNeedsMapDemand = true;
+                        break; // coalesce: one missing+relevant layer is enough to need this whole column's cells
+                    }
+                }
+                if (!columnNeedsMapDemand) continue;
+                for (long[] cell : intersectingCellsForCube(generator, cx + dx, cz + dz)) {
+                    long packedCell = (cell[0] << 32) ^ (cell[1] & 0xFFFFFFFFL);
+                    if (seenCells.add(packedCell)) cells.add(cell);
+                }
+            }
+        }
+        return cells;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: the real map cells a single cube's own 16x16 X/Z footprint
+     * intersects -- the same antimeridian-safe corner computation {@link #intersectingCells} uses
+     * for the whole 3x3 neighborhood, narrowed to one cube so {@link #missingRelevantIntersectingCells}
+     * can query/dispatch only the specific missing+relevant columns it finds, not the full
+     * neighborhood's bounding box regardless of which cubes within it actually need anything.
+     */
+    private static List<long[]> intersectingCellsForCube(EarthGenerator generator, int cubeX, int cubeZ) {
+        int baseX = cubeX << 4, baseZ = cubeZ << 4;
+        return intersectingCellsForBounds(generator, baseX, baseX + 15, baseZ, baseZ + 15);
+    }
+
+    /**
      * MINECRAFT-566 comment 55558: {@link #intersectingCells}'s own antimeridian "unwrap" can
      * produce a cell index whose derived center longitude lands outside the ordinary -180..180
      * range (e.g. 180.01) -- this brings any such value back into that range before it is ever
@@ -320,10 +430,21 @@ public final class RoadPrefetch {
      * this whole 48-block-wide neighborhood.
      */
     private static List<long[]> intersectingCells(EarthGenerator generator, int blockX, int blockZ) {
-        MercatorGrid grid = generator.grid();
         int cx = blockX >> 4, cz = blockZ >> 4;
         int minBlockX = cubeIndexToBlockCenter(cx - 1) - 8, maxBlockX = cubeIndexToBlockCenter(cx + 1) + 7;
         int minBlockZ = cubeIndexToBlockCenter(cz - 1) - 8, maxBlockZ = cubeIndexToBlockCenter(cz + 1) + 7;
+        return intersectingCellsForBounds(generator, minBlockX, maxBlockX, minBlockZ, maxBlockZ);
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: the shared corner-to-cell computation {@link #intersectingCells}
+     * (the whole 3x3 neighborhood's own bounding box) and {@link #intersectingCellsForCube} (one
+     * single cube's own 16x16 footprint) both reduce to -- pulled out once rather than duplicated,
+     * so the antimeridian unwrap logic (comment 55558) stays in exactly one place.
+     */
+    private static List<long[]> intersectingCellsForBounds(
+            EarthGenerator generator, int minBlockX, int maxBlockX, int minBlockZ, int maxBlockZ) {
+        MercatorGrid grid = generator.grid();
         double minLat = Double.MAX_VALUE, maxLat = -Double.MAX_VALUE;
         double[] cornerLons = new double[4];
         int i = 0;

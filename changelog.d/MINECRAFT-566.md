@@ -423,9 +423,37 @@ bump: minor
   every X/Z tile unconditionally": added a cheap pre-check (`RoadPrefetch.cubeContainsNaturalSurface`,
   reused as-is, against just the landing position's own CENTER cube) before the cell-intersection
   check runs at all -- an arrival landing deep underground or far up in open sky gains nothing from
-  holding. A fuller "which of the 27 cubes are missing" breakdown was not attempted (no clear
-  existing `ServerCubeWorld` API found for it); this is a reasonable, cheap partial step, not the
-  full ask. 92/92 tests pass.
+  holding. A fuller "which of the 27 cubes are missing" breakdown was not attempted this round (see
+  comment 55560's fix below, which replaces this center-cube-only narrowing). 92/92 tests pass.
+
+### Fixed (comment 55560, the full "which of the 27 cubes are missing" breakdown)
+- John's own independent native verification of commit 653e870 found one real remaining blocker in
+  the center-cube-only narrowing above, naming his own exact repro: remove just one upper cube from
+  the neighborhood, prove it has no natural surface, and the command still stays queued at 200 and
+  issues one unnecessary POST -- purely because that one irrelevant cube shares the neighborhood
+  with the relevant, missing center cube.
+- Fixed per his own exact prescription: `RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock`/
+  `dispatchMissingRelevantCellFetchesNearBlock` (new) check all 27 real `dx,dy,dz` offsets
+  individually, using `CubeWorld`'s own public, inherited `cube(long)` together with
+  `CubeKey.pack(cx+dx, cy+dy, cz+dz)` -- the SAME key `ServerCubeWorld.readyAround`/`loadAround`
+  compute internally (confirmed by reading their real bytecode) -- rather than one shared
+  center-cube precheck. Only a cube that is BOTH still missing AND naturally-surface-relevant
+  creates any map demand at all. Coalesced per his own "coalesce missing Y bands per X/Z": grouped
+  by `dx,dz` column, so a column's own cell footprint is queried/dispatched once per column, never
+  redundantly per missing Y layer. The mixin's old `isCenterCubeNaturallyRelevant`/
+  `isRoadPendingAndDispatch` helpers are replaced by `isMissingRelevantRoadPendingAndDispatch`,
+  which delegates to the new pair.
+- Retained the positive control, per his own explicit ask: a new test
+  (`isAnyMissingRelevantCellPendingNearBlockReportsPendingWhenNothingIsLoadedAtAll`) proves the
+  ordinary, fully-cold-boot case (nothing loaded at all) still reports pending/dispatches exactly
+  as the prior check did. A second new test
+  (`aMissingButNaturallyIrrelevantUpperCubeCreatesNoMapDemandEvenWithAColdCache`) reproduces his own
+  exact repro directly, against a minimal, real `CubeWorld` subclass with 26 of the 27 real
+  neighborhood cubes populated via real `EarthGenerator.generate` sections and the naturally
+  irrelevant upper cube left missing -- asserting zero pending and zero dispatched requests even
+  against a stone-cold tile cache. 94/94 tests pass (`compileJava`/`compileTestJava` both clean).
+  One unrelated, pre-existing timing-sensitive test in `RoadTileSourceTest` flaked once in a
+  full-suite run and passed cleanly in isolation -- not touched by this change.
 
 ### Known gaps
 - `CubicEventsArrivalRoadGateMixin` (comments 55551 through 55556) is not yet independently

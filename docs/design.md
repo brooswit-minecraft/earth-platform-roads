@@ -1444,6 +1444,61 @@ cheap, well-justified partial step using existing, already-tested infrastructure
 validate against the real dependency; no new automated test added for the antimeridian fix itself,
 per the disclosed reasoning above).
 
+## MINECRAFT-566: the "which of the 27 cubes are missing" fix, found by native verification of 653e870 (comment 55560)
+
+John's own independent native verification of commit 653e870 passed the date-line, cold-command,
+and already-loaded-revisit cases, but found one real remaining release blocker, naming the exact
+fix: "remove only one upper cube from that same fixture, prove it has no natural surface, then with
+cold map data the command still stays queued at 200 and issues one unnecessary POST."
+
+**The bug:** the prior version's `isCenterCubeNaturallyRelevant` precheck (comment 55558's own
+"further narrowing") qualified relevance against only the CENTER cube, then -- once that one check
+passed -- checked/dispatched road data across the WHOLE 3x3 neighborhood's cell-intersection
+bounding box, regardless of which of the other 26 cubes in that neighborhood actually needed
+anything. A neighbor cube that is itself missing but has no natural surface at all (his own "upper
+cube" case) still forced a wait and a dispatch, purely because it happened to share the
+neighborhood with the relevant, missing center cube.
+
+**The fix**, per his own exact prescription: use `CubeWorld`'s own public, inherited `cube(long)`
+(confirmed by reading `CubeWorld` itself) together with `CubeKey.pack(cx+dx, cy+dy, cz+dz)` -- THE
+SAME key `ServerCubeWorld.readyAround`/`loadAround` compute internally for their own `containsKey`
+checks, confirmed by reading their real bytecode -- over all 27 of the final `dx,dy,dz` offsets,
+not one shared center-cube precheck. `RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock`/
+`dispatchMissingRelevantCellFetchesNearBlock` (new) take the real `ServerCubeWorld` (as its own
+`CubeWorld` supertype) alongside the generator and landing block position: only a cube that is BOTH
+still missing from the cube world's own loaded set AND naturally-surface-relevant (the existing,
+unchanged `cubeContainsNaturalSurface`) creates any map demand at all. Per his own "coalesce missing
+Y bands per X/Z": grouped by `dx,dz` column -- once any ONE of a column's three `dy` layers is found
+both missing and relevant, that whole column's own cell footprint (`intersectingCellsForCube`, a new
+single-cube narrowing of the same antimeridian-safe corner computation `intersectingCells` already
+used, both now sharing one `intersectingCellsForBounds` helper) is queried/dispatched exactly once,
+never redundantly re-derived per missing Y layer. The old `isCenterCubeNaturallyRelevant`/
+`isRoadPendingAndDispatch` mixin helpers are gone -- replaced by
+`isMissingRelevantRoadPendingAndDispatch`, which simply delegates to the new `RoadPrefetch` pair.
+
+**Retaining positive controls**, per his own explicit ask: the ordinary, fully-cold-boot case (no
+cube loaded at all) still reports every relevant column's cells exactly as the prior,
+whole-neighborhood-only check did -- proven by a new test
+(`isAnyMissingRelevantCellPendingNearBlockReportsPendingWhenNothingIsLoadedAtAll`) mirroring the
+existing cube-level and near-block tests, confirming this narrowing did not regress the common real
+case. A second new test
+(`aMissingButNaturallyIrrelevantUpperCubeCreatesNoMapDemandEvenWithAColdCache`) reproduces his own
+exact repro directly: a minimal, real `CubeWorld` subclass (`TestCubeWorld`, just enough to exercise
+the real, inherited `cube(long)`/`cubes` map -- the same disclosed "no full `ServerCubeWorld`/
+`ServerLevel` harness" test gap every mixin in this ticket already has) with 26 of the real
+landing-centered neighborhood's 27 cubes populated via `EarthGenerator.generate` (a real section per
+cube, the same primitive other tests in this class already use) and exactly the cube directly above
+the ground-containing cube left missing, after sanity-asserting that cube genuinely has no natural
+surface at this real terrain location. Asserts zero pending and zero dispatched requests against a
+stone-cold tile cache -- the exact scenario his own native fixture found failing.
+
+94/94 tests pass (`./gradlew compileJava`/`compileTestJava` both clean -- the new `CubeWorld`/
+`CubeKey` references and the unchanged Mixin target descriptors all validate against the real
+dependency classpath). One unrelated, pre-existing timing-sensitive test
+(`RoadTileSourceTest.dispatchCellFetchStaysRegisteredAndActuallyResolvesAcrossASteadyCooldown`)
+flaked once in a full-suite run and passed cleanly on its own in isolation -- not touched by this
+change, not re-investigated here.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

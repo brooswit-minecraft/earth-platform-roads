@@ -156,26 +156,29 @@ public abstract class CubicEventsArrivalRoadGateMixin {
         CubeGenerator generator = cubes.generator();
         boolean roadPending = generator instanceof EarthGenerator earthGenerator
                 && RoadPrefetch.hasLiveTileSource()
-                && isCenterCubeNaturallyRelevant(earthGenerator, pos)
-                && isRoadPendingAndDispatch(earthGenerator, pos);
+                && isMissingRelevantRoadPendingAndDispatch(cubes, earthGenerator, pos);
         roadHeld.set(roadPending);
         return false; // terrainReady is already known false here
     }
 
-    private static boolean isCenterCubeNaturallyRelevant(EarthGenerator earthGenerator, BlockPos pos) {
-        // MINECRAFT-566 comment 55558: "qualify only missing natural-surface-relevant cubes rather
-        // than blocking on every X/Z tile unconditionally." A single, cheap check (one 256-column
-        // scan, not scanning every cube in the neighborhood) against the CENTER cube -- the one the
-        // arrival's own landing position actually sits in -- rather than treating the whole 3x3
-        // neighborhood as uniformly relevant regardless of whether any of it could plausibly show
-        // natural surface at all (e.g. an arrival whose own landing column is deep underground or
-        // far up in open sky gains nothing from holding for road data).
-        return RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
-    }
-
-    private static boolean isRoadPendingAndDispatch(EarthGenerator earthGenerator, BlockPos pos) {
-        RoadPrefetch.dispatchRelevantCellFetchesNearBlock(earthGenerator, pos.getX(), pos.getY(), pos.getZ());
-        return RoadPrefetch.isAnyRelevantCellPendingNearBlock(earthGenerator, pos.getX(), pos.getY(), pos.getZ());
+    /**
+     * MINECRAFT-566 comment 55560: John's own independent native verification found a real,
+     * confirmed bug in the previous version of this gate -- it qualified relevance against only the
+     * CENTER cube, then (if relevant) checked/dispatched road data for the WHOLE 3x3 neighborhood's
+     * bounding box regardless of which of the other 26 cubes actually needed anything. His own
+     * repro: remove just one upper cube from the neighborhood, prove it has no natural surface, and
+     * the command still stays queued and issues one unnecessary POST purely because it shares the
+     * neighborhood with the relevant, missing center cube. Fixed by delegating to
+     * {@link RoadPrefetch#isAnyMissingRelevantCellPendingNearBlock}/
+     * {@code dispatchMissingRelevantCellFetchesNearBlock}, which check all 27 of the real
+     * {@code dx,dy,dz} offsets individually against {@code cubes}'s own loaded set (via
+     * {@code CubeWorld.cube(long)}/{@code CubeKey.pack}, per his own exact prescription) -- only a
+     * cube that is BOTH still missing AND naturally relevant creates any map demand at all. See that
+     * method's own doc for the full reasoning, including the per-X/Z-column coalescing he asked for.
+     */
+    private static boolean isMissingRelevantRoadPendingAndDispatch(ServerCubeWorld cubes, EarthGenerator earthGenerator, BlockPos pos) {
+        RoadPrefetch.dispatchMissingRelevantCellFetchesNearBlock(cubes, earthGenerator, pos.getX(), pos.getY(), pos.getZ());
+        return RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, earthGenerator, pos.getX(), pos.getY(), pos.getZ());
     }
 
     @ModifyExpressionValue(method = "arrive(Lnet/minecraft/server/level/ServerLevel;Lio/earthplatform/minecraft/cubic/ServerCubeWorld;)V",

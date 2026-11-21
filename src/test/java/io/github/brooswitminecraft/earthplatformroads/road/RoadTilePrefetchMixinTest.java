@@ -6,6 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.mojang.serialization.Lifecycle;
 import com.sun.net.httpserver.HttpServer;
 import io.earthplatform.geography.globe.TerrariumTileSource;
+import io.earthplatform.minecraft.cubic.Cube;
+import io.earthplatform.minecraft.cubic.CubeKey;
+import io.earthplatform.minecraft.cubic.CubeWorld;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.earth.EarthSettings;
 import java.io.IOException;
@@ -17,6 +20,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.MappedRegistry;
 import net.minecraft.core.RegistrationInfo;
@@ -24,6 +28,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -1345,6 +1350,154 @@ class RoadTilePrefetchMixinTest {
             assertTrue(requests.get() >= 1, "Expected dispatchRelevantCellFetchesNearBlock to have sent a real request");
             assertTrue(!RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
                     "Expected the SAME landing position to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: a minimal, real {@code CubeWorld} subclass -- just enough to
+     * drive {@link RoadPrefetch#isAnyMissingRelevantCellPendingNearBlock}/
+     * {@code dispatchMissingRelevantCellFetchesNearBlock}'s own {@code cube(long)} check without a
+     * full {@code ServerCubeWorld}/{@code ServerLevel} (the same disclosed test gap every other
+     * mixin in this class already has -- see {@code CubicEventsArrivalRoadGateMixin}'s own class
+     * doc). {@code CubeWorld.cube(long)} never touches the {@code Level} passed to its constructor,
+     * so {@code null} is safe here; only the inherited, protected {@code cubes} map is actually
+     * exercised, via {@link #markLoaded}.
+     */
+    private static final class TestCubeWorld extends CubeWorld {
+        TestCubeWorld() {
+            super(null);
+        }
+
+        @Override
+        protected int baselineTop(int x, int z) {
+            return Integer.MIN_VALUE;
+        }
+
+        @Override
+        public void blockChanged(BlockPos pos) {
+        }
+
+        void markLoaded(int cubeX, int cubeY, int cubeZ, LevelChunkSection section) {
+            this.cubes.put(CubeKey.pack(cubeX, cubeY, cubeZ), new Cube(cubeX, cubeY, cubeZ, section));
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560's "positive control": the ordinary, fully-cold-boot case (no
+     * cube loaded at all) must still report the new, per-cube {@code isAnyMissingRelevantCellPendingNearBlock}/
+     * {@code dispatchMissingRelevantCellFetchesNearBlock} pair exactly as pending/dispatchable as
+     * the prior, whole-neighborhood-only check did -- proving the missing/loaded narrowing added
+     * for his own "upper cube" repro did not regress the common real case (nothing loaded yet).
+     */
+    @Test
+    void isAnyMissingRelevantCellPendingNearBlockReportsPendingWhenNothingIsLoadedAtAll(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555100,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Missing Relevant Test Road"},
+                  "geometry":[{"lat":49.0010,"lon":-119.0050},{"lat":49.0060,"lon":-119.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 49.0035, lon = -119.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int ground = generator.surfaceY(block[0], block[1]);
+
+            TestCubeWorld cubes = new TestCubeWorld(); // nothing loaded at all: every one of the 27 cubes is missing
+
+            assertTrue(RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], ground, block[1]),
+                    "Expected the 3x3x3 cube neighborhood around this never-fetched landing column to be reported pending");
+
+            RoadPrefetch.dispatchMissingRelevantCellFetchesNearBlock(cubes, generator, block[0], ground, block[1]);
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchMissingRelevantCellFetchesNearBlock to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], ground, block[1]),
+                    "Expected the SAME landing position to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560's own real repro, the actual release blocker this whole round
+     * fixes: with every OTHER cube in the 3x3x3 neighborhood already loaded, a single remaining
+     * missing cube that genuinely has no natural surface anywhere in its own 16x16 footprint (his
+     * own "upper cube" case) must create NO map demand at all -- not pending, and not dispatched --
+     * even though the tile cache for this whole area is stone cold. Under the PRIOR, whole-
+     * neighborhood-bounding-box check this would have falsely stayed pending and issued one
+     * unnecessary POST purely because it shared the neighborhood with the relevant, loaded center
+     * cube; that is exactly the bug his own native verification of commit 653e870 found.
+     */
+    @Test
+    void aMissingButNaturallyIrrelevantUpperCubeCreatesNoMapDemandEvenWithAColdCache(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 48.0035, lon = -118.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int groundY = generator.surfaceY(block[0], block[1]);
+            int cx = block[0] >> 4, cy = groundY >> 4, cz = block[1] >> 4; // center the cube grid on the real ground-containing cube
+
+            // Sanity precondition, not a production-logic assertion: the cube directly ABOVE the
+            // ground-containing cube must genuinely have no natural surface anywhere in its own
+            // 16x16 footprint at this real terrain location -- if that ever stops holding here, this
+            // test needs a different landing location, not a change to the logic it checks.
+            assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cx, cy + 1, cz),
+                    "Sanity: expected the cube directly above ground to have no natural surface at this location");
+
+            TestCubeWorld cubes = new TestCubeWorld();
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 1 && dz == 0) continue; // leave exactly this one (naturally irrelevant) cube missing
+                        LevelChunkSection section = generator.generate(cx + dx, cy + dy, cz + dz);
+                        cubes.markLoaded(cx + dx, cy + dy, cz + dz, section);
+                    }
+                }
+            }
+
+            assertTrue(!RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], groundY, block[1]),
+                    "Expected the one missing-but-naturally-irrelevant upper cube to create no pending demand at all, with everything else already loaded");
+
+            RoadPrefetch.dispatchMissingRelevantCellFetchesNearBlock(cubes, generator, block[0], groundY, block[1]);
+            assertEquals(0, requests.get(),
+                    "Expected zero dispatch for a missing cube with no natural surface, even against a stone-cold tile cache");
         } finally {
             stub.stop(0);
         }
