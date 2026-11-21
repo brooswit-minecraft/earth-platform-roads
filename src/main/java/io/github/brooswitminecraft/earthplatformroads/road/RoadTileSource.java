@@ -243,27 +243,48 @@ public final class RoadTileSource {
             diskHit = readDiskCacheIfPresent(key, readyFile, emptyFile);
             if (diskHit != null) return diskHit;
 
-            // Pending (no marker at all): attempt a fetch now. On any failure -- including "not yet
-            // eligible per the rate limit/backoff deadline" -- this cell simply stays pending, no
-            // marker written, so the very next access (this world's next cube, or a restarted
-            // server reading the same cache root) retries it.
-            if (!allowNetwork) return List.of();
-            double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
-            double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
-            List<RoadSegment> fetched;
-            try {
-                fetched = fetchCell(minLat, minLon, maxLat, maxLon);
-            } catch (IOException | RuntimeException e) {
-                return List.of(); // pending stays pending; this generation call gets no road, not a permanent gap
-            }
-            try {
-                writeCachedCell(fetched.isEmpty() ? emptyFile : readyFile, fetched, minLat, minLon, maxLat, maxLon);
-            } catch (IOException e) {
-                throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
-            }
-            memory.put(key, fetched);
-            return fetched;
+            attemptFetch(key, cellLat, cellLon, readyFile, emptyFile);
+            List<RoadSegment> afterAttempt = memory.get(key);
+            return afterAttempt != null ? afterAttempt : List.of();
         }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55468: a cell whose attempt never actually reached the network
+     * ("dispatch suppressed" -- declined by {@link #nextEligibleRequestAt}, free, instant) is a
+     * fundamentally different outcome from one that genuinely was dispatched and failed (a real
+     * timeout or 5xx, costing an actual request) -- conflating them let a persistently-failing cell
+     * (e.g. a dense tile that always 504s) sit at the front of {@link #lookaheadQueue} forever,
+     * monopolizing every future opportunistic slot and starving its neighbors. Callers (both
+     * {@link #waysForCell} and {@link #enqueueLookahead}) must be able to tell these apart.
+     */
+    private enum FetchOutcome { RESOLVED, DISPATCH_SUPPRESSED, ATTEMPTED_FAILURE }
+
+    /**
+     * Attempts to resolve exactly one cell -- MUST be called while already holding that cell's own
+     * {@link #cellLocks} entry. Writes the cache and populates {@link #memory} on success; writes
+     * nothing on any failure, suppressed or attempted, so the cell stays genuinely pending either
+     * way (comment 55450's invariant, unchanged).
+     */
+    private FetchOutcome attemptFetch(long key, long cellLat, long cellLon, Path readyFile, Path emptyFile) {
+        if (!allowNetwork) return FetchOutcome.DISPATCH_SUPPRESSED; // no live source at all: nothing was ever going to be dispatched
+        double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
+        double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
+        List<RoadSegment> fetched;
+        try {
+            fetched = fetchCell(minLat, minLon, maxLat, maxLon);
+        } catch (NotYetEligibleException e) {
+            return FetchOutcome.DISPATCH_SUPPRESSED; // free: no real request was ever sent
+        } catch (IOException | RuntimeException e) {
+            return FetchOutcome.ATTEMPTED_FAILURE; // a real request WAS sent and failed (timeout, 5xx, remark, etc.)
+        }
+        try {
+            writeCachedCell(fetched.isEmpty() ? emptyFile : readyFile, fetched, minLat, minLon, maxLat, maxLon);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
+        }
+        memory.put(key, fetched);
+        return FetchOutcome.RESOLVED;
     }
 
     /**
@@ -293,25 +314,35 @@ public final class RoadTileSource {
 
         long[] next = lookaheadQueue.pollFirst();
         if (next == null) return;
-        long nextKey = (next[0] << 32) ^ (next[1] & 0xFFFFFFFFL);
-        // Cell-center representative point; which exact point within the cell doesn't matter since
-        // waysForCell resolves it back to the same cell boundaries either way.
-        double representativeLat = next[0] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
-        double representativeLon = next[1] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
-        waysForCell(representativeLat, representativeLon);
-        // MINECRAFT-566 comment 55466: an earlier version removed this cell from queuedCellKeys
-        // unconditionally here, relying on a LATER enqueueLookahead call for an overlapping area to
-        // rediscover it was still uncached and re-queue it -- which happened to work in a test that
-        // kept calling this for the same overlapping neighborhood, but could not actually
-        // distinguish "the original job was retained" from "it was dropped, then a brand new job
-        // for the same cell got added later." If the fetch attempt above didn't actually resolve
-        // this cell (declined as not-yet-eligible, or a genuine failure -- either way it's still
-        // PENDING afterward), put the SAME job back at the front of the queue and keep it marked
-        // queued, so it is the next thing tried again, not silently dropped and left to chance.
-        if (cellState(representativeLat, representativeLon) == CellState.PENDING) {
-            lookaheadQueue.addFirst(next);
-        } else {
-            queuedCellKeys.remove(nextKey); // resolved (ready or confirmed-empty) -- permanently done, not retried
+        long nextCellLat = next[0], nextCellLon = next[1];
+        long nextKey = (nextCellLat << 32) ^ (nextCellLon & 0xFFFFFFFFL);
+        String cellId = nextCellLat + "_" + nextCellLon;
+        Path readyFile = cacheRoot.resolve(cellId + ".json");
+        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
+
+        FetchOutcome outcome;
+        synchronized (cellLocks.computeIfAbsent(nextKey, k -> new Object())) {
+            outcome = attemptFetch(nextKey, nextCellLat, nextCellLon, readyFile, emptyFile);
+        }
+
+        // MINECRAFT-566 comment 55466: retain a job that was never actually dispatched (declined
+        // by the rate-limit deadline, free, instant) by putting it back at the FRONT -- it costs
+        // nothing to try again at the very next opportunity, and this is what "the original job
+        // was retained, not dropped and rediscovered later" actually means.
+        //
+        // Comment 55468's correction: a job that WAS actually dispatched and genuinely failed (a
+        // real timeout or 5xx, not just "too soon") must NOT get that same front-of-queue priority
+        // -- a persistently-failing cell (e.g. a dense tile that always 504s) would otherwise
+        // monopolize every future opportunistic slot forever, since it would keep landing right
+        // back at the front after every failed retry, starving every other queued neighbor. Such a
+        // cell instead rotates to the BACK: still retried eventually (never dropped, never
+        // confirmed-empty, per the same no-fabrication invariant {@link #attemptFetch} already
+        // upholds), but only after every other currently-queued neighbor gets its own turn first --
+        // a simple, bounded (the queue's own capacity bounds it) form of backoff/rotation.
+        switch (outcome) {
+            case RESOLVED -> queuedCellKeys.remove(nextKey); // ready or confirmed-empty -- permanently done, never retried
+            case DISPATCH_SUPPRESSED -> lookaheadQueue.addFirst(next);
+            case ATTEMPTED_FAILURE -> lookaheadQueue.addLast(next);
         }
     }
 

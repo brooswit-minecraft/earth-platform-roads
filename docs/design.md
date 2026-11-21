@@ -253,7 +253,25 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   proves this properly: the real 5-second-order interval (not shortened), a controlled clock (no
   real sleep), and critically a DRAIN call that scans a totally different, non-overlapping
   neighborhood -- so the retained job cannot have been freshly re-added by that call's own scan,
-  only genuinely retained from before. `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior`
+  only genuinely retained from before.
+- **A second lookahead-queue bug, found by comment 55468 through pure logical review -- no observed
+  Zippy evidence, no Zippy access needed to find it.** The 55466 fix retained ANY cell whose attempt
+  left it `PENDING` at the front of the queue, whether that attempt was never actually dispatched
+  (declined by the rate-limit deadline, free, instant) or genuinely dispatched and failed (a real
+  timeout or 5xx, costing an actual request). Conflating these let a persistently-failing cell
+  (e.g. a dense tile that always 504s) sit at the front forever, monopolizing every future
+  opportunistic slot and starving its neighbors. Fixed: {@code RoadTileSource} now distinguishes
+  `FetchOutcome.DISPATCH_SUPPRESSED` (never sent, retained at the FRONT, as before) from
+  `ATTEMPTED_FAILURE` (really sent and failed, rotated to the BACK instead -- still retried
+  eventually, never confirmed-empty, just after every other then-queued neighbor gets its own
+  turn first). `.aPersistentlyFailingCellRotatesBehindItsNeighborsWithoutFalseEmptyOrBurst` proves
+  it: cell A fails twice via a real 504 (bbox-dispatched, controlled clock, six other Moore
+  neighbors pre-seeded confirmed-empty so the rotation between just A and B is directly
+  observable), B becomes ready on its own turn in between, and A stays genuinely pending (never
+  falsely marked empty) both times. (While building this test, an early version placed cells near
+  latitude 90 -- an actually invalid WGS84 coordinate -- and `OverpassWayParser`'s own `GeoPoint`
+  constructor correctly rejected it; moved the whole scenario away from the poles.)
+  `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior`
   (55462) matches his own live, read-only diagnosis directly: a pre-existing, install-wide-cache
   neighbor entry from before the fresh test world even started, a multi-segment turning way, a
   real painted block deep in the still-fully-pending own cell's interior, not just at the seam.

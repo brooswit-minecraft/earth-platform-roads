@@ -596,4 +596,123 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55468's explicit ask: cell A fails TWICE (a real dispatched failure --
+     * a persistent 504, not just "declined as too soon"), and cell B still becomes {@code READY} in
+     * between, without A ever being falsely marked confirmed-empty and without violating the
+     * global one-in-flight/backoff guarantees. Dispatches by the real bbox parsed from each POST
+     * (A's bbox -> 504 every time; B's bbox -> a real way), and pre-seeds six of the eight Moore
+     * neighbors as already confirmed-empty so only A and B ever actually enter the queue, keeping
+     * the FIFO rotation simple and directly observable: A (first-enqueued) fails and rotates to the
+     * BACK, so B (now at the front) gets its own turn next, rather than A monopolizing every future
+     * slot the way the pre-55468 code would have.
+     */
+    @Test
+    void aPersistentlyFailingCellRotatesBehindItsNeighborsWithoutFalseEmptyOrBurst(@TempDir Path roadCache) throws IOException {
+        // Lat values kept well away from the poles (90.x would be an invalid WGS84 coordinate,
+        // which is exactly what an earlier version of this test used by mistake near its own
+        // 90-degree "own" point -- a real bug caught by the parser itself, not the test's
+        // assertions).
+        double pLat = 45.005, pLon = -150.005; // own cell 4500_-15001
+        // A = 4499_-15001 (first-enqueued Moore neighbor); B = 4501_-15001 (seventh-enqueued).
+        double aMinLat = 44.99, aMaxLat = 45.00, bMinLat = 45.01, bMaxLat = 45.02;
+        double cellMinLon = -150.01, cellMaxLon = -150.00;
+        double aRepLat = 44.995, aRepLon = -150.005;
+        double bRepLat = 45.015, bRepLon = -150.005;
+
+        java.nio.file.Files.createDirectories(roadCache);
+        // Six filler Moore neighbors, PLUS the own point's own cell (4500_-15001) -- in real usage
+        // via the mixin, the own cell is always already fetched by waysForCell before
+        // enqueueLookahead ever runs, so it's never still sitting uncached when the neighbor scan
+        // happens; this test calls enqueueLookahead directly (to isolate the queue mechanism), so
+        // it has to pre-seed that same "already resolved" state itself. All pre-seeded
+        // confirmed-empty so the enqueue scan skips them entirely -- only A and B ever actually
+        // enter the queue, keeping the rotation directly observable.
+        for (String fillerCellId : new String[] {"4499_-15002", "4499_-15000", "4500_-15002", "4500_-15001", "4500_-15000", "4501_-15002", "4501_-15000"}) {
+            java.nio.file.Files.writeString(roadCache.resolve(fillerCellId + ".empty"), "");
+        }
+
+        String responseB = """
+                {"elements":[{"type":"way","id":555029,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Rotation Test Street B"},
+                  "geometry":[{"lat":45.011,"lon":-150.005},{"lat":45.019,"lon":-150.005}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger aAttempts = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            if (approx(minLat, aMinLat) && approx(maxLat, aMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                aAttempts.incrementAndGet();
+                byte[] body = "persistent failure".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(504, body.length); // a real, genuinely dispatched failure -- not "declined as too soon"
+                exchange.getResponseBody().write(body);
+            } else if (approx(minLat, bMinLat) && approx(maxLat, bMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                byte[] body = responseB.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            } else {
+                byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            }
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofSeconds(5)); // the real production-order interval
+            java.time.Instant clockTime = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Consume this instance's eligibility on an unrelated cell first (request #1), same as
+            // the cooldown-retention test, so the first real lookahead attempt below is genuinely
+            // eligible once the clock is advanced past it.
+            tileSource.waysForCell(0.005, 0.005);
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // First dequeue: A, dispatched, fails with a real 504. Must rotate to the BACK, not the
+            // front, and must NOT be marked confirmed-empty.
+            tileSource.enqueueLookahead(pLat, pLon);
+            assertEquals(1, aAttempts.get(), "Expected A to be genuinely dispatched once");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(aRepLat, aRepLon),
+                    "Expected A to stay genuinely pending after a real failure -- never falsely confirmed-empty");
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Second dequeue, from a DIFFERENT non-overlapping point: with A rotated to the back, B
+            // (not A again) must be at the front now -- proving A's failure didn't let it
+            // monopolize the next slot and starve B.
+            tileSource.enqueueLookahead(100.005, -160.005);
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(bRepLat, bRepLon),
+                    "Expected B to become ready on this turn -- A's failure must not have starved it");
+            assertEquals(1, aAttempts.get(), "Expected no additional A attempt while B was being drained");
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Third dequeue, another non-overlapping point: B is resolved and gone, so A (still the
+            // only remaining queued entry) comes up again -- its second genuine failure.
+            tileSource.enqueueLookahead(110.005, -170.005);
+            assertEquals(2, aAttempts.get(), "Expected A's second genuine dispatch and failure");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(aRepLat, aRepLon),
+                    "Expected A to still be pending (not confirmed-empty) after failing twice");
+        } finally {
+            stub.stop(0);
+        }
+    }
 }
