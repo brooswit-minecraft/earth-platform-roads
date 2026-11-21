@@ -1310,53 +1310,93 @@ the same footprint -- a destination whose terrain generates quickly but whose ro
 pending falls through the unrelated 200-tick clock into the same forced-adopt-and-permanently-save
 bug comment 55549 already confirmed natively for this exact command.
 
-**The fix extends the SAME existing wait rather than building a new one** (per John's own explicit
-warning in comment 55552 against a new token/callback and its lifecycle risks): a new
-`CubicEventsArrivalRoadGateMixin` redirects exactly the two calls `arrive` already makes for this
-purpose, both scoped to that one method:
-- `ServerCubeWorld.readyAround(BlockPos)`: calls the real method first (terrain readiness,
-  unchanged), and if terrain IS ready, additionally checks
+**John's own source review (comment 55554) found two real bugs in the first version:**
+1. That version returned early (never checking road data at all) whenever the REAL `readyAround`
+   was `false`. But this mod's own ordinary-movement mechanism (comment 55545) throws
+   `RoadDataNotReadyException` instead of ever generating a cube whose road data is pending, so
+   that cube is legitimately absent from `ServerCubeWorld`'s own map -- `readyAround` correctly
+   (but misleadingly) reports "not ready" for a reason that already IS road-pending, and the first
+   version never checked road data for exactly this, the single most common real case. Fixed: road
+   data is now checked unconditionally; the final readiness answer is `terrainReady && !roadPending`.
+2. Deeper: `arrive`'s own condition is `!readyAround(pos) && arrival.waited < 200`. Once `waited`
+   has already reached 200 (from any earlier tick), that right-hand term is `false` regardless of
+   this mixin's own `readyAround` override -- `&&` short-circuits the whole condition, so the
+   `List.set` redirect (which "pinned" `waited` below 200 in the first version) is never even
+   reached that tick, and `standOn` runs anyway. Pinning `waited` only prevents the problem; it
+   cannot rescue an arrival already sitting at exactly 200 (John's own described native boundary
+   fixture: seed `waited = 199`, tick once to 200, with road data still pending).
+
+**The fix, corrected:** rather than trying to stop `standOn` from being called at all (its own
+private-method redirect would need to call the REAL implementation when not held, which a sibling
+project found throws `IllegalAccessError` across Earth Platform's own NeoForge module boundary for
+a private member -- a real, confirmed risk, not theoretical), `CubicEventsArrivalRoadGateMixin`
+gates the actual FORCING call itself: `standOn`'s own first statement, `cubes.loadAround(pos)` --
+PUBLIC on `ServerCubeWorld`, safe to redirect normally, with a SEPARATE `@Redirect` SCOPED TO
+`standOn` itself (not `arrive`). Four redirects total:
+- `ServerCubeWorld.readyAround(BlockPos)` (inside `arrive`): ALWAYS checks
   `RoadPrefetch.isAnyRelevantCellPendingNearBlock` across the SAME 3x3x3 cube neighborhood
-  `readyAround`/`loadAround` both traverse -- confirmed by John's own source review (comment 55552)
-  to be identical, never a broader speculative one. Dispatches
-  (`RoadPrefetch.dispatchRelevantCellFetchesNearBlock`, fire-and-forget) so the fetch actually gets
-  a chance to happen. If road data is pending, reports "not ready" even though terrain is, and sets
-  a plain static flag for the very next statement this same tick.
-- The ONE `List.set(int, Object)` call `arrive` makes right after a "not ready" result (persisting
-  the incremented `waited` back into the queue): when that flag was just set, this is a deliberate
-  no-op (returns the list's own current, unincremented element instead) -- `waited` never advances
-  while road data is the actual reason for waiting, so the 200-tick patience genuinely never
-  exhausts for that reason. An ordinary terrain-not-ready tick is completely untouched.
+  `readyAround`/`loadAround` both traverse (confirmed by John's own source review), regardless of
+  the real terrain result (bug 1's fix). Dispatches (`dispatchRelevantCellFetchesNearBlock`,
+  fire-and-forget) and records the combined answer in a plain static flag for every other redirect,
+  this same tick's same iteration (single-threaded, sequential -- safe).
+- `List.set`/`List.remove` (inside `arrive`): no-ops while road-held, keeping `waited` pinned and
+  this exact arrival queued -- together, normally enough to prevent `waited` from ever reaching 200
+  for a road-pending arrival at all.
+- `cubes.loadAround(pos)` (inside `standOn` itself, bug 2's actual fix): skipped entirely while
+  road-held -- the destination cube is never forced into existence, and never permanently saved,
+  REGARDLESS of whether `standOn` itself still runs (it does; this is its only forcing side effect).
+  `standOn`'s own subsequent search loop (reading block state, never itself forcing generation)
+  then runs over whatever is or is not already loaded -- it always returns SOME `Vec3` by
+  construction (several unconditional fallback branches), just never used for anything while held.
+- `ServerPlayer.teleportTo` (inside `arrive`, public vanilla API): skipped while road-held, so
+  whatever `Vec3` `standOn` computed is never used -- the traveler's position stays completely
+  untouched, exactly "remains at origin," no special-case coordinate math needed.
+
+**Comment 55554's "avoid scanning procedural terrain for every cell every tick"** is also addressed:
+`isAnyRelevantCellPendingNearBlock`/`dispatchRelevantCellFetchesNearBlock` no longer scan all 256
+columns of all 27 cubes (~6900 `surfaceY` calls). Since the whole 3x3x3 neighborhood is already
+known, by construction, to be the ONE specific landing footprint, there is nothing to discover by
+sampling every column -- a real map cell is roughly 1.1km, far larger than one 16m cube, so each
+cube's own CENTER column resolves to the same cell as virtually any other column in it. And since
+which CELL a point falls in is purely a function of latitude/longitude, never height, the Y
+dimension of the 3x3x3 neighborhood is redundant for this purpose -- checking the same 3 x-values
+by 3 z-values once covers all three Y layers too. 9 `geographic`/`cellState` calls total, not ~6900.
 
 This single-tick, stateless design deliberately avoids comment 55552's own token/lifecycle concern
 entirely: there is no callback or persistent per-arrival object that could outlive a tick, supersede
-a newer trip, or need releasing on disconnect/cancel/world-unload -- nothing survives past the one
-`List.set` redirect that consumes the flag each tick. Player disconnect is handled by `arrive`'s
-own, completely unmodified `isRemoved()` check, which runs before this mixin's hooks are reached
-again for that arrival.
+a newer trip, or need releasing on disconnect/cancel/world-unload -- nothing survives past one
+iteration. Player disconnect is handled by `arrive`'s own, completely unmodified `isRemoved()`
+check, which runs before this mixin's hooks are reached again for that arrival.
 
 **Verification:** `./gradlew compileJava` succeeds against the real `libs/earthplatform-0.1.0-alpha.73.jar`
 dependency -- Mixin's own annotation processor validates injector target descriptors (method
-signatures, field/call targets) against the ACTUAL target classpath at compile time, so a clean
-compile here is meaningfully stronger evidence than ordinary javac success alone that these exact
-redirect targets (`arrive`'s own descriptor, `readyAround`'s, `List.set`'s) are real. A new
-`RoadTilePrefetchMixinTest` case directly proves the two new `RoadPrefetch` methods
-(`isAnyRelevantCellPendingNearBlock`/`dispatchRelevantCellFetchesNearBlock`) against a real,
-entirely-cold synthetic fixture. 92/92 tests pass.
+signatures, field/call targets) against the ACTUAL target classpath at compile time, including the
+`standOn(...)`-scoped redirect, so a clean compile here is meaningfully stronger evidence than
+ordinary javac success alone that these exact redirect targets are real. A `RoadTilePrefetchMixinTest`
+case directly proves the two new `RoadPrefetch` methods against a real, entirely-cold synthetic
+fixture. 92/92 tests pass.
 
 **Known, disclosed limitations of this exact candidate:**
-- The two new `RoadPrefetch` methods re-scan the full 3x3x3 neighborhood's natural-height footprint
-  fresh on EVERY tick an arrival stays held, rather than resolving and caching that footprint once
-  (John's own "resolve the spot/footprint off-thread, use cheap readiness checks in the tick"
-  framing asks for the latter). Not attempted here, given how few concurrent arrivals this queue
-  realistically ever holds -- a disclosed, not-yet-attempted optimization, not a correctness gap.
-- No test in this repository drives the real, compiled `CubicEvents.arrive` method itself, for the
-  same reason no test drives `ServerCubeWorld.produce` directly -- the same disclosed harness gap
-  as every mixin in this mod. John's own described native boundary fixture (seed a real arrival at
-  `waited=199` with a cold loopback tile, instrument `standOn` to confirm it does not run at tick
-  200 while pending, and does run once after the footprint resolves) is exactly the right test for
-  this and is not something this harness can reproduce -- his own native infrastructure is what
-  will confirm whether these exact Mixin redirects actually weave and fire as written.
+- `tellPlace` (the arrival chat message) is NOT suppressed while road-held, for the SAME
+  cross-module private-method reason `standOn` itself is not redirected in `arrive` -- it still
+  runs every held tick, reporting whatever position `standOn` computed (possibly an area that was
+  never actually generated, since `loadAround` was skipped) even though the player has not actually
+  moved. A real, disclosed cosmetic gap (a potentially repeated or misleading chat message), not a
+  data-integrity one -- no premature generation, no permanent save, and no actual player movement
+  occur while road-held. No safe way to suppress it was found without the same cross-module risk.
+- Whether `standOn`'s own subsequent search logic (block-state reads, occasional `clearLeaves`/
+  `setBlockAndUpdate` calls) is itself safe to run over an area `loadAround` was never called for
+  is not independently verified here -- Earth Platform's own cube-world API is expected to handle
+  an unloaded read/query gracefully, as it must for any other not-yet-generated area any code might
+  query, but this is not proven against a real server in this harness.
+- No test in this repository drives the real, compiled `CubicEvents.arrive`/`standOn` methods
+  themselves, for the same reason no test drives `ServerCubeWorld.produce` directly -- the same
+  disclosed harness gap as every mixin in this mod. John's own described native boundary fixture
+  (seed a real arrival at `waited=199` with a cold loopback tile, instrument `standOn` to confirm
+  it does not run at tick 200 while pending, and does run once after the footprint resolves) is
+  exactly the right test for this and is not something this harness can reproduce -- his own native
+  infrastructure is what will confirm whether these exact Mixin redirects actually weave and fire
+  as written.
 
 ## Compile/test-time-only dependency, not a fork
 

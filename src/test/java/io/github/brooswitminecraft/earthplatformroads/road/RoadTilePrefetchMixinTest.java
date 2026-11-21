@@ -1327,8 +1327,14 @@ class RoadTilePrefetchMixinTest {
 
             assertTrue(RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
                     "Expected the 3x3x3 cube neighborhood around this never-fetched landing column to be reported pending");
-            assertTrue(!RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground + 500, block[1]),
-                    "Expected a landing position far ABOVE natural ground to NOT be reported pending regardless of cell state");
+            // MINECRAFT-566 comment 55554: "avoid scanning procedural terrain for every cell every
+            // tick" -- this check is now geometry-of-CELLS-based, not natural-height-based (which
+            // real map cell a point falls in is purely a function of latitude/longitude, never Y),
+            // so a position far ABOVE/BELOW the same lat/lon is still reported pending (the real
+            // ServerCubeWorld.readyAround/loadAround's own 3x3x3 Y-span already encodes whatever Y
+            // relevance matters here -- this check does not need a second, narrower one on top).
+            assertTrue(RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground + 500, block[1]),
+                    "Expected a landing position far ABOVE natural ground but at the SAME lat/lon to still be reported pending");
 
             RoadPrefetch.dispatchRelevantCellFetchesNearBlock(generator, block[0], ground, block[1]); // fire-and-forget: must not block this thread
             for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {

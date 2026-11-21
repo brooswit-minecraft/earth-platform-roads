@@ -250,14 +250,36 @@ public final class RoadPrefetch {
      * confirmation (comment 55552): {@code ServerCubeWorld.readyAround}/{@code loadAround} both
      * traverse the identical 3x3x3 CUBE neighborhood around {@code (x >> 4, y >> 4, z >> 4)}, so
      * this checks that exact same neighborhood, never a broader one.
+     *
+     * <p><b>Comment 55554, "avoid scanning procedural terrain for every cell every tick":</b> the
+     * cube-based {@link #isAnyRelevantCellPending} this is modeled on scans all 256 columns of
+     * EACH cube because, for an ARBITRARY generation-time cube, there is no cheaper way to know in
+     * advance which columns are road-relevant. This arrival check does not have that problem: the
+     * WHOLE 3x3x3 neighborhood is already known, by construction, to be the one specific landing
+     * footprint -- there is nothing to discover by sampling every column. Samples only each cube's
+     * own CENTER column, and only across the 3x3 X/Z grid (never the Y dimension -- which real map
+     * CELL a point falls in is purely a function of latitude/longitude, never height, so checking
+     * the same 3 x-values by 3 z-values once covers all three Y layers of the neighborhood too): 9
+     * {@code geographic}/{@code cellState} calls total, not up to ~6900 -- sound because a real map
+     * cell ({@code RoadNetwork.CELL_DEGREES}, roughly 1.1km) is far larger
+     * than one cube (16m), so a cube's own center column resolves to the same cell as virtually any
+     * other column in it. This is deliberately NOT the same full-footprint fix comment 55537/55542
+     * needed for the generation-time Y-relevance gate -- there, a cube could be the ONLY relevant
+     * one for an off-center column, so sampling the center alone was a real bug; here, every cube in
+     * this fixed, already-known neighborhood matters regardless (no narrower-than-the-neighborhood
+     * relevance question to get wrong), so a per-cube center sample is simply a cheaper, sufficient
+     * read of the SAME cell this whole cube would otherwise resolve to anyway.
      */
     public static boolean isAnyRelevantCellPendingNearBlock(EarthGenerator generator, int blockX, int blockY, int blockZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return false;
+        MercatorGrid grid = generator.grid();
         int cx = blockX >> 4, cy = blockY >> 4, cz = blockZ >> 4;
         for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    if (isAnyRelevantCellPending(generator, cx + dx, cy + dy, cz + dz)) return true;
-                }
+            for (int dz = -1; dz <= 1; dz++) {
+                int centerX = cubeIndexToBlockCenter(cx + dx), centerZ = cubeIndexToBlockCenter(cz + dz);
+                GeoPoint point = grid.geographic(centerX, centerZ);
+                if (tiles.cellState(point.latitude(), point.longitude()) == RoadTileSource.CellState.PENDING) return true;
             }
         }
         return false;
@@ -265,15 +287,26 @@ public final class RoadPrefetch {
 
     /**
      * MINECRAFT-566 comment 55551: the dispatch counterpart to
-     * {@link #isAnyRelevantCellPendingNearBlock}, for the exact same 3x3x3 cube neighborhood.
+     * {@link #isAnyRelevantCellPendingNearBlock} -- see that method's own doc (comment 55554) for
+     * why a per-cube center sample, deduplicated by actual cell, is sufficient and cheap here.
      */
     public static void dispatchRelevantCellFetchesNearBlock(EarthGenerator generator, int blockX, int blockY, int blockZ) {
-        int cx = blockX >> 4, cy = blockY >> 4, cz = blockZ >> 4;
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        if (tiles == null) return;
+        MercatorGrid grid = generator.grid();
+        int cx = blockX >> 4, cz = blockZ >> 4;
+        java.util.Set<Long> dispatchedCells = new java.util.HashSet<>();
         for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    dispatchRelevantCellFetches(generator, cx + dx, cy + dy, cz + dz);
-                }
+            for (int dz = -1; dz <= 1; dz++) {
+                int centerX = cubeIndexToBlockCenter(cx + dx), centerZ = cubeIndexToBlockCenter(cz + dz);
+                GeoPoint point = grid.geographic(centerX, centerZ);
+                double lat = point.latitude(), lon = point.longitude();
+                long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+                long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+                long cellKey = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+                if (!dispatchedCells.add(cellKey)) continue;
+                tiles.dispatchCellFetch(lat, lon);
+                tiles.enqueueLookaheadAsync(lat, lon);
             }
         }
     }
