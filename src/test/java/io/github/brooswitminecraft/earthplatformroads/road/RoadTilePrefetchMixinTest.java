@@ -715,4 +715,102 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55470: aaea04b's refactor called {@code attemptFetch} directly on the
+     * dequeued cell, dropping the "already resolved by some other path?" double-check {@code
+     * waysForCell} always did. A queued cell that gets resolved by its own point's ORDINARY fetch
+     * (the realistic case: the player's own position later lands exactly in that neighbor cell)
+     * before its stale queue entry is ever dequeued would otherwise be fetched a second,
+     * unnecessary time -- wasting a scarce provider slot and, worse, overwriting the already-
+     * correct cached geometry with whatever that redundant fetch happens to return. This proves the
+     * fix: queued, then resolved via an ordinary (non-lookahead) {@code waysForCell} call, then
+     * drained -- no second POST for that same cell's key.
+     */
+    @Test
+    void aQueuedCellResolvedByItsOwnFetchIsNotDispatchedAgainOnDrain(@TempDir Path roadCache) throws IOException {
+        double pLat = 55.005, pLon = -170.005; // own cell 5500_-17001
+        // T = 5501_-17001 (seventh-enqueued Moore neighbor, same position as "B" in earlier tests).
+        double tMinLat = 55.01, tMaxLat = 55.02, cellMinLon = -170.01, cellMaxLon = -170.00;
+        double tRepLat = 55.015, tRepLon = -170.005;
+
+        java.nio.file.Files.createDirectories(roadCache);
+        // Every Moore neighbor except the first-enqueued (N1, a harmless decoy) and T is pre-seeded
+        // confirmed-empty, along with the own cell itself -- so the queue only ever holds N1 and T,
+        // keeping this directly observable.
+        for (String fillerCellId : new String[] {"5499_-17001", "5499_-17000", "5500_-17002", "5500_-17001", "5500_-17000", "5501_-17002", "5501_-17000"}) {
+            java.nio.file.Files.writeString(roadCache.resolve(fillerCellId + ".empty"), "");
+        }
+
+        String responseT = """
+                {"elements":[{"type":"way","id":555030,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Resolved-Before-Drain Street"},
+                  "geometry":[{"lat":55.011,"lon":-170.005},{"lat":55.019,"lon":-170.005}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger tRequests = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            byte[] body;
+            if (approx(minLat, tMinLat) && approx(maxLat, tMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                tRequests.incrementAndGet();
+                body = responseT.getBytes(StandardCharsets.UTF_8);
+            } else {
+                body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8); // N1 (the decoy) and anything else: a genuinely empty result
+            }
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofSeconds(5));
+            java.time.Instant clockTime = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            tileSource.waysForCell(0.005, 0.005); // consumes initial eligibility (request #1)
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Enqueues N1 and T; dequeues and resolves N1 (confirmed-empty) -- T stays queued,
+            // never yet dequeued.
+            tileSource.enqueueLookahead(pLat, pLon);
+            assertEquals(2, requests.get(), "Expected N1's own resolution, not T's -- T must still be queued");
+            assertEquals(0, tRequests.get());
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // T is resolved by its OWN ordinary fetch now -- exactly like a player's position
+            // later landing directly in that neighbor cell -- while its stale entry still sits in
+            // the lookahead queue, untouched.
+            tileSource.waysForCell(tRepLat, tRepLon);
+            assertEquals(1, tRequests.get(), "Expected T's own fetch to dispatch exactly once");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(tRepLat, tRepLon));
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Drain via a totally different, non-overlapping point -- dequeues T's stale entry.
+            // With the fix, this must detect T is already resolved and pop the job WITHOUT
+            // dispatching a second request for it.
+            tileSource.enqueueLookahead(20.005, -60.005);
+            assertEquals(1, tRequests.get(), "Expected NO second dispatch for T's key once it was already resolved before the drain");
+        } finally {
+            stub.stop(0);
+        }
+    }
 }

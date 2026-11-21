@@ -322,7 +322,16 @@ public final class RoadTileSource {
 
         FetchOutcome outcome;
         synchronized (cellLocks.computeIfAbsent(nextKey, k -> new Object())) {
-            outcome = attemptFetch(nextKey, nextCellLat, nextCellLon, readyFile, emptyFile);
+            // MINECRAFT-566 comment 55470: a queued cell can be resolved by some OTHER path (most
+            // commonly: the player's own position later lands exactly in this cell, triggering its
+            // ordinary synchronous waysForCell fetch) before this stale queue entry ever gets
+            // dequeued. Dispatching anyway would waste a scarce provider slot AND -- worse --
+            // overwrite already-resolved, already-correct cached geometry with whatever a second,
+            // redundant fetch happens to return. Re-check memory/disk under this SAME per-cell lock
+            // before ever attempting a new dispatch; either READY or confirmed EMPTY counts as
+            // already resolved, so the stale job is simply popped, not re-fetched.
+            List<RoadSegment> alreadyResolved = readDiskCacheIfPresent(nextKey, readyFile, emptyFile);
+            outcome = alreadyResolved != null ? FetchOutcome.RESOLVED : attemptFetch(nextKey, nextCellLat, nextCellLon, readyFile, emptyFile);
         }
 
         // MINECRAFT-566 comment 55466: retain a job that was never actually dispatched (declined
