@@ -5,6 +5,7 @@ import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import io.github.brooswitminecraft.earthplatformroads.road.SynchronousLoadGuard;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -161,6 +162,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * still exhaust the retries, left as a known, disclosed, deliberately bounded (not unlimited, to
  * avoid an unbounded generation stall) residual gap, not claimed as fully closed.
  *
+ * <h2>A real metadata-leak bug in the retry loop, found by comment 55504 in pre-handoff review</h2>
+ * The first version of the retry loop called {@code generate()} on every attempt with the SAME
+ * mutable {@code blockEntities}/{@code entities} lists -- but {@code generate()}'s own
+ * {@code structures.place(...)} APPENDS to those lists as a side effect (confirmed by decompiling
+ * {@code SurfaceGenerator.generate} for understanding). An ABANDONED, discarded attempt's own
+ * structure/entity tags stayed in those lists even though the FINAL, accepted attempt's section
+ * never actually contains the blocks they describe -- a real, not hypothetical, metadata leak.
+ * Fixed by giving every attempt its own fresh, empty lists (isolating each attempt's side effects
+ * completely) and merging ONLY the accepted attempt's additions into the caller's real lists at the
+ * very end -- the same isolation {@code produce()} itself already relies on by always passing
+ * fresh empty lists in.
+ *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
  * {@code loadNow} methods themselves: doing so needs a real {@code ServerLevel}, which (unlike
@@ -255,7 +268,19 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // arrival generate() call. Free in the ordinary case: produce() only ever runs once per
         // column, so there was nothing legitimate to evict yet.
         RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
-        LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+        // MINECRAFT-566 comment 55504, a real bug found in pre-handoff review: every retry attempt
+        // below was calling generate() with the SAME mutable blockEntities/entities lists -- but
+        // generate()'s own structures.place(...) APPENDS to those lists as a side effect (confirmed
+        // by decompiling SurfaceGenerator.generate for understanding). An ABANDONED (discarded,
+        // stale) attempt's structure/entity tags would stay in those lists even though the FINAL,
+        // accepted attempt's section never actually contains the blocks they describe -- a real
+        // metadata leak, not just a hypothetical one. Fixed by giving EVERY attempt its OWN fresh,
+        // empty lists (isolating each attempt's side effects completely) and merging ONLY the
+        // accepted attempt's additions into the caller's real lists at the very end -- the same
+        // isolation `produce()` itself already relies on by always passing fresh empty lists in.
+        List<CompoundTag> attemptBlockEntities = new ArrayList<>();
+        List<CompoundTag> attemptEntities = new ArrayList<>();
+        LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
         // MINECRAFT-566 comment 55496, a real, independently-reproduced residual race (see this
         // class's own "known, disclosed residual race" doc section): a DIFFERENT, already-in-flight
         // concurrent column() computation, started before the eviction above ran, can still publish
@@ -269,8 +294,12 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         for (int attempt = 0; attempt < MAX_STALE_RETRY_ATTEMPTS
                 && RoadPrefetch.sectionLooksStale(earthGenerator, cubeX, cubeY, cubeZ, section); attempt++) {
             RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
-            section = cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+            attemptBlockEntities = new ArrayList<>(); // discard the abandoned attempt's own additions entirely
+            attemptEntities = new ArrayList<>();
+            section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
         }
+        blockEntities.addAll(attemptBlockEntities);
+        entities.addAll(attemptEntities);
         return section;
     }
 }
