@@ -1,8 +1,7 @@
 package io.github.brooswitminecraft.earthplatformroads.mixin;
 
-import io.earthplatform.geography.GeoPoint;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
-import io.github.brooswitminecraft.earthplatformroads.road.RoadNetwork;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -62,6 +61,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * RoadTilePrefetchMixinTest#aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls}
  * for the regression (two different way IDs sharing a node, the second's own cell reached only
  * through the lookahead queue, over several simulated prepare calls).
+ *
+ * <h2>This mixin's own hooks are unreachable during ordinary gameplay movement (55474)</h2>
+ * {@code prepare}/{@code prepareNear} are Earth Platform's documented "fetch ahead" entry points,
+ * but ordinary streamed generation (a player simply walking/driving) never calls either one: the
+ * real path is {@code ServerCubeWorld.requestAround} (the server tick) dispatching to a background
+ * worker that calls {@code produce}, which on a storage miss calls {@code generator.generate(...)}
+ * directly -- confirmed by reading {@code ServerCubeWorld} itself (the {@code combined-73} build
+ * this mod targets). So every fix above only ever helped {@code /earth travel} teleport and Chunky
+ * pre-generation, never a normal walk into fresh terrain. {@code ServerCubeWorldRoadPrefetchMixin}
+ * (same package) adds the missing hook for that real path, reusing this class's own {@link
+ * RoadPrefetch#forColumn} dispatch rather than a second copy of it -- see that mixin's own doc for
+ * why it is safe to add there (off the server tick thread; never for Earth Platform's synchronous
+ * {@code loadNow} arrival path) and for its own regression test driving the real worker path.
  */
 @Mixin(EarthGenerator.class)
 public abstract class EarthGeneratorPrepareMixin {
@@ -76,11 +88,6 @@ public abstract class EarthGeneratorPrepareMixin {
     }
 
     private void prefetch(int x, int z) {
-        var tiles = RoadNetwork.liveTileSourceForPrefetch();
-        if (tiles == null) return;
-        EarthGenerator self = (EarthGenerator) (Object) this;
-        GeoPoint point = self.grid().geographic(x, z);
-        tiles.waysForCell(point.latitude(), point.longitude());
-        tiles.enqueueLookahead(point.latitude(), point.longitude());
+        RoadPrefetch.forColumn((EarthGenerator) (Object) this, x, z);
     }
 }

@@ -515,6 +515,44 @@ class RoadTilePrefetchMixinTest {
     }
 
     /**
+     * MINECRAFT-566 comment 55474's "distinct diagnostics" for a sustained provider outage: a
+     * column whose own cell is pending AND this tile source's last several real fetch attempts
+     * (elsewhere) have all failed must read as {@code PENDING_PROVIDER_OUTAGE}, not the ordinary
+     * {@code PENDING_NO_DATA} {@link #diagnoseColumnDistinguishesAllFourCauses} already covers.
+     */
+    @Test
+    void diagnoseColumnReturnsProviderOutageAfterSeveralConsecutiveRealFailures(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer failingStub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        failingStub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "service unavailable".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(503, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        failingStub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + failingStub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5));
+            // Three real, dispatched failures across three different cells, nowhere near the
+            // never-fetched column this test diagnoses below.
+            tileSource.waysForCell(60.0, 20.0);
+            tileSource.waysForCell(60.02, 20.0);
+            tileSource.waysForCell(60.04, 20.0);
+            assertEquals(3, requests.get());
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            var grid = generator.grid();
+            int[] pendingColumn = generator.block(42.025, -107.295); // never touched by any waysForCell call above
+            assertEquals(RoadNetwork.ColumnDiagnosis.PENDING_PROVIDER_OUTAGE, RoadNetwork.diagnoseColumn(grid, pendingColumn[0], pendingColumn[1]));
+        } finally {
+            failingStub.stop(0);
+        }
+    }
+
+    /**
      * MINECRAFT-566 comment 55464's explicit ask: a cooldown-declined lookahead-queue entry must
      * stay pending/eligible for a LATER attempt (never permanently lost), repeated calls during the
      * same cooldown window must not create duplicate queue entries or a burst of requests ("without

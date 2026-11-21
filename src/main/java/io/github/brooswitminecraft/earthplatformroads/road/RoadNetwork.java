@@ -278,6 +278,14 @@ public final class RoadNetwork {
         EXCLUDED_BRIDGE_OR_TUNNEL,
         /** No segment covers this column, and this column's own cell has never been successfully fetched (or no live source is configured to ask). */
         PENDING_NO_DATA,
+        /**
+         * No segment covers this column, this column's own cell is still pending (never
+         * successfully fetched) -- AND {@link RoadTileSource#sustainedOutage()} says this instance's
+         * last several real fetch attempts, across every cell, have all failed. MINECRAFT-566
+         * comment 55474's "distinct diagnostics" for a sustained outage, as opposed to a cell that is
+         * merely pending because nobody has asked for it yet (still {@link #PENDING_NO_DATA}).
+         */
+        PENDING_PROVIDER_OUTAGE,
         /** No segment covers this column, and this column's own cell WAS fetched and genuinely has no mapped road here. */
         CONFIRMED_EMPTY_NO_ROAD,
     }
@@ -297,9 +305,8 @@ public final class RoadNetwork {
         if (anyBridgeOrTunnelCovers) return ColumnDiagnosis.EXCLUDED_BRIDGE_OR_TUNNEL;
         RoadTileSource tiles = tileSource();
         if (tiles == null) return ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD; // preloaded-only network; nothing found there genuinely means nothing mapped
-        return tiles.cellState(here.latitude(), here.longitude()) == RoadTileSource.CellState.PENDING
-                ? ColumnDiagnosis.PENDING_NO_DATA
-                : ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD;
+        if (tiles.cellState(here.latitude(), here.longitude()) != RoadTileSource.CellState.PENDING) return ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD;
+        return tiles.sustainedOutage() ? ColumnDiagnosis.PENDING_PROVIDER_OUTAGE : ColumnDiagnosis.PENDING_NO_DATA;
     }
 
     /** Every mapped way this mod deliberately does not render a surface for, because it is a bridge or tunnel. */

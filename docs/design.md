@@ -284,9 +284,53 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   Does NOT cover a mixin-level terrain skip (e.g. "under water") -- that check lives in
   `EarthGeneratorRoadMixin`, not here. Confirmed in `RoadTilePrefetchMixinTest
   .diagnoseColumnDistinguishesAllFourCauses` (one generator, four real cells, one cause each).
+- **`prepare`/`prepareNear` are unreachable during ordinary gameplay movement -- found by comment
+  55474 through pure logical review of Earth Platform's own `ServerCubeWorld` source, no Zippy
+  access needed.** Every fix above only ever helped `/earth travel` teleport (`prepareNear`) and
+  Chunky pre-generation calling `prepare` per cell. A player simply walking/driving into fresh
+  terrain never calls either: the real path is `ServerCubeWorld.tickCubes` (server tick) ->
+  `requestAround` (server thread, enqueues only) -> `request` -> `workers.execute` (background
+  worker pool) -> `produce`, which on a storage miss calls `generator.generate(...)` directly, with
+  no prepare hook anywhere in that chain -- confirmed by reading the real class in this mod's own
+  `libs/earthplatform-0.1.0-alpha.73.jar` dependency (the `combined-73` build). Almost certainly the
+  real mechanism behind "a road abruptly ends" during ordinary play, though 55474 is explicit this
+  is a verified integration gap, not a confirmed explanation for any one specific report.
+  **Fix:** a new `ServerCubeWorldRoadPrefetchMixin` injects into `produce`, immediately before its
+  call to `generate(...)` -- after the storage-read fast path has already returned, so an
+  already-saved/edited cube is untouched -- and dispatches the exact same bounded, deduplicated,
+  rate-limited `waysForCell`/`enqueueLookahead` pair `EarthGeneratorPrepareMixin` already uses
+  (pulled out into a shared `RoadPrefetch.forColumn`, not a second copy). Because this runs on the
+  background worker thread BEFORE `generate()`, a cell that fetches successfully is available to
+  `EarthGeneratorRoadMixin`'s `surface()` hook during THIS SAME generation call, not a retrofit of
+  an already-saved cube. `produce` is also called from `loadNow` ("synchronous load for places that
+  must exist this tick, such as an arrival point", explicitly possibly the main server thread) --
+  55474's hard constraint is never adding HTTP there. Both callers share the one `produce` method
+  with nothing distinguishing them, so a new `SynchronousLoadGuard` (a `ThreadLocal` depth counter,
+  not a plain boolean -- `loadNow` and the background path run on unrelated threads, and nothing
+  rules out `loadAround`'s loop nesting one `loadNow` inside another) wraps `loadNow`'s HEAD/RETURN;
+  the `produce` injection checks it and does nothing while active.
+  **Also added, same comment's ask:** `RoadTileSource.sustainedOutage()` (true after
+  `SUSTAINED_OUTAGE_FAILURE_THRESHOLD` consecutive genuinely-dispatched failures ACROSS DIFFERENT
+  cells, reset by any single success anywhere -- a persistently-404ing single tile is not proof the
+  provider itself is down) backs a new `RoadNetwork.ColumnDiagnosis.PENDING_PROVIDER_OUTAGE`,
+  distinct from the ordinary "nobody has asked yet" `PENDING_NO_DATA`.
+  **Known, disclosed test gap:** no test drives the real, compiled `ServerCubeWorld.produce`/
+  `loadNow` methods themselves -- that needs a real `ServerLevel`, which (unlike `EarthGenerator`,
+  which this project's and Earth Platform's own benches construct directly) this project's
+  `neoForge.unitTest` harness has no fixture for, and Earth Platform ships none either. What IS
+  covered directly: `SynchronousLoadGuardTest` (enter/exit, nesting, and -- the actual bug this
+  guards against -- cross-thread isolation, using a real second `Thread`) and the outage-streak
+  mechanics (`RoadTileSourceTest`, plus one `RoadTilePrefetchMixinTest` case driving
+  `RoadNetwork.diagnoseColumn` through several real dispatched failures). The dispatch itself
+  (`RoadPrefetch.forColumn`) is the exact code `RoadTilePrefetchMixinTest` already exercises through
+  `prepare`/`prepareNear`. What remains genuinely unverified is only that this specific mixin's own
+  injection points actually weave and fire as written against the real `ServerCubeWorld` class;
+  NeoForge's `gameTestServer` run (a real dedicated server) is the sanctioned mechanism for that and
+  is not attempted here.
 - **Not attempted this pass, named explicitly as still-open:** separate readiness handling for
   Chunky pre-generation specifically (`ServerCubeWorld.pregenerate`/`ChunkyCompat.pregenerate` call
-  `generate()` directly, off the travel/teleport path `prepareNear` covers); a real multi-way
+  `generate()` directly, off the travel/teleport path `prepareNear` covers -- and now off the
+  ordinary-movement path `ServerCubeWorldRoadPrefetchMixin` covers, too); a real multi-way
   Yosemite extract plus a real distant-site extract with full source-vs-generated accounting
   (class counts, connected intersections, tile boundary, documented omissions); and any
   disposable-profile in-game visual/collision/seam demonstration, which requires an actual running

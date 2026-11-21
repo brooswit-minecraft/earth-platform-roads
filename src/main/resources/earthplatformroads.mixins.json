@@ -5,7 +5,8 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "EarthGeneratorRoadMixin",
-    "EarthGeneratorPrepareMixin"
+    "EarthGeneratorPrepareMixin",
+    "ServerCubeWorldRoadPrefetchMixin"
   ],
   "injectors": {
     "defaultRequire": 1

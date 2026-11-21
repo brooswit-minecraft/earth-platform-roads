@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Fetches mapped road data for a tile (the same {@value RoadNetwork#CELL_DEGREES}-degree grid cell
@@ -96,6 +97,29 @@ public final class RoadTileSource {
     /** Test-only: replace the clock {@link #nextEligibleRequestAt} is measured against, so a test can advance time without a real sleep. */
     void setClockForTests(java.time.Clock testClock) {
         this.clock = testClock;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55474: "bound waiting and fail open deliberately on a sustained
+     * provider outage, with distinct diagnostics". A single cell that keeps 504ing is not proof the
+     * PROVIDER is down (a dense tile can legitimately be slow/heavy on its own); this instead counts
+     * consecutive {@code ATTEMPTED_FAILURE} outcomes ACROSS EVERY cell this instance has tried, reset
+     * to zero by any single {@code RESOLVED} fetch (any cell) -- a run of real, dispatched failures
+     * with nothing succeeding in between is what actually indicates the provider itself is down, not
+     * just one awkward tile. {@code DISPATCH_SUPPRESSED} outcomes (never reached the network at all)
+     * do not move this counter either way: they prove nothing about the provider's own health.
+     */
+    private static final int SUSTAINED_OUTAGE_FAILURE_THRESHOLD = 3;
+    private final AtomicInteger consecutiveAttemptedFailures = new AtomicInteger();
+
+    /**
+     * Whether this instance's last {@value #SUSTAINED_OUTAGE_FAILURE_THRESHOLD}+ real (dispatched,
+     * not suppressed) fetch attempts have ALL failed, with no successful fetch of any cell in
+     * between -- {@link RoadNetwork#diagnoseColumn}'s distinct diagnosis for this case, instead of
+     * the ordinary "just hasn't been fetched yet" {@code PENDING_NO_DATA}.
+     */
+    public boolean sustainedOutage() {
+        return consecutiveAttemptedFailures.get() >= SUSTAINED_OUTAGE_FAILURE_THRESHOLD;
     }
 
     /**
@@ -274,8 +298,9 @@ public final class RoadTileSource {
         try {
             fetched = fetchCell(minLat, minLon, maxLat, maxLon);
         } catch (NotYetEligibleException e) {
-            return FetchOutcome.DISPATCH_SUPPRESSED; // free: no real request was ever sent
+            return FetchOutcome.DISPATCH_SUPPRESSED; // free: no real request was ever sent; does not affect the outage streak
         } catch (IOException | RuntimeException e) {
+            consecutiveAttemptedFailures.incrementAndGet();
             return FetchOutcome.ATTEMPTED_FAILURE; // a real request WAS sent and failed (timeout, 5xx, remark, etc.)
         }
         try {
@@ -284,6 +309,7 @@ public final class RoadTileSource {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
         memory.put(key, fetched);
+        consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
     }
 

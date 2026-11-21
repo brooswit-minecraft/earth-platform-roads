@@ -335,4 +335,56 @@ class RoadTileSourceTest {
         assertTrue(source.cachedWaysForCellOrEmpty(40.0005, -105.0005).isEmpty(), "Nothing cached yet; this read-only call must not fetch");
         assertEquals(0, requests.get(), "cachedWaysForCellOrEmpty must never trigger a network request");
     }
+
+    /**
+     * MINECRAFT-566 comment 55474's "distinct diagnostics" for a sustained provider outage, as
+     * opposed to an ordinary single pending cell. Three DIFFERENT cells (not the same one retried,
+     * since a single awkward tile failing repeatedly is not proof the PROVIDER is down) all
+     * genuinely dispatched and failed, with no success in between.
+     */
+    @Test
+    void sustainedOutageBecomesTrueOnlyAfterSeveralConsecutiveRealFailuresAcrossDifferentCells(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer failingStub = startStub(requests, "service unavailable", 503);
+        RoadTileSource source = new RoadTileSource(endpointOf(failingStub), cacheRoot, true, Duration.ofSeconds(5));
+
+        assertTrue(source.waysForCell(50.0, 10.0).isEmpty());
+        assertTrue(!source.sustainedOutage(), "One real failure must not yet read as a sustained outage");
+        assertTrue(source.waysForCell(50.02, 10.0).isEmpty());
+        assertTrue(!source.sustainedOutage(), "Two real failures must not yet read as a sustained outage");
+        assertTrue(source.waysForCell(50.04, 10.0).isEmpty());
+        assertTrue(source.sustainedOutage(), "Three consecutive real failures across different cells must read as a sustained outage");
+        assertEquals(3, requests.get());
+    }
+
+    @Test
+    void aSuccessfulFetchResetsTheOutageStreakOnTheSameInstance(@TempDir Path cacheRoot) throws IOException {
+        // One stub, same RoadTileSource instance throughout: the 1st and 2nd requests (different
+        // cells) fail, the 3rd succeeds, the 4th (yet another cell) fails again -- if the streak
+        // were NOT reset by the 3rd call's success, the 4th failure would wrongly read as "3
+        // consecutive failures" (1+1+1, never cleared) rather than correctly as just one.
+        AtomicInteger requestNumber = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            int n = requestNumber.incrementAndGet();
+            String response = n == 3 ? ONE_WAY_RESPONSE : "service unavailable";
+            int status = n == 3 ? 200 : 503;
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        this.server = stub;
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        source.waysForCell(53.0, 13.0); // fails (request 1)
+        source.waysForCell(53.02, 13.0); // fails (request 2)
+        assertTrue(!source.sustainedOutage(), "Two failures: not yet a sustained outage");
+        source.waysForCell(53.04, 13.0); // succeeds (request 3) -- must reset the streak
+        assertTrue(!source.sustainedOutage());
+        source.waysForCell(53.06, 13.0); // fails (request 4) -- only ONE failure since the reset
+        assertTrue(!source.sustainedOutage(), "A single failure right after a success must not read as a sustained outage");
+        assertEquals(4, requestNumber.get());
+    }
 }

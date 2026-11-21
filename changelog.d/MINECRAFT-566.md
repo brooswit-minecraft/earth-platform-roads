@@ -59,12 +59,37 @@ bump: minor
   road surface (covered/excluded-as-bridge-or-tunnel/pending/confirmed-empty), backed by a new
   `RoadTileSource.CellState` exposing a cell's actual on-disk cache state.
 
+### Fixed (comment 55474)
+- `prepare`/`prepareNear` -- `EarthGeneratorPrepareMixin`'s only hooks -- are never reached by
+  ordinary gameplay movement at all: the real streamed-generation path
+  (`ServerCubeWorld.requestAround` -> `request` -> background worker -> `produce` -> `generate()`
+  on a storage miss) calls none of them, confirmed by reading Earth Platform's own
+  `ServerCubeWorld` class. Every earlier fix in this file only ever helped `/earth travel` teleport
+  and Chunky pre-generation -- never a normal walk into fresh terrain, almost certainly the real
+  mechanism behind "a road abruptly ends" reported since comment 55454 (a verified integration gap,
+  not a confirmed explanation for any one specific report). Fixed by a new
+  `ServerCubeWorldRoadPrefetchMixin` dispatching the exact same bounded/rate-limited fetch
+  (`RoadPrefetch.forColumn`, factored out of `EarthGeneratorPrepareMixin`) immediately before
+  `produce`'s own call to `generate()` -- after the storage-read fast path, so an already-saved
+  cube is untouched -- so a cell that fetches successfully is available to the road surface hook
+  during THIS generation call. Never touches `loadNow`'s synchronous arrival path (guarded by a new
+  `SynchronousLoadGuard`, since both share the one `produce` method with no parameter telling them
+  apart) or the server tick thread itself.
+- Added `RoadTileSource.sustainedOutage()` and `RoadNetwork.ColumnDiagnosis.PENDING_PROVIDER_OUTAGE`:
+  a distinct diagnosis for several consecutive genuinely-dispatched fetch failures across different
+  cells (the provider itself appears down), separate from the ordinary "nobody has asked yet"
+  pending state.
+
 ### Known gaps
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
   transient gap.
-- Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport path
-  `prepareNear` covers) has no dedicated readiness handling yet.
+- Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport and
+  ordinary-movement paths, both now covered) has no dedicated readiness handling yet.
+- No test drives the real, compiled `ServerCubeWorld.produce`/`loadNow` methods themselves -- doing
+  so needs a real `ServerLevel`, which this project's `neoForge.unitTest` harness has no fixture
+  for (nor does Earth Platform ship one). The new guard logic and the shared dispatch it gates are
+  each covered directly instead; see `docs/design.md`'s own note on this for the full breakdown.
 - `RoadNetwork.segments()`/`junctions()`/`excludedBridgesAndTunnels()` only scan the preloaded
   bundled+external region list -- they do not see live-tile-sourced ways.
 - The tile cache is scoped to the whole game install, not per-save.
