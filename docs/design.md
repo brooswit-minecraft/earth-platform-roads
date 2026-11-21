@@ -471,6 +471,58 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   attempted earlier in this work returned "502 Gateway Timeout -- at capacity" (see
   `docs/road-data-provenance.md`); that attempt is now superseded context, not a blocking gap.
 
+## MINECRAFT-566: a real stale-surface-cache bug in the readiness work (comments 55486/55487)
+
+Found through pure logical review of Earth Platform's own `SurfaceGenerator` class (confirmed by
+reading its real bytecode), then independently reproduced by John on a real server -- no Zippy
+access needed for the finding itself.
+
+`SurfaceGenerator` (which `EarthGenerator` extends) permanently memoizes an ENTIRE column's worth
+of `Surface` decisions (256 of them, one per Y-slice) in a private `columns`
+`ConcurrentHashMap<Long, Column>`, keyed by a private `columnKey(columnX, columnZ)` --
+`HashCommon.mix` applied to the packed column/chunk coordinates. The first caller to ask for
+anything about a column populates this cache for its ENTIRE lifetime on that generator instance;
+`column(int,int)` never recomputes an already-cached entry on its own. Critically, `lowestGround`
+(confirmed by reading its bytecode: it calls `column(x,z)` directly) is one such caller --
+`ColumnSurvey`/`ServerCubeWorld.plan` calls it every tick for ordinary flying-surface logic, with
+no relationship at all to whether this column's road data happens to be ready yet. (`surfaceY`, by
+contrast, does a plain `.get` with no compute-on-miss -- confirmed NOT to trigger this.)
+
+This meant the bounded-worker readiness fix (comments 55474-55481) could not actually guarantee
+correctness on its own: if `lowestGround` (or anything else routing through `column`) had already
+cached this column's decision BEFORE its road tile became ready, the LATER, genuinely fresh
+`produce`/`generate` call for that exact same column -- even with the tile now READY -- would hit
+that same stale cached entry and never re-invoke `surface()` at all, regardless of how well the
+bounded wait/coalescing worked. John's own reproduction on a real server confirmed this exactly: a
+`lowestGround` call while PENDING, then the tile resolved to READY, then `generate()` on the SAME
+generator instance still emitted grass; only a FRESH generator instance (same seed/data) correctly
+emitted blackstone.
+
+**Fixed** with a narrow, per-column cache eviction, not a global clear (55486's own explicit ask):
+a new `SurfaceGeneratorColumnCacheAccessor` (`@Accessor` interface Mixin exposing the private
+`columns` map) plus `RoadPrefetch.surfaceGeneratorColumnKey` (replicating `columnKey`'s exact
+formula via the same real, public fastutil `HashCommon.mix` -- no accessor needed for the private
+method itself, only the field) and `RoadPrefetch.evictStaleSurfaceDecision`, called
+unconditionally by `ServerCubeWorldRoadPrefetchMixin`'s existing injection point, right before
+`produce`'s own call to `generate()` -- for BOTH the ordinary-streaming path and `loadNow`'s
+arrival path (not gated by `SynchronousLoadGuard`: evicting a map entry is not HTTP, and the
+staleness risk is not specific to either path). Free in the ordinary case: `produce` only ever
+runs once per column under normal operation, so there is nothing legitimate to evict yet; evicting
+simply guarantees `generate()`'s own imminent, already-about-to-happen recomputation sees current
+data instead of possibly-stale cached data.
+
+**Verified** by `RoadTilePrefetchMixinTest.evictingTheStaleSurfaceDecisionFixesARealReproductionOfTheCachingBug`,
+replicating John's own reproduction methodology directly against a real `EarthGenerator` (no
+`ServerCubeWorld` needed for this specific mechanism): calls `lowestGround` while a cell is
+genuinely PENDING, writes the tile READY directly to disk, confirms `generate()` WITHOUT the fix's
+eviction still shows the stale natural terrain (reproducing the bug first), then confirms the SAME
+generator instance, after `evictStaleSurfaceDecision`, correctly paints the real road.
+
+**Not attempted:** a dedicated accessor/invalidation test driving the real, compiled
+`ServerCubeWorld.produce` itself (same disclosed `ServerLevel` gap as the rest of this readiness
+work) -- the mechanism (the accessor, the key replication, the eviction) is proven directly instead,
+against a real generator.
+
 ## MINECRAFT-566: road width, centerline and shoulder styling (comment 55484)
 
 A deliberately SEPARATE slice from the readiness/bounded-worker work above -- John explicitly asked

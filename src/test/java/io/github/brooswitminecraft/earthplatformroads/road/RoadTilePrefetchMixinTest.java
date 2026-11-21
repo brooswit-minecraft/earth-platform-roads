@@ -934,4 +934,74 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55486/55487: reproduces, on a real {@code EarthGenerator}, the exact
+     * staleness bug John independently confirmed on a real server -- {@code lowestGround} (which
+     * {@code ColumnSurvey}/{@code ServerCubeWorld.plan} calls every tick, well before this column's
+     * road data need be ready) permanently memoizes this column's whole {@code Surface} decision in
+     * {@code SurfaceGenerator}'s own private cache; a LATER, genuinely fresh {@code generate()} call
+     * for the exact same column -- even after the road data becomes ready -- hits that same stale
+     * entry and never re-evaluates. Then proves {@code RoadPrefetch.evictStaleSurfaceDecision} (the
+     * fix {@code ServerCubeWorldRoadPrefetchMixin} now calls unconditionally before every
+     * {@code generate()}) actually fixes it: the SAME generator instance, after the targeted evict,
+     * correctly re-evaluates and paints the real road.
+     */
+    @Test
+    void evictingTheStaleSurfaceDecisionFixesARealReproductionOfTheCachingBug(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 43.0005, lon = -108.0005; // a fresh, never-used cell: 4300_-10800, PENDING (no marker file yet)
+
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int[] block = generator.block(lat, lon);
+        int columnX = block[0] >> 4, columnZ = block[1] >> 4;
+
+        // Step 1: a height-only query, exactly like ColumnSurvey's own every-tick lowestGround
+        // call, while this column's road data is still genuinely PENDING (no marker file at all).
+        // This is the real call that (per Earth Platform's own SurfaceGenerator.column, confirmed
+        // by reading its bytecode) permanently caches this column's whole Surface[] decision.
+        generator.lowestGround(columnX, columnZ);
+
+        // Step 2: the tile actually becomes READY -- written directly to disk, no network needed
+        // (allowNetwork=false here; cellState/cachedWaysForCellOrEmpty read the disk file directly
+        // regardless). A real way whose centerline passes right through the probe point.
+        java.nio.file.Files.writeString(roadCache.resolve("4300_-10800.json"), """
+                {"schema_version":1,"region_id":"staleness-repro","ways":[{"way_id":555040,
+                  "way_tags":{"highway":"secondary","name":"Staleness Repro Street"},
+                  "centerline":[{"lat":43.0003,"lon":-108.0007},{"lat":43.0007,"lon":-108.0003}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeY = ground >> 4;
+
+        // Step 3: reproduce the bug -- generate() right now, WITHOUT evicting, must still show
+        // the stale (natural, non-road) decision cached back in step 1, even though the tile is
+        // now genuinely ready.
+        var staleState = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+        assertTrue(!isAnyRoadSurfaceMaterial(staleState),
+                "Expected to reproduce the real bug: the stale cached decision must still be natural terrain, got " + staleState);
+
+        // Step 4: the actual fix -- evict just this one column's stale cache entry.
+        RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+
+        // Step 5: the SAME generator instance, same column, now correctly re-evaluates and paints
+        // the real road -- the exact "fresh generator instance" behavior John's own reproduction
+        // showed only a NEW instance previously had, now true of this SAME instance too.
+        var fixedState = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+        assertTrue(isAnyRoadSurfaceMaterial(fixedState),
+                "Expected the eviction to fix it: the same generator instance must now paint the real road, got " + fixedState);
+    }
+
+    /** Any of this mod's three road-surface materials (MINECRAFT-566 comment 55484), full-block or layered. */
+    private static boolean isAnyRoadSurfaceMaterial(net.minecraft.world.level.block.state.BlockState state) {
+        return state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get());
+    }
 }

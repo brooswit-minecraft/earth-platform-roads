@@ -2,6 +2,7 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 
 import io.earthplatform.geography.GeoPoint;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import io.github.brooswitminecraft.earthplatformroads.mixin.SurfaceGeneratorColumnCacheAccessor;
 import java.time.Duration;
 
 /**
@@ -70,5 +71,36 @@ public final class RoadPrefetch {
      */
     public static int cubeIndexToBlockCenter(int cubeIndex) {
         return (cubeIndex << 4) + 8;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55486/55487: the exact key {@code SurfaceGenerator.columnKey(int,int)}
+     * (private, confirmed by reading its real bytecode) computes for its own per-column cache --
+     * {@code HashCommon.mix} applied to the two column/chunk coordinates packed into one long,
+     * {@code (columnX << 32) | (columnZ & 0xFFFFFFFFL)}. {@code HashCommon.mix} is a real, public
+     * fastutil method (already an Earth Platform/NeoForge runtime dependency), so this can be
+     * replicated exactly without needing a Mixin accessor into the private method itself -- only
+     * the {@code columns} map needs one ({@code SurfaceGeneratorColumnCacheAccessor}). Column/chunk
+     * coordinates here, NOT block coordinates -- matches {@code ServerCubeWorld.produce}'s own
+     * {@code cubeX}/{@code cubeZ} parameters directly, with no conversion needed (unlike {@link #forColumn}'s
+     * block-coordinate contract).
+     */
+    public static long surfaceGeneratorColumnKey(int columnX, int columnZ) {
+        return it.unimi.dsi.fastutil.HashCommon.mix(((long) columnX << 32) | (columnZ & 0xFFFFFFFFL));
+    }
+
+    /**
+     * Evicts this one column's possibly-stale cached {@code Surface} decision (see
+     * {@link SurfaceGeneratorColumnCacheAccessor}'s own doc for the real bug this guards against)
+     * -- narrow, per-column, never a global cache clear. Column/chunk coordinates, matching
+     * {@link #surfaceGeneratorColumnKey}. {@code (Object)}-via-cast is required here, not optional
+     * boilerplate: {@code EarthGenerator} is a real {@code final} class (confirmed by reading it),
+     * so a direct cast to an interface its own Java source never declares implementing (which this
+     * Mixin-woven accessor interface is, from the compiler's perspective at compile time) would not
+     * compile without it.
+     */
+    public static void evictStaleSurfaceDecision(EarthGenerator generator, int columnX, int columnZ) {
+        ((SurfaceGeneratorColumnCacheAccessor) (Object) generator).earthplatformroads$columns()
+                .remove(surfaceGeneratorColumnKey(columnX, columnZ));
     }
 }

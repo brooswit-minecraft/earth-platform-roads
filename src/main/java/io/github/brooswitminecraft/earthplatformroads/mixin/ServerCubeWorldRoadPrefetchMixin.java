@@ -94,6 +94,29 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * a later caller still benefits once it resolves. The Moore-neighborhood lookahead dispatch is fully
  * async too ({@code enqueueLookaheadAsync}): the calling worker thread never waits on it at all.
  *
+ * <h2>A real stale-cache bug, found and independently reproduced by comments 55486/55487</h2>
+ * {@code SurfaceGenerator} (confirmed by reading its real bytecode) permanently memoizes an entire
+ * column's worth of {@code Surface} decisions in a private {@code columns} map the first time
+ * anything asks for it -- including {@code lowestGround}, which {@code ColumnSurvey}/
+ * {@code ServerCubeWorld.plan} calls every tick for flying-surface logic, well before this
+ * column's own road data need be ready. Once cached, {@code column(int,int)} never recomputes it
+ * on its own: a later, genuinely fresh {@code generate()} call for the exact same column (even
+ * after road data becomes ready) hits that same stale entry and never re-invokes {@code surface()}
+ * at all -- John independently reproduced this on a real server (the SAME generator instance kept
+ * emitting grass after a tile became READY; only a FRESH generator instance, same seed/data,
+ * correctly emitted blackstone). This meant the bounded-worker fix above, on its own, could not
+ * actually guarantee correctness even when the fetch itself succeeded in time. Fixed by
+ * {@link SurfaceGeneratorColumnCacheAccessor} (a new {@code @Accessor} exposing the private
+ * {@code columns} map) plus {@link RoadPrefetch#surfaceGeneratorColumnKey} (replicating
+ * {@code SurfaceGenerator}'s own private {@code columnKey} exactly, via the same real, public
+ * fastutil {@code HashCommon.mix} it uses -- no accessor needed for that part): this injection now
+ * evicts exactly the one column about to be generated, unconditionally, right before
+ * {@code generate()} runs -- narrow, per-column invalidation, never a global cache clear, and free
+ * in the ordinary case (nothing to evict yet, since {@code produce} only runs once per column
+ * normally). Applies to BOTH the ordinary-streaming path and {@code loadNow}'s own arrival path
+ * (not gated by {@link SynchronousLoadGuard}): the staleness risk is not specific to either one,
+ * and evicting a map entry is not HTTP.
+ *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
  * {@code loadNow} methods themselves: doing so needs a real {@code ServerLevel}, which (unlike
@@ -138,8 +161,19 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             at = @At(value = "INVOKE",
                     target = "Lio/earthplatform/minecraft/cubic/gen/CubeGenerator;generate(IIILjava/util/List;Ljava/util/List;)Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
     private void earthplatformroads$prefetchBeforeOrdinaryGenerate(long key, int cubeX, int y, int cubeZ, CallbackInfoReturnable<?> cir) {
-        if (SynchronousLoadGuard.isActive()) return; // loadNow's arrival path: never fetch here
         if (!(generator instanceof EarthGenerator earthGenerator)) return;
+        // MINECRAFT-566 comment 55486/55487, a real, independently-reproduced staleness bug found
+        // in Earth Platform's own code: SurfaceGenerator permanently memoizes this column's whole
+        // Surface[] decision the first time ANYTHING asks for it (lowestGround/ColumnSurvey, called
+        // every tick for flying logic, well before road data need be ready) -- once cached, this
+        // very generate() call about to run would hit that stale entry and never re-invoke
+        // surface() at all, no matter how fresh the road data now is. Evict just this one column
+        // (never a global clear) right before generate() runs, unconditionally -- this is NOT
+        // gated by SynchronousLoadGuard, since it is not HTTP and the exact same staleness risk
+        // applies equally to loadNow's own arrival generate() call. Free in the ordinary case:
+        // produce() only ever runs once per column, so there was nothing legitimate to evict yet.
+        RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+        if (SynchronousLoadGuard.isActive()) return; // loadNow's arrival path: never fetch here
         // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
         // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
         // block->cube shift, `pos.getX() >> 4`, feeding the exact same parameter), but

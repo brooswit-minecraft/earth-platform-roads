@@ -117,6 +117,16 @@ bump: minor
   `adoptReady`/`retryAt` seam instead of a one-shot bounded wait) needs a new Mixin accessor into a
   private record constructor and is not attempted this pass -- see `docs/design.md`.
 
+### Fixed (comments 55486/55487)
+- A real, independently-reproduced stale-cache bug undermining the readiness work: Earth Platform's
+  own `SurfaceGenerator` permanently memoizes a whole column's surface decisions the first time
+  anything asks (including `lowestGround`, called every tick for ordinary flying logic, well
+  before road data need be ready) -- a later, genuinely fresh `generate()` for that same column,
+  even after the tile becomes ready, could still hit that stale cached entry and never re-evaluate.
+  Fixed with a narrow, per-column cache eviction (never a global clear) right before every
+  `produce()`-triggered `generate()` call, both the ordinary-streaming and arrival paths. Verified
+  by directly reproducing John's own methodology against a real `EarthGenerator`.
+
 ### Changed (comment 55484, a separate styling slice from the readiness work above)
 - Roughly doubled every `RoadClass`'s paved half-width (and the lanes-based formula the same way)
   per John's live-playtest feedback that roads read as too narrow. Never required any migration:
