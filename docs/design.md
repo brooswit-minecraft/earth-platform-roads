@@ -552,6 +552,51 @@ deliberately races into the middle of the wait; the response is then released (c
 the bound); and the test asserts the real road still paints correctly despite that race -- proving
 the reorder, not just asserting it.
 
+### A bounded verify-and-retry for that residual race (comments 55496/55498/55499)
+
+John independently reproduced the residual race above with deliberate test-only latches
+(a completed, premature computation paused right before its own publish, released only after this
+mixin's eviction and its own fresh `generate()` call had already run) and asked for a real fix, not
+another ordering tweak -- correctly: the problem is WHO WINS the write race, not WHEN the eviction
+happens, and no reorder changes that.
+
+The actual root-cause fix -- move the road material decision out of `SurfaceGenerator`'s cache
+entirely, so there is nothing left for a stale write to corrupt -- was evaluated and deliberately
+**not** attempted. `surface()`'s `Surface` record carries more fields than the top/under block
+states this mixin pair already overrides (passed as `0, 0, 0, 0, 0, false` in the existing
+override), and comment 55498 named concrete, additional real risks in reimplementing that logic
+externally: cached `Surface` data in the real `combined-73` build also drives cave-mouth behavior
+at depth 0/1 and `StructureHost.fill`'s own foundation filling -- a blind post-`generate()`
+overwrite of "top plus a few blocks of under" could plug an existing cave mouth or corrupt a
+generated structure's blocks/metadata, in ordinary play, not just under an engineered race. That
+rewrite touches the single most heavily-tested part of this whole mod and needs its own dedicated,
+carefully-verified pass against a real running game -- not a same-change patch alongside everything
+else, in an environment with no running Minecraft client to verify it against.
+
+**Fixed instead** with a bounded verify-and-retry, leaving the existing, already-correct
+`surface()`-based mechanism completely untouched: `ServerCubeWorldRoadPrefetchMixin`'s `@Inject` at
+the `generate()` call site became an `@Redirect`
+(`earthplatformroads$generateWithStaleRetry`) that calls the real `generate()`, then checks
+`RoadPrefetch.sectionLooksStale` -- re-deriving, from fresh `RoadNetwork` data and `EarthGenerator`'s
+own NATURAL `surfaceY`/`waterY` (never the decorated output, per 55498's explicit guidance), whether
+every column in this cube that should show a road actually does in the generated section -- and if
+not, evicts again and retries (re-evict, regenerate) up to `MAX_STALE_RETRY_ATTEMPTS` (3) times. In
+ordinary play this never retries at all; the race would have to recur on every single attempt to
+survive all 3. This narrows the race to "exhausts a small, bounded retry budget", not "eliminated" --
+a disclosed, deliberately bounded residual gap (unbounded retries would risk an unbounded
+generation stall instead), not claimed as fully closed.
+
+**Verified** by `RoadTilePrefetchMixinTest.sectionLooksStaleDetectsAMismatchAgainstFreshRoadDataAndClearsOnceFixed`:
+a correctly generated section (road data already ready) is proven to never be flagged; the exact
+same section with ONLY the road column's own block swapped to a natural material (modelling what a
+won stale race actually leaves behind) is proven to be flagged. **Known, disclosed test gap:** the
+retry LOOP's own end-to-end behavior (that a second attempt actually recovers after a first-attempt
+staleness detection) is not independently reproduced by an automated test this pass -- doing that
+means pausing `SurfaceGenerator`'s own internal computation at a specific bytecode point, the same
+test-only-latch technique John's own reproduction used, which needs its own dedicated hook into
+Earth Platform internals beyond what exists here; the detection function itself (what the retry
+loop actually decides on) is proven directly and deterministically instead.
+
 ## MINECRAFT-566: road width, centerline and shoulder styling (comment 55484)
 
 A deliberately SEPARATE slice from the readiness/bounded-worker work above -- John explicitly asked

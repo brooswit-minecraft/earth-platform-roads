@@ -1085,4 +1085,44 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55496/55499: {@code RoadPrefetch.sectionLooksStale} is what
+     * {@code ServerCubeWorldRoadPrefetchMixin}'s bounded verify-and-retry actually checks before
+     * deciding to re-evict and regenerate. Proves it directly, deterministically: a correctly
+     * generated section (road data already ready) is never flagged; the exact same section with
+     * ONLY the road column's own block swapped to a natural material (modelling what a won stale
+     * race would actually leave behind) IS flagged.
+     */
+    @Test
+    void sectionLooksStaleDetectsAMismatchAgainstFreshRoadDataAndClearsOnceFixed(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 45.0005, lon = -110.0005; // a fresh, never-used cell: 4500_-11000, READY from the start
+
+        java.nio.file.Files.writeString(roadCache.resolve("4500_-11000.json"), """
+                {"schema_version":1,"region_id":"stale-detection","ways":[{"way_id":555060,
+                  "way_tags":{"highway":"secondary","name":"Stale Detection Street"},
+                  "centerline":[{"lat":45.0003,"lon":-110.0007},{"lat":45.0007,"lon":-110.0003}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int[] block = generator.block(lat, lon);
+        int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeY = ground >> 4;
+        int lx = block[0] & 15, ly = ground & 15, lz = block[1] & 15;
+
+        var correctSection = generator.generate(cubeX, cubeY, cubeZ);
+        assertTrue(isAnyRoadSurfaceMaterial(correctSection.getBlockState(lx, ly, lz)),
+                "Sanity: this column must actually be real road surface to begin with, got " + correctSection.getBlockState(lx, ly, lz));
+        assertTrue(!RoadPrefetch.sectionLooksStale(generator, cubeX, cubeY, cubeZ, correctSection),
+                "Expected a correctly generated section to never be flagged stale");
+
+        var staleSection = new net.minecraft.world.level.chunk.LevelChunkSection(correctSection.getStates().copy(), correctSection.getBiomes());
+        staleSection.setBlockState(lx, ly, lz, net.minecraft.world.level.block.Blocks.GRASS_BLOCK.defaultBlockState());
+        assertTrue(RoadPrefetch.sectionLooksStale(generator, cubeX, cubeY, cubeZ, staleSection),
+                "Expected a section whose road column was overwritten with a natural material to be flagged stale");
+    }
 }

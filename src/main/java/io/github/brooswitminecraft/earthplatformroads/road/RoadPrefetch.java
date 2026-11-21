@@ -1,9 +1,15 @@
 package io.github.brooswitminecraft.earthplatformroads.road;
 
 import io.earthplatform.geography.GeoPoint;
+import io.earthplatform.geography.globe.MercatorGrid;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
+import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat;
 import io.github.brooswitminecraft.earthplatformroads.mixin.SurfaceGeneratorColumnCacheAccessor;
 import java.time.Duration;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 
 /**
  * The one real dispatch -- {@code waysForCell} then {@code enqueueLookahead}, through
@@ -102,5 +108,56 @@ public final class RoadPrefetch {
     public static void evictStaleSurfaceDecision(EarthGenerator generator, int columnX, int columnZ) {
         ((SurfaceGeneratorColumnCacheAccessor) (Object) generator).earthplatformroads$columns()
                 .remove(surfaceGeneratorColumnKey(columnX, columnZ));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55496: eviction alone cannot fully close the race -- a DIFFERENT,
+     * already-in-flight concurrent {@code column()} computation, started before the eviction ran,
+     * can still publish its own (also premature) result into the SAME now-empty slot before
+     * {@code generate()}'s own read of it, winning regardless of eviction timing. Rather than
+     * reimplement {@code SurfaceGenerator}'s own cached depth-spread/decoration logic to move the
+     * road decision out of its cache entirely (comment 55498: real additional risks there --
+     * cached {@code Surface} data also drives cave-mouth behavior and structure fill, which a blind
+     * post-generate overwrite could corrupt) this instead verifies the ALREADY-GENERATED section
+     * against what fresh road data says it should contain, so {@code ServerCubeWorldRoadPrefetchMixin}'s
+     * {@code @Redirect} can retry (re-evict, regenerate) a small, bounded number of times rather than
+     * accept a result a race may have corrupted. Never touches a block outside what fresh road data
+     * says should be road surface -- an unrelated cave mouth, structure, or any off-road column is
+     * never inspected here, let alone written to.
+     *
+     * <p>Scans this cube's own 16x16 columns (not every cube in the world -- bounded, and only ever
+     * for cubes {@code ServerCubeWorldRoadPrefetchMixin} is already generating): for each column
+     * where fresh {@link RoadNetwork} data says a road should be painted, and whose natural ground
+     * height actually falls within THIS cube's own Y range, confirms the generated section's actual
+     * block there is one of this mod's three road materials. {@link EarthGenerator#surfaceY}/
+     * {@link SurfaceGenerator#waterY} (natural, not derived from the decorated output) are used for
+     * height/water, per 55498's own explicit guidance -- the SAME functions
+     * {@code EarthGeneratorRoadMixin}'s own (unmodified, still the single source of truth for WHICH
+     * material to paint) {@code surface()} hook already relies on.
+     */
+    public static boolean sectionLooksStale(EarthGenerator generator, int cubeX, int cubeY, int cubeZ, LevelChunkSection section) {
+        MercatorGrid grid = generator.grid();
+        int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int worldX = baseX + lx, worldZ = baseZ + lz;
+                RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, worldX, worldZ);
+                if (segment == null) continue;
+                if (segment.crossSectionAt(grid, worldX, worldZ) == RoadSegment.CrossSection.OFF_ROAD) continue;
+                int groundY = generator.surfaceY(worldX, worldZ);
+                int waterY = generator.waterY(worldX, worldZ);
+                if (waterY != SurfaceGenerator.DRY && waterY >= groundY) continue; // underwater: surface() itself never paints here either
+                int localY = groundY - baseY;
+                if (localY < 0 || localY > 15) continue; // this column's surface is not in THIS cube
+                if (!isAnyRoadSurfaceMaterial(section.getBlockState(lx, localY, lz))) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isAnyRoadSurfaceMaterial(BlockState state) {
+        return state.is(Blocks.POLISHED_BLACKSTONE) || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                || state.is(Blocks.YELLOW_TERRACOTTA) || state.is(LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                || state.is(Blocks.GRAVEL) || state.is(LayeredSlopesCompat.LAYERED_GRAVEL.get());
     }
 }

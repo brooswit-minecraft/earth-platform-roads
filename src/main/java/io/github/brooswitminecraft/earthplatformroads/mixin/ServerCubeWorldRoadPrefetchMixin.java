@@ -5,10 +5,14 @@ import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
 import io.github.brooswitminecraft.earthplatformroads.road.SynchronousLoadGuard;
 import java.time.Duration;
+import java.util.List;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
@@ -125,12 +129,37 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * from it. Fixed by reordering: the dispatch/wait now runs first, and the eviction is the very
  * LAST statement in this method, immediately before falling through into {@code generate()}.
  * {@code loadNow}'s own arrival path has no wait to race against, so this reordering does not
- * affect it. <b>Known, disclosed residual race, not fully closed:</b> {@code SurfaceGenerator}'s
- * own {@code column()} cache fills via a plain, non-atomic get-then-compute-then-put, not
- * {@code computeIfAbsent} -- a DIFFERENT, already-in-flight concurrent computation for this exact
- * column, started before this eviction ran, can still publish its own (also premature) result
- * AFTER this eviction, winning the race anyway. Closing that fully would mean owning
- * {@code SurfaceGenerator}'s own caching logic entirely, not attempted here.
+ * affect it. <b>Known, disclosed residual race:</b> {@code SurfaceGenerator}'s own {@code column()}
+ * cache fills via a plain, non-atomic get-then-compute-then-put, not {@code computeIfAbsent} -- a
+ * DIFFERENT, already-in-flight concurrent computation for this exact column, started before this
+ * eviction ran, can still publish its own (also premature) result AFTER this eviction, winning the
+ * race anyway -- no eviction-ordering fix changes who wins that race. See the next section for how
+ * this is mitigated (not eliminated).
+ *
+ * <h2>Bounded verify-and-retry for the residual race, comments 55496/55498/55499</h2>
+ * John independently reproduced the residual race above with deliberate test-only latches forcing
+ * the exact interleaving, and the real fix for it that actually eliminates the race -- moving the
+ * road material decision out of {@code SurfaceGenerator}'s cache entirely, so there is nothing left
+ * for a stale concurrent publish to corrupt -- was evaluated and deliberately NOT attempted:
+ * {@code surface()}'s {@code Surface} record carries more than the top/under block states this
+ * mixin pair already overrides, and comment 55498 named concrete further risks in reimplementing
+ * that depth-spread/decoration logic externally (cached {@code Surface} data also drives cave-mouth
+ * behavior and {@code StructureHost} fill) -- a blind post-{@code generate()} overwrite could
+ * corrupt either, in ordinary play, not just under a deliberately engineered race. That rewrite
+ * would touch the single most heavily-tested part of this whole mod and needs its own dedicated,
+ * carefully-verified pass, not a same-change patch.
+ *
+ * <p>Instead, {@code earthplatformroads$generateWithStaleRetry} ({@code @Redirect}, replacing the
+ * same {@code generate()} call this class already targeted via {@code @Inject}) calls the real
+ * {@code generate()}, then verifies the result with {@link RoadPrefetch#sectionLooksStale} --
+ * re-deriving, from fresh {@link io.github.brooswitminecraft.earthplatformroads.road.RoadNetwork}
+ * data and {@code EarthGenerator}'s own natural {@code surfaceY}/{@code waterY} (never the
+ * decorated output, per comment 55498's explicit guidance), whether every column in this cube that
+ * should show a road actually does -- and if not, evicts again and retries, up to
+ * {@link #MAX_STALE_RETRY_ATTEMPTS} times. This narrows the race to "recurs on every single retry
+ * attempt", not "eliminated": a genuinely adversarial, continuously-racing concurrent caller could
+ * still exhaust the retries, left as a known, disclosed, deliberately bounded (not unlimited, to
+ * avoid an unbounded generation stall) residual gap, not claimed as fully closed.
  *
  * <h2>Known, disclosed test gap</h2>
  * No test in this repository drives the real, compiled {@code ServerCubeWorld.produce}/
@@ -159,6 +188,17 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      */
     private static final Duration PREFETCH_WAIT_BOUND = Duration.ofSeconds(2);
 
+    /**
+     * MINECRAFT-566 comment 55496's residual race, bounded rather than eliminated (see this
+     * class's own "known, disclosed residual race" doc section): how many times
+     * {@code earthplatformroads$generateWithStaleRetry} will re-evict and regenerate before giving
+     * up and accepting whatever the last attempt produced. In ordinary play this never retries at
+     * all; the race would have to recur on every single attempt to survive this many retries,
+     * which realistically only happens under the kind of deliberately engineered test-latch timing
+     * comment 55496's own reproduction used.
+     */
+    private static final int MAX_STALE_RETRY_ATTEMPTS = 3;
+
     @Shadow
     private CubeGenerator generator;
 
@@ -172,18 +212,20 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         SynchronousLoadGuard.exit();
     }
 
-    @Inject(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
+    @Redirect(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
             at = @At(value = "INVOKE",
                     target = "Lio/earthplatform/minecraft/cubic/gen/CubeGenerator;generate(IIILjava/util/List;Ljava/util/List;)Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
-    private void earthplatformroads$prefetchBeforeOrdinaryGenerate(long key, int cubeX, int y, int cubeZ, CallbackInfoReturnable<?> cir) {
-        if (!(generator instanceof EarthGenerator earthGenerator)) return;
+    private LevelChunkSection earthplatformroads$generateWithStaleRetry(
+            CubeGenerator cubeGenerator, int cubeX, int cubeY, int cubeZ, List<CompoundTag> blockEntities, List<CompoundTag> entities) {
+        if (!(cubeGenerator instanceof EarthGenerator earthGenerator)) {
+            return cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+        }
         // MINECRAFT-566 comment 55492, a real bug in the first version of this fix: evicting
         // BEFORE the bounded wait below left a window (up to PREFETCH_WAIT_BOUND) during which
         // some OTHER concurrent caller -- a lowestGround survey on the server tick thread, for
         // example -- could re-populate this exact column's cache with ANOTHER premature decision,
         // undoing the eviction before generate() ever benefited from it. The dispatch/wait must
-        // run FIRST; the eviction must be the very LAST thing this method does, as close as
-        // possible to the generate() call it is about to fall through into.
+        // run FIRST; the eviction must be the very LAST thing before calling the real generate().
         if (!SynchronousLoadGuard.isActive()) { // loadNow's arrival path: never fetch here
             // MINECRAFT-566 comment 55476, a confirmed "wrong-tile" bug in the first version of this
             // mixin: produce's x/z are CUBE indices (unpacked from CubeKey -- see loadNow's own
@@ -212,13 +254,23 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // since it is not HTTP and the exact same staleness risk applies equally to loadNow's own
         // arrival generate() call. Free in the ordinary case: produce() only ever runs once per
         // column, so there was nothing legitimate to evict yet.
-        //
-        // Known, disclosed residual race (comment 55492, not fully closed): SurfaceGenerator's own
-        // column() cache is filled via a plain, non-atomic get-then-compute-then-put, not
-        // computeIfAbsent -- a DIFFERENT, already-in-flight concurrent computation for this exact
-        // column, started before this eviction ran, can still publish its own (also premature)
-        // result AFTER this eviction, winning the race anyway. Narrowing this further would mean
-        // owning SurfaceGenerator's own caching logic entirely, not attempted here.
         RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+        LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+        // MINECRAFT-566 comment 55496, a real, independently-reproduced residual race (see this
+        // class's own "known, disclosed residual race" doc section): a DIFFERENT, already-in-flight
+        // concurrent column() computation, started before the eviction above ran, can still publish
+        // its own (also premature) result into the same now-empty slot before generate()'s own read
+        // of it -- no eviction-ordering fix changes who wins that race. Rather than reimplement
+        // SurfaceGenerator's own cached depth-spread/decoration logic to move the road decision out
+        // of its cache entirely (comment 55498: real additional risk there -- cached Surface data
+        // also drives cave-mouth behavior and structure fill, which a blind post-generate overwrite
+        // could corrupt), this instead verifies the result against what fresh road data says it
+        // should contain and retries (re-evict, regenerate) a small, bounded number of times.
+        for (int attempt = 0; attempt < MAX_STALE_RETRY_ATTEMPTS
+                && RoadPrefetch.sectionLooksStale(earthGenerator, cubeX, cubeY, cubeZ, section); attempt++) {
+            RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+            section = cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+        }
+        return section;
     }
 }

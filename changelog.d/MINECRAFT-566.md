@@ -139,6 +139,21 @@ bump: minor
   before the eviction can still publish after it) remains open; closing it fully would mean owning
   that upstream caching logic entirely.
 
+### Fixed (comments 55496/55498/55499)
+- That residual race, independently reproduced by John with deliberate test-only latches: bounded
+  the exposure with a verify-and-retry rather than attempting the real root-cause fix (moving the
+  road decision out of `SurfaceGenerator`'s cache entirely), which was evaluated and deliberately
+  not attempted this pass -- cached `Surface` data also drives cave-mouth behavior and structure
+  fill in the real build, and a blind post-`generate()` overwrite risked corrupting either in
+  ordinary play, not just under the race. `ServerCubeWorldRoadPrefetchMixin`'s injection became an
+  `@Redirect`: calls the real `generate()`, verifies the result against fresh road data
+  (`RoadPrefetch.sectionLooksStale`, using natural `surfaceY`/`waterY`, never decorated output), and
+  retries (re-evict, regenerate) up to 3 times if it looks wrong. Narrows the race to "exhausts a
+  bounded retry budget", not eliminated -- disclosed as such. The detection function itself is
+  proven directly and deterministically; the retry loop's own end-to-end recovery is not
+  independently reproduced (would need the same test-only-latch hook into Earth Platform internals
+  John's own reproduction used).
+
 ### Changed (comment 55484, a separate styling slice from the readiness work above)
 - Roughly doubled every `RoadClass`'s paved half-width (and the lanes-based formula the same way)
   per John's live-playtest feedback that roads read as too narrow. Never required any migration:
