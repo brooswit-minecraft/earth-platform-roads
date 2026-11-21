@@ -1023,6 +1023,18 @@ myself against the real timing this bug is actually about, was judged worse than
 disclosed for whoever picks it up next. `b7ff716` (canopy clearance only) remains the confirmed,
 ready candidate -- untouched by this finding.
 
+**Addendum (comment 55524):** John separately confirmed, against unchanged `3ff4ea5` (docs-only,
+no code change), that the SYNCHRONOUS forced-load path (`ServerCubeWorld.loadNow` ->
+`produce`/`adoptReady`, used by portal arrival, teleport, and similar forced-load callers) has the
+SAME underlying problem via a DIFFERENT entry point: it bypasses whatever pending/retryAt tracking
+a future async fix might add, can adopt grass while the tile is still confirmed PENDING, and makes
+zero extra HTTP calls on that thread (the no-game-thread-HTTP guarantee holds). This means whatever
+slice eventually addresses 55522 needs an EXPLICITLY designed and tested policy for `loadNow`
+specifically, not just the ordinary-movement async path -- and must not naively change `loadNow`'s
+general contract (e.g. returning null, or blocking) given how many OTHER callers (portal ground
+selection among them) depend on its existing synchronous guarantee. Not attempted, for the same
+reason as 55522 itself; folded into the same disclosed, not-yet-started known gap.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
