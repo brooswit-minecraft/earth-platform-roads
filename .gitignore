@@ -26,6 +26,7 @@ bin/
 Thumbs.db
 __pycache__/
 
-# Earth Platform dependency jar: built locally by scripts/build_earth_platform_dependency.sh,
-# never committed (third-party binary; see docs/earth-platform-dependency.md for provenance).
+# Earth Platform and Layered Slopes dependency jars: fetched/built locally by
+# scripts/build_earth_platform_dependency.sh and scripts/fetch_layered_slopes_dependency.sh,
+# never committed (third-party binaries; see docs/earth-platform-dependency.md for provenance).
 /libs/*.jar
