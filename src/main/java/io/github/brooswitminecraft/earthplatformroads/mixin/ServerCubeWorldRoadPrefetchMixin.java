@@ -275,10 +275,10 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      * bounded chance to resolve, regardless of what the state looks like by the time this runs --
      * handling the race window rather than missing it.
      *
-     * <p>Bounded two ways at once: a real wall-clock window ({@link #PENDING_DEFER_WINDOW}, the
-     * REMAINING portion of which is passed to the re-dispatch -- not a fresh full
-     * {@link #PREFETCH_WAIT_BOUND} every time, which comment 55532 also flagged as a real
-     * inconsistency with this window's own "total, not per-attempt" intent) and a single retry
+     * <p>Bounded two ways at once: a real wall-clock budget (a dynamic total per comment 55535 --
+     * see {@link #DEFER_ROUND_TRIP_MARGIN}'s own doc -- the REMAINING portion of which is passed to
+     * the re-dispatch, not a fresh full bound every time, which comment 55532 also flagged as a real
+     * inconsistency with this budget's own "total, not per-attempt" intent) and a single retry
      * attempt (once the cell resolves and this regenerates once, there is nothing further to gain
      * from retrying again). Either bound running out, or the wait coming back still pending, means
      * an explicit, deliberate fail-open: accept whatever the last attempt produced, exactly like any
@@ -298,8 +298,32 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      * initial fetch POST, and a cache-only source (no live-fetch capability, but still non-null)
      * still entered this method's wait scheduling despite sending zero POSTs. See
      * {@code RoadPrefetch.hasLiveTileSource}'s own updated doc for the cache-only distinction.
+     *
+     * <p><b>Comment 55535, a real design gap in the fixed window itself:</b> a FIXED constant here
+     * cannot be both short (so a genuine outage fails open quickly) and long enough to survive the
+     * provider's own real steady-cadence cooldown (observed concretely under the DEFAULT cadence: an
+     * entirely ordinary, healthy cold cell gave up and saved grass PERMANENTLY -- an already-saved
+     * cube never reaches this injection again -- before its own real cooldown had even cleared, even
+     * though an explicit, later fetch immediately proved the cell would have resolved correctly).
+     * Replaced by a DYNAMIC budget, computed once per call from
+     * {@link RoadPrefetch#timeUntilNextEligibleRequest} (the REAL remaining cooldown, not a guess),
+     * plus {@link #DEFER_ROUND_TRIP_MARGIN} for the request/response itself once that cooldown
+     * clears, clamped to {@link #MAX_DEFER_WAIT} as a hard safety ceiling regardless of cadence. The
+     * one case this budget deliberately does NOT try to extend for is
+     * {@link RoadPrefetch#sustainedOutage} (several real, dispatched failures in a row, no success
+     * between): waiting out a longer cooldown cannot help a provider that is already known to be
+     * down, so that case clamps to the short {@link #PREFETCH_WAIT_BOUND} instead -- "a deliberate
+     * finite outage policy," per John's own framing, rather than this budget growing to cover a
+     * cadence that will not actually help.
      */
-    private static final Duration PENDING_DEFER_WINDOW = Duration.ofSeconds(3);
+    private static final Duration DEFER_ROUND_TRIP_MARGIN = Duration.ofSeconds(2);
+
+    /**
+     * MINECRAFT-566 comment 55535: a hard ceiling on the dynamic defer budget above, regardless of
+     * how long the provider's own real cooldown turns out to be -- this generation worker thread
+     * must not stall indefinitely even against a misconfigured or unusually long cadence.
+     */
+    private static final Duration MAX_DEFER_WAIT = Duration.ofSeconds(10);
 
     @Shadow
     private CubeGenerator generator;
@@ -353,19 +377,31 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         boolean liveAndRelevant = !SynchronousLoadGuard.isActive()
                 && RoadPrefetch.hasLiveTileSource()
                 && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ);
-        // MINECRAFT-566 comment 55534: "the reported 3s is not an aggregate worker bound" -- the
-        // prior version computed this deadline AFTER the first accepted generate() call returned,
-        // so PENDING_DEFER_WINDOW only ever bounded the retry's OWN slice, not the real total extra
-        // time this method can spend (initial dispatch wait + first generate() + retry wait), which
-        // is why a held response was observed failing open at 4.26s against a nominal 3s window.
-        // Captured here, before the initial dispatch, so the window is a genuine aggregate budget.
-        Instant deferDeadline = Instant.now().plus(PENDING_DEFER_WINDOW);
+        // MINECRAFT-566 comment 55535: the aggregate defer budget is now DYNAMIC -- sized against
+        // the REAL remaining steady-cadence cooldown (RoadPrefetch.timeUntilNextEligibleRequest)
+        // plus a fixed round-trip margin, clamped to MAX_DEFER_WAIT -- rather than a fixed guess that
+        // could not be both short (fail an outage open quickly) and long enough to survive an
+        // entirely ordinary cooldown. sustainedOutage() short-circuits this to the short
+        // PREFETCH_WAIT_BOUND instead: a known-down provider will not be fixed by waiting longer.
+        // Computed once, here, before the initial dispatch, so it is a genuine aggregate budget
+        // across initial dispatch + first generate() + retry (comment 55534's own fix, preserved).
+        Duration deferBudget;
+        if (!liveAndRelevant) {
+            deferBudget = Duration.ZERO; // nothing to defer for at all; never read, kept for clarity
+        } else if (RoadPrefetch.sustainedOutage()) {
+            deferBudget = PREFETCH_WAIT_BOUND;
+        } else {
+            Duration candidate = RoadPrefetch.timeUntilNextEligibleRequest().plus(DEFER_ROUND_TRIP_MARGIN);
+            deferBudget = candidate.compareTo(MAX_DEFER_WAIT) > 0 ? MAX_DEFER_WAIT : candidate;
+        }
+        Instant deferDeadline = Instant.now().plus(deferBudget);
         if (liveAndRelevant) { // already excludes loadNow's own arrival path -- see liveAndRelevant's own doc
-            // MINECRAFT-566 comment 55476's "bounded-worker" ask: forColumnBounded (not the plain
-            // forColumn prepare/prepareNear uses) coalesces this column's own-cell fetch across every
-            // cube-Y layer and bounds this worker's own wait to PREFETCH_WAIT_BOUND, with the real
-            // network wait happening on a dedicated background thread, never this one.
-            RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, PREFETCH_WAIT_BOUND);
+            // MINECRAFT-566 comment 55476's "bounded-worker" ask, now comment 55535's dynamic budget:
+            // forColumnBounded (not the plain forColumn prepare/prepareNear uses) coalesces this
+            // column's own-cell fetch across every cube-Y layer and bounds this worker's own wait to
+            // deferBudget (the real remaining cooldown, not a fixed guess), with the real network
+            // wait happening on a dedicated background thread, never this one.
+            RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, deferBudget);
         }
         // MINECRAFT-566 comment 55486/55487, a real, independently-reproduced staleness bug found
         // in Earth Platform's own code: SurfaceGenerator permanently memoizes this column's whole
@@ -394,7 +430,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // one generate() call (John's own native reproduction: the tile became READY barely 91ms
         // after the accepted attempt had already produced grass), and a check made only after the
         // fact would correctly, but uselessly, see "not pending" and never retry at all. See
-        // PENDING_DEFER_WINDOW's own doc for the full reasoning.
+        // DEFER_ROUND_TRIP_MARGIN's own doc for the full reasoning.
         boolean wasPendingBeforeAcceptedAttempt = liveAndRelevant // already excludes loadNow's own arrival path
                 && RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ);
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
@@ -422,10 +458,10 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // genuinely pending -- never re-derived from the current state here, for exactly the race
         // reason that snapshot's own doc explains. Re-dispatches the SAME cell (coalesced via
         // RoadTileSource's own in-flight map, so this never sends a second real request while the
-        // first is still outstanding), passing the REMAINING portion of PENDING_DEFER_WINDOW (never
-        // a fresh full PREFETCH_WAIT_BOUND -- this window is a total budget, not per-attempt), and
-        // only if that wait actually resolved it, evicts and regenerates once -- an EXPLICIT,
-        // deliberate fail-open the moment the window is already out, or the wait comes back still
+        // first is still outstanding), passing the REMAINING portion of the dynamic deferBudget
+        // (comment 55535 -- never a fresh bound each time, this budget is a total, not per-attempt),
+        // and only if that wait actually resolved it, evicts and regenerates once -- an EXPLICIT,
+        // deliberate fail-open the moment the budget is already out, or the wait comes back still
         // pending: accept whatever the last attempt produced, exactly like any other pending/failed
         // cell already does, never an unbounded stall of this generation worker thread. A single
         // retry attempt is enough: once resolved and regenerated, there is nothing further to gain.
@@ -433,8 +469,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             Instant now = Instant.now();
             if (now.isBefore(deferDeadline)) {
                 Duration remaining = Duration.between(now, deferDeadline);
-                Duration thisWait = remaining.compareTo(PREFETCH_WAIT_BOUND) < 0 ? remaining : PREFETCH_WAIT_BOUND;
-                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, thisWait);
+                RoadPrefetch.forColumnBounded(earthGenerator, centerBlockX, centerBlockZ, remaining);
                 if (!RoadPrefetch.isPendingForColumn(earthGenerator, centerBlockX, centerBlockZ)) {
                     RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
                     attemptBlockEntities = new ArrayList<>(); // discard the abandoned (premature) attempt's own additions entirely

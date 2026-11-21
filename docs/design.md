@@ -1102,33 +1102,67 @@ tile source genuinely `PENDING` throughout (asserted directly), proving the gate
 relevant using nothing but natural terrain -- exactly the precondition this bug violated. 89/89
 tests pass.
 
-## MINECRAFT-566: default-cadence native finding not yet fixed (comment 55535)
+## MINECRAFT-566: the defer budget is now cadence-aware, not a fixed guess (comment 55535)
 
-John's next native round, against the SAME `54cc747` commit (pre-55534-fix), ran under the
-provider's own DEFAULT steady request cadence (longer than this mixin's fixed 3s
-`PENDING_DEFER_WINDOW`) rather than a held/controlled response. Two shapes:
+John's native round against `54cc747` (pre-55534) found the "slow speculative" shape still failing
+under the provider's own DEFAULT steady request cadence (longer than the then-fixed 3s
+`PENDING_DEFER_WINDOW`): a queued fetch for the demanded cell got delayed behind an earlier request
+by the cadence itself (not a bug -- real rate limiting), the fixed defer budget ran out well before
+that real cooldown cleared, generated grass, and -- because `produce`'s storage-read fast path means
+an already-saved cube never reaches this injection again -- that grass was PERMANENT on reopen. A
+later, explicit fetch after the real cooldown correctly resolved the same cell, confirming the data
+and fetch path were fine; only the fixed timing budget was wrong, structurally -- it could not be
+both short (fail a genuine outage open quickly) and long enough to survive an entirely ordinary
+cooldown, because it had no way to know which situation it was actually in.
 
-- A "fast" shape (one request resolves shortly before a second, unrelated demand needs a
-  different/nearby cell) worked correctly: one POST, correct stripe, correct reopen.
-- The original "slow speculative" shape still fails: a queued fetch job for the demanded cell got
-  delayed behind an earlier request by the steady cadence itself (not a bug, just real rate
-  limiting), the generation's own bounded defer window ran out well before the cadence's own cooldown
-  cleared, generated grass, and -- because `produce`'s storage-read fast path means an already-saved
-  cube never reaches this injection again -- that grass is PERMANENT on reopen. A later, explicit
-  fetch after the real cooldown correctly resolves the cell for a FRESH cube, confirming the data
-  and fetch path are fine; only the timing budget is too short relative to normal (not pathological)
-  request cadence.
+**Fix:** the defer budget is now computed DYNAMICALLY, once per call, instead of a fixed constant:
+- `RoadTileSource.timeUntilNextEligibleRequest()` (new, instance-wide, read-only) reports the REAL
+  remaining steady-cadence cooldown, `Duration.ZERO` once it has cleared.
+- `RoadPrefetch.timeUntilNextEligibleRequest()`/`RoadPrefetch.sustainedOutage()` expose that and
+  `RoadTileSource.sustainedOutage()` the same way `hasLiveTileSource` already does.
+- `ServerCubeWorldRoadPrefetchMixin` computes `deferBudget` once, before the initial dispatch: if
+  `sustainedOutage()` (several real, dispatched failures in a row -- a provider genuinely known to
+  be down), clamp to the short `PREFETCH_WAIT_BOUND` (2s) rather than waiting out a cooldown that
+  will not help; otherwise, `timeUntilNextEligibleRequest() + DEFER_ROUND_TRIP_MARGIN` (2s, for the
+  request/response itself once the cooldown clears), clamped to a hard `MAX_DEFER_WAIT` ceiling
+  (10s) regardless of cadence. This budget is used as BOTH the initial dispatch's own bound and the
+  total aggregate the later retry's remaining-portion calculation is drawn from (the 55534 fix's own
+  aggregate-budget structure, preserved) -- "a deliberate finite outage policy," per John's own
+  framing, rather than either extreme.
 
-**Not yet fixed.** John's own framing: keep this draft out of the next playtest cutoff "until
-ordinary outstanding immediate demand survives valid cadence and the old slow-speculation fixture
-passes within a deliberate finite outage policy" -- i.e., the fix needs to let an immediate demand's
-defer/retry survive a normal cooldown interval (not just a short, fixed worst-case guess), while
-still eventually giving up during a genuine, sustained provider outage rather than stalling a
-generation worker thread indefinitely. This needs real design work (likely: sizing the wait against
-the source's own actual steady interval / `nextEligibleRequestAt`, combined with `sustainedOutage()`
-as the actual "stop waiting, this is a real outage" signal, rather than a single fixed duration
-constant) -- not attempted in this same pass; see the ticket for the next round once designed.
-Explicitly: no server-thread HTTP and no bypassing request cadence, in whatever shape this takes.
+Verified directly: a new `RoadTileSourceTest` case proves `timeUntilNextEligibleRequest` tracks a
+real steady-cadence cooldown (positive right after a dispatch, zero once it genuinely elapses); a
+new `RoadTilePrefetchMixinTest` case proves `RoadPrefetch`'s own wrappers delegate correctly and
+return the right defaults with no live source, including driving a real `sustainedOutage() == true`
+state with three genuinely dispatched failures against a stub. 91/91 tests pass. The mixin-level
+end-to-end behavior (does the generation worker actually wait the right amount under a real cadence)
+remains the same disclosed test gap as every other fix in this file -- no real `ServerCubeWorld`
+fixture exists here; John's own native infrastructure is what actually proved the bug and will
+reverify the fix.
+
+## MINECRAFT-566: readiness still samples one cell per cube, not the cells it actually spans (comment 55542, explicitly deferred)
+
+John's own framing: "Separate later acceptance control; do not divert the current default-cadence
+work... keep this as a narrow follow-up if needed." Native checks against `ad55ad7` found a real
+cube spanning two different map cells -- a center cell A (confirmed empty) and an outer strip
+covered only by a different cell B, whose healthy fetch was still held in flight. `isPendingForColumn`
+(and therefore `wasPendingBeforeAcceptedAttempt`'s snapshot) only ever checks the single cell the
+CENTER column maps to -- it saw cell A, already confirmed-empty, and concluded "not pending,
+nothing to defer for," even though cell B (covering a real, different part of this exact cube's own
+footprint) was still genuinely in flight. The worker accepted grass; B then resolved and a fresh
+generator correctly painted the stripe from a way wholly within B; the original cube's grass was
+permanent on reopen. The SAME underlying class of bug `cubeContainsNaturalSurface` already had to
+be fixed for (55537) -- single-point sampling missing a real footprint's own span across more than
+one unit of granularity -- now applies to the PENDING check itself, which still samples only the
+center.
+
+**Not attempted this pass**, per John's own explicit instruction not to divert from 55535. His
+own suggested direction for whenever this is picked up: "count actual data cells intersecting the
+relevant footprint as demand, not the entire speculative halo" -- i.e., identify the actual SET of
+distinct cells a cube's real column footprint intersects (not a broad speculative neighborhood) and
+check pending-ness across exactly that set, the same kind of full-footprint scan
+`cubeContainsNaturalSurface` already does for Y-relevance, applied to cell-pending-ness instead of
+natural height.
 
 ## Compile/test-time-only dependency, not a fork
 

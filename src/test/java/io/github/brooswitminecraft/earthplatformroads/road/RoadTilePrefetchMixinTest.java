@@ -1227,4 +1227,51 @@ class RoadTilePrefetchMixinTest {
         assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface - 50, cubeZContaining),
                 "Expected a cube far BELOW the natural ground height to NOT be reported as containing it");
     }
+
+    /**
+     * MINECRAFT-566 comment 55535: {@code RoadPrefetch.sustainedOutage}/{@code
+     * timeUntilNextEligibleRequest} must delegate to the real configured source, and return sane
+     * defaults (never true / always zero) with no live source at all -- the signals
+     * {@code ServerCubeWorldRoadPrefetchMixin}'s dynamic defer budget relies on.
+     */
+    @Test
+    void sustainedOutageAndTimeUntilNextEligibleRequestDelegateCorrectly(@TempDir Path roadCache) throws Exception {
+        RoadNetwork.setTileSourceForTests(null);
+        assertTrue(!RoadPrefetch.sustainedOutage(), "Expected no sustained outage reported when there is no live source at all");
+        assertEquals(Duration.ZERO, RoadPrefetch.timeUntilNextEligibleRequest(),
+                "Expected zero remaining cooldown reported when there is no live source at all");
+
+        java.nio.file.Files.createDirectories(roadCache);
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            exchange.sendResponseHeaders(500, -1); // every real dispatch genuinely fails
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5), null, Duration.ofMillis(200));
+            RoadNetwork.setTileSourceForTests(tileSource);
+            assertTrue(!RoadPrefetch.sustainedOutage(), "Expected no outage reported before any real failure has happened");
+            assertEquals(Duration.ZERO, RoadPrefetch.timeUntilNextEligibleRequest(),
+                    "Expected zero remaining cooldown before any request has ever been dispatched");
+
+            // Three real, genuinely dispatched failures in a row (each past the 200ms cooldown so
+            // none is merely DISPATCH_SUPPRESSED) is exactly SUSTAINED_OUTAGE_FAILURE_THRESHOLD.
+            tileSource.waysForCell(53.0, -4.0);
+            Thread.sleep(200);
+            tileSource.waysForCell(53.1, -4.1);
+            Thread.sleep(200);
+            tileSource.waysForCell(53.2, -4.2);
+            assertEquals(3, requests.get(), "Expected three real dispatched requests against this always-failing stub");
+            assertTrue(RoadPrefetch.sustainedOutage(), "Expected RoadPrefetch to delegate and report the real sustained outage");
+
+            Duration remaining = RoadPrefetch.timeUntilNextEligibleRequest();
+            assertTrue(!remaining.isNegative(), "Expected a non-negative remaining cooldown after a real dispatch. Got " + remaining);
+        } finally {
+            stub.stop(0);
+        }
+    }
 }

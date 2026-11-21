@@ -261,6 +261,34 @@ class RoadTileSourceTest {
     }
 
     /**
+     * MINECRAFT-566 comment 55535: {@code ServerCubeWorldRoadPrefetchMixin}'s pending-surface-cube
+     * defer needs the REAL remaining cooldown, not a guess, to size its own dynamic wait budget
+     * against the provider's actual steady cadence -- a fixed constant was found too short against
+     * an entirely ordinary cooldown, permanently saving grass for a cell a later fetch immediately
+     * proved would have resolved correctly.
+     */
+    @Test
+    void timeUntilNextEligibleRequestReflectsTheRealRemainingCooldown(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, EMPTY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(300));
+
+        assertEquals(Duration.ZERO, source.timeUntilNextEligibleRequest(),
+                "Expected no cooldown at all before any request has ever been dispatched");
+
+        source.waysForCell(52.0, -3.0); // starts the 300ms steady-cadence cooldown
+        assertEquals(1, requests.get());
+
+        Duration remaining = source.timeUntilNextEligibleRequest();
+        assertTrue(!remaining.isZero() && !remaining.isNegative() && remaining.compareTo(Duration.ofMillis(300)) <= 0,
+                "Expected a positive remaining cooldown of at most 300ms right after dispatching. Got " + remaining);
+
+        Thread.sleep(300);
+        assertEquals(Duration.ZERO, source.timeUntilNextEligibleRequest(),
+                "Expected zero remaining cooldown once the real interval has genuinely elapsed");
+    }
+
+    /**
      * MINECRAFT-566 comment 55450's core regression: a disk-cached tile must complete promptly even
      * while a DIFFERENT cell is rate-limited/backed off, using a fresh source instance (a real
      * restart) over a cache root seeded with one already-ready tile. Requires: the disk hit returns

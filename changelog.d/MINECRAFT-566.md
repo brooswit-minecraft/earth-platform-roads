@@ -300,6 +300,20 @@ bump: minor
   path never pays for the scan at all. The test rewritten to an entirely cold boot (no fixture, no
   cache file, tile genuinely PENDING throughout) proving the gate works with nothing but natural
   terrain.
+- Fixed the fixed-duration defer budget itself (comment 55535, John's own next priority once the
+  above were confirmed closed): under the provider's own DEFAULT steady request cadence (longer than
+  the then-fixed window), an immediate demand's defer/retry gave up before the real cooldown had
+  cleared, generated grass, and -- since an already-saved cube never reaches this injection again --
+  that grass was PERMANENT. A later explicit fetch confirmed the data and fetch path were fine; only
+  the fixed budget was wrong, structurally -- it could not be both short (fail a genuine outage open
+  quickly) and long enough to survive an ordinary cooldown. Fixed by computing the budget
+  DYNAMICALLY each call from the new `RoadTileSource.timeUntilNextEligibleRequest()` (the real
+  remaining cooldown) plus a fixed round-trip margin, clamped to a hard `MAX_DEFER_WAIT` ceiling --
+  except during `sustainedOutage()` (several real, dispatched failures in a row), which clamps to
+  the short `PREFETCH_WAIT_BOUND` instead, since waiting longer cannot help a provider that is
+  already known to be down. 91/91 tests pass (two new cases: one proving the real cooldown tracking,
+  one proving `RoadPrefetch`'s delegation and defaults, including a real driven `sustainedOutage()`
+  state).
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
@@ -312,6 +326,17 @@ bump: minor
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
   transient gap.
+- `RoadPrefetch.isPendingForColumn` (and therefore the defer snapshot) still samples only the single
+  cell the cube's CENTER column maps to (comment 55542, explicitly deferred per John's own
+  instruction not to divert from 55535): a real cube whose own footprint spans TWO different map
+  cells can have its center cell already confirmed-empty while a different cell covering only an
+  outer strip of the same cube is still genuinely pending -- natively reproduced (center cell
+  empty, outer-strip cell held in flight; worker adopted grass; a fresh generator later painted the
+  stripe correctly once the outer cell resolved; original grass was permanent on reopen). Same
+  underlying class of bug as 55537 (single-point sampling missing a real footprint's own span),
+  applied to cell-pending-ness rather than Y-relevance. Not attempted this pass. John's own
+  suggested direction when picked up: "count actual data cells intersecting the relevant footprint
+  as demand, not the entire speculative halo."
 - Chunky pre-generation's own direct `generate()` path (separate from the travel/teleport and
   ordinary-movement paths, both now covered) has no dedicated readiness handling yet.
 - No test drives the real, compiled `ServerCubeWorld.produce`/`loadNow` methods themselves -- doing

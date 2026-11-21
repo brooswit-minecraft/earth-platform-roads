@@ -131,6 +131,22 @@ public final class RoadTileSource {
     }
 
     /**
+     * MINECRAFT-566 comment 55535: how long until this instance's own {@link #nextEligibleRequestAt}
+     * cooldown actually clears -- {@link Duration#ZERO} if it already has. {@code
+     * ServerCubeWorldRoadPrefetchMixin}'s pending-surface-cube defer needs this to size its own wait
+     * against the REAL remaining cadence rather than guessing with a fixed constant (John's native
+     * finding: a fixed, too-short window gave up before an entirely ordinary steady-cadence cooldown
+     * had actually cleared, generating -- and then permanently saving -- grass for a cell that a
+     * later, explicit fetch immediately proved would have resolved correctly). This is instance-wide
+     * (the one real outbound request at a time this whole source enforces), not per-cell -- matching
+     * {@link #nextEligibleRequestAt}'s own scope.
+     */
+    public Duration timeUntilNextEligibleRequest() {
+        Duration remaining = Duration.between(clock.instant(), nextEligibleRequestAt);
+        return remaining.isNegative() ? Duration.ZERO : remaining;
+    }
+
+    /**
      * MINECRAFT-566 comment 55534: whether this instance can EVER actually reach the network --
      * distinct from merely existing. A cache-only instance ({@code allowNetwork=false}, e.g. the
      * "not opted into the preview provider" default) is a perfectly real, non-null

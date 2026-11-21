@@ -108,6 +108,29 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55535: {@code RoadTileSource.sustainedOutage()}, exposed for the same
+     * reason {@link #hasLiveTileSource} is -- {@code ServerCubeWorldRoadPrefetchMixin}'s defer needs
+     * this as its "stop waiting, this is a real outage, not just an ordinary cooldown" signal. Never
+     * {@code true} when there is no live tile source at all (nothing has ever genuinely attempted a
+     * fetch, let alone failed one).
+     */
+    public static boolean sustainedOutage() {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        return tiles != null && tiles.sustainedOutage();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55535: {@code RoadTileSource.timeUntilNextEligibleRequest()}, exposed so
+     * the defer can size its own wait against the REAL remaining steady-cadence cooldown instead of
+     * guessing with a fixed constant -- see that method's own doc for the native finding that drove
+     * this. {@link Duration#ZERO} when there is no live tile source at all (nothing to wait for).
+     */
+    public static Duration timeUntilNextEligibleRequest() {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        return tiles == null ? Duration.ZERO : tiles.timeUntilNextEligibleRequest();
+    }
+
+    /**
      * MINECRAFT-566 comment 55534, a conservative padding below each sampled column's own natural
      * ground height, applied by {@link #cubeContainsNaturalSurface}: John's own native "upper-first"
      * fixture found a real road footprint column (off-center, e.g. the shoulder) whose OWN natural
