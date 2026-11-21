@@ -3,6 +3,7 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 import io.earthplatform.geography.globe.MercatorGrid;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.gen.SurfaceGenerator;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -24,12 +25,24 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
  * correctly drops any stray block-entity tag for a position this clears to air, rather than this
  * class needing to duplicate that bookkeeping itself.
  *
- * <p>Leaf detection uses {@code state.getBlock() instanceof LeavesBlock} rather than
- * {@code BlockTags.LEAVES}: the plain Java type check needs no datapack/tag registry to be bound
- * (confirmed live -- the tag read back empty in this mod's own {@code neoForge.unitTest} harness,
- * which does not run a real server's datapack reload) and still catches every vanilla leaf variant,
- * since {@code CherryLeavesBlock}/{@code MangroveLeavesBlock} both extend {@code LeavesBlock}
- * (confirmed by reading the real classes).
+ * <p>Leaf detection checks BOTH {@code BlockTags.LEAVES} and {@code instanceof LeavesBlock} (either
+ * one counts): the tag alone read back empty in this mod's own {@code neoForge.unitTest} harness
+ * (no real server datapack reload happens there), so {@code instanceof} is needed as a fallback for
+ * that environment -- but the tag is still checked FIRST and is the one that correctly covers a
+ * modded leaf block that only carries the tag without extending vanilla {@code LeavesBlock} (a real
+ * gap the {@code instanceof}-only version shipped in commit 3ce7eb1 had, per John's review comment
+ * 55510). {@code hasProperty(LeavesBlock.PERSISTENT)} already guards the one place this reads/writes
+ * that specific vanilla property, so a tag-matched block without it is simply left as-is rather than
+ * erroring.
+ *
+ * <p><b>Known limitation (comment 55510):</b> this classifies purely on {@link RoadNetwork}'s own
+ * mapped geometry -- it does not check whether {@code EarthGeneratorRoadMixin} actually painted the
+ * expected road material at this column (that would need re-deriving it the way
+ * {@link RoadPrefetch#sectionLooksStale} does, which is currently disabled -- see that class's own
+ * doc). On the rare column where the per-column surface cache is stale (the still-unresolved
+ * residual race from comments 55496/55498/55505/55507), this can clear a column's canopy even though
+ * the surface under it never actually got painted as road. This is a real, disclosed gap, not a fix
+ * for that race -- do not read a clean canopy as proof the road surface underneath is correct.
  */
 public final class RoadCanopyClearance {
     private RoadCanopyClearance() {}
@@ -62,7 +75,7 @@ public final class RoadCanopyClearance {
                 for (int localY = firstLocalY; localY <= 15; localY++) {
                     BlockState state = section.getBlockState(lx, localY, lz);
                     if (state.isAir()) continue;
-                    if (state.getBlock() instanceof LeavesBlock) {
+                    if (state.is(BlockTags.LEAVES) || state.getBlock() instanceof LeavesBlock) {
                         // Keep the canopy, but make sure removing its own log(s) elsewhere in this
                         // same pass never lets it decay naturally afterward -- "leaves meant to be
                         // kept do not simply decay because their logs were intentionally removed."

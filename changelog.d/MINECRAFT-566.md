@@ -190,12 +190,26 @@ bump: minor
   removed supporting log never lets them decay) and never touching the gravel shoulder, anything
   below the deck, underwater columns, or a column off the mapped footprint. Scoped per-cube, same
   pattern as the rest of this mod's generation-time hooks -- never a separate full-column edit pass.
-  Leaf detection uses `state.getBlock() instanceof LeavesBlock`, not `BlockTags.LEAVES`: the tag
-  read back empty in this project's own `neoForge.unitTest` harness (no real server datapack
-  reload there), and the plain type check also catches `CherryLeavesBlock`/`MangroveLeavesBlock`
-  (both confirmed to extend `LeavesBlock`) for free.
+  Leaf detection checks `BlockTags.LEAVES` OR `instanceof LeavesBlock`: the tag alone read back
+  empty in this project's own `neoForge.unitTest` harness (no real server datapack reload there),
+  so `instanceof` covers that environment, but the tag is checked first and is what correctly
+  covers a modded leaf block that only carries the tag without extending vanilla `LeavesBlock` --
+  a real gap the `instanceof`-only version shipped in commit 3ce7eb1 had, per John's independent
+  compiled-build review (comment 55510); fixed in the very next commit.
+- John's comment 55510 also independently confirmed 3ce7eb1's canopy clearance on a real compiled
+  build: clears log/stone above paved/stripe across both horizontal and vertical cube seams,
+  preserves vanilla leaves through actual random ticks, correctly reopens once a removed log's
+  decay control disappears, and leaves off-road/shoulder/support columns and an existing
+  player-edited log untouched.
 
 ### Known gaps
+- Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
+  does not verify the road material was actually painted under a column (that would mean
+  re-deriving it the way the currently-disabled `RoadPrefetch.sectionLooksStale` does). On the rare
+  column hit by the still-unresolved residual per-column surface-cache race (55496/55498/55505/
+  55507), this can clear a column's canopy even though the surface under it never got painted as
+  road. Per John's comment 55510: a clean canopy is not proof the road surface underneath is
+  correct, and this does not fix that race.
 - The neighborhood read-side check only extends as far as some cell that has actually been
   fetched, anywhere nearby -- a column two or more cells away from every such cell can still see a
   transient gap.

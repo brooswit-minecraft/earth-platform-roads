@@ -755,11 +755,15 @@ underwater by the same `surfaceY`/`waterY` check `EarthGeneratorRoadMixin` and `
 already use), every non-air block strictly above that column's own natural ground height, up to
 this cube's own top, is cleared to air -- except leaves, which are preserved but made
 `LeavesBlock.PERSISTENT` (so removing a supporting log in the same pass never leaves them to decay
-naturally afterward). Leaf detection uses `state.getBlock() instanceof LeavesBlock`, not
-`BlockTags.LEAVES`: the tag read back empty in this project's own `neoForge.unitTest` harness (no
-real server datapack reload happens there), and the plain type check also catches
-`CherryLeavesBlock`/`MangroveLeavesBlock` for free (both confirmed, by reading the real classes, to
-extend `LeavesBlock`).
+naturally afterward). Leaf detection checks `state.is(BlockTags.LEAVES)` OR `instanceof LeavesBlock`
+(either counts): `instanceof` alone was the first version shipped (`3ce7eb1`) specifically because
+the tag read back empty in this project's own `neoForge.unitTest` harness (no real server datapack
+reload happens there); John's comment 55510, after independently compiling and testing that exact
+build on a real server, pointed out a real gap in that `instanceof`-only version -- a modded leaf
+block that carries `BlockTags.LEAVES` without extending vanilla `LeavesBlock` would not be
+recognized as a leaf and would get cleared instead of preserved. Checking the tag FIRST (falling
+back to `instanceof` only for this harness's own tag-binding limitation) fixes that while keeping
+the test suite green.
 
 **Verified** by `RoadGenerationTest.canopyClearanceRemovesNonLeafBlocksOverTheRoadButPreservesLeavesAsPersistent`:
 against the same real, non-private Yosemite fixture the rest of this ticket's generation tests use,
@@ -768,8 +772,23 @@ are cleared/preserved-and-made-persistent respectively, while the identical plac
 off-road are left completely untouched. **Known, disclosed test gap:** this calls
 `RoadCanopyClearance.clear` directly, not through the mixin's own `@Redirect` -- exercising the
 mixin's wiring end to end would need a real tree/structure actually landing a block over this exact
-pinned column during a real `generate()` call, which is not reproducible from this harness; no
-in-game visual confirmation has been done either.
+pinned column during a real `generate()` call, which is not reproducible from this harness.
+
+**Independently confirmed on a real compiled build** (John, comment 55510): `3ce7eb1`'s canopy
+clearance correctly clears a log/stone block above a paved/striped column across both horizontal
+and vertical cube seams, preserves real vanilla leaves through actual random ticks (persistence
+holds, and reopens correctly once a removed log's own decay control disappears), and leaves
+off-road/shoulder/support columns and an existing player-edited log completely untouched. A real
+worker's healthy-fetch regression also still correctly placed the centerline stripe.
+
+**Disclosed limitation, per the same comment:** `RoadCanopyClearance` classifies a column purely by
+`RoadNetwork`'s own mapped geometry -- it never checks whether `EarthGeneratorRoadMixin` actually
+painted the expected road material there (that would mean re-deriving it the way the currently
+-disabled `RoadPrefetch.sectionLooksStale` does; see that class's own doc). On the rare column hit
+by the still-unresolved residual per-column surface-cache race (55496/55498/55505/55507), this can
+clear a column's canopy even though the road surface underneath never actually got painted. This is
+a disclosed gap, not a fix for that race -- a clean canopy over a column is not evidence the road
+material underneath is correct.
 
 ## Compile/test-time-only dependency, not a fork
 
