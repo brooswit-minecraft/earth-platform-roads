@@ -658,6 +658,47 @@ class RoadTileSourceTest {
     }
 
     /**
+     * MINECRAFT-566 comment 55547, a real liveness gap found in using
+     * {@code waysForCellWithBoundedWait(lat, lon, Duration.ZERO)} as a fire-and-forget dispatch: a
+     * zero bound also becomes the retry loop's own internal deadline, so a cooldown-suppressed
+     * dispatch gives up (and unregisters from the in-flight map) on the very first decline instead
+     * of staying registered as current demand through the cooldown. {@code dispatchCellFetch} fixes
+     * this by keeping a generous internal retry budget while never having the CALLER wait at all.
+     */
+    @Test
+    void dispatchCellFetchStaysRegisteredAndActuallyResolvesAcrossASteadyCooldown(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(100));
+
+        source.waysForCell(82.0, 82.0); // starts the 100ms steady-cadence cooldown
+        assertEquals(1, requests.get());
+
+        // A different, still-pending cell: dispatchCellFetch must return immediately (never block
+        // this thread at all, unlike waysForCellWithBoundedWait even with a zero bound, which still
+        // calls future.get()), yet the cell must still actually resolve once the cooldown clears --
+        // proving the dispatch stayed registered as live demand rather than giving up immediately.
+        long start = System.nanoTime();
+        source.dispatchCellFetch(83.0, 83.0);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        assertTrue(elapsedMillis < 50, "Expected dispatchCellFetch to return near-instantly, not wait at all -- took " + elapsedMillis + "ms");
+
+        List<RoadSegment> resolved = List.of();
+        for (int i = 0; i < 40 && resolved.isEmpty(); i++) {
+            resolved = source.cachedWaysForCellOrEmpty(83.0, 83.0);
+            if (resolved.isEmpty()) {
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        assertEquals(1, resolved.size(), "Expected the fire-and-forget dispatch to actually resolve this cell once the cooldown cleared, not give up on the first decline");
+    }
+
+    /**
      * MINECRAFT-566 comment 55528, a real bug John's own independent loopback reproduction found: a
      * genuinely ATTEMPTED failure (a request that was actually sent and failed, e.g. an HTTP 500)
      * advances {@code nextEligibleRequestAt} by the steady cadence exactly like a success does, so

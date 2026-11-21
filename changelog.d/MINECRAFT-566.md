@@ -330,8 +330,32 @@ bump: minor
   since an arrival needs a `Cube` back synchronously with no "retry next tick" option available to
   it. 90/90 tests pass (two obsolete tests for the removed cadence-budget methods replaced by one new
   test proving the two new `RoadPrefetch` methods against a real, entirely-cold synthetic fixture).
+- Fixed a real liveness gap in that dispatch itself (comment 55547, found in John's own source
+  review of `61341d4` -- the new seam itself was confirmed correct): calling
+  `waysForCellWithBoundedWait(lat, lon, Duration.ZERO)` as "fire-and-forget" doesn't just skip the
+  caller's own wait -- that same zero bound also becomes the retry loop's own internal deadline, so
+  a cooldown-suppressed dispatch gave up (and dropped its own in-flight registration) on the very
+  first decline, reintroducing the pre-55528 bug for this one call site. Because `ServerCubeWorld`
+  only remembers the CUBE key, not this tile's own dispatch priority, a merely speculative
+  lookahead cell could then take the next legal request slot ahead of a genuinely still-wanted one
+  -- repeated lookahead starving real demand even against a healthy backend. Fixed with a genuinely
+  fire-and-forget `RoadTileSource.dispatchCellFetch`: the caller never calls `future.get(...)` at
+  all, and the retry loop's own internal deadline is a separate, generous, fixed 30s budget,
+  decoupled from any caller-side wait. Also deduplicates by actual map cell before dispatching
+  (collects distinct cells across the cube's 256-column scan first) rather than redundantly
+  dispatching the same cell up to 256 times. 91/91 tests pass (one new case proving the dispatch
+  returns near-instantly yet the cell still actually resolves once a real cooldown clears).
 
 ### Known gaps
+- Per comment 55547: `loadNow`'s own explicit policy (SynchronousLoadGuard excludes it from the
+  pending-defer mechanism entirely) means the SAME column can still legitimately show unsaved,
+  provisional grass via a forced arrival WHILE the ordinary-streaming path's own retry for that
+  exact cube is still outstanding -- not only the originally-disclosed teleport-into-new-coordinates
+  case, but also an arrival landing on a column the player is already walking toward. This is the
+  same deliberate, explicit policy choice (an arrival needs a `Cube` back synchronously, with no
+  "retry next tick" option), not a new behavior -- kept as-is per John's own framing ("keep this
+  exception explicit; no blanket null or server-thread HTTP"), not attempted to be narrowed further
+  this pass.
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
   does not verify the road material was actually painted under a column (that would mean
   re-deriving it the way the currently-disabled `RoadPrefetch.sectionLooksStale` does). On the rare

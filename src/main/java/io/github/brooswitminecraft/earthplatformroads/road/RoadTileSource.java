@@ -350,6 +350,61 @@ public final class RoadTileSource {
     }
 
     /**
+     * MINECRAFT-566 comment 55547: a real liveness gap in using
+     * {@link #waysForCellWithBoundedWait} with {@link Duration#ZERO} as a "fire-and-forget" dispatch
+     * ({@code ServerCubeWorldRoadPrefetchMixin}'s own earlier approach, comment 55545). Passing
+     * {@code Duration.ZERO} as {@code bound} does not just skip the CALLER's own wait -- it also
+     * becomes {@link #waysForCellRetryingAcrossCooldown}'s own internal {@code deadline}, so a
+     * cooldown-suppressed dispatch gives up (and unregisters from {@link #inFlightByCell}) on the
+     * very first decline, exactly the pre-55528 bug, reintroduced by this one call site's own choice
+     * of bound. Once unregistered, this cell's own "current, high-priority demand" registration is
+     * gone entirely: {@code ServerCubeWorld} itself only retains the CUBE key (via its own
+     * {@code retryAt}), never this tile's own dispatch priority, so a DIFFERENT, merely speculative
+     * lookahead cell can take the next legal request slot ahead of this genuinely still-wanted one --
+     * natively observed: repeated lookahead starving a real demand even against a healthy backend.
+     *
+     * <p>Fixed with a genuine fire-and-forget dispatch: the SAME coalesced, {@code PRIORITY_IMMEDIATE}
+     * dispatch and retry-across-cooldown loop {@link #waysForCellWithBoundedWait} uses, but the
+     * CALLER never calls {@code future.get(...)} at all (so it truly never waits, unlike passing a
+     * zero bound into that method), and the retry loop's own internal {@code deadline} is a generous,
+     * fixed {@link #FIRE_AND_FORGET_RETRY_BUDGET} -- long enough to survive an entirely ordinary
+     * cooldown without ever prematurely giving up and dropping this cell's own registration, since
+     * nothing here blocks on it either way (this background thread occupying itself for that long is
+     * the SAME disclosed, pre-existing "one shared thread held during a cooldown sleep" limitation
+     * {@link #waysForCellRetryingAcrossCooldown}'s own doc already names, not a new one).
+     */
+    private static final Duration FIRE_AND_FORGET_RETRY_BUDGET = Duration.ofSeconds(30);
+
+    /**
+     * MINECRAFT-566 comment 55547: the fire-and-forget dispatch counterpart to
+     * {@link #waysForCellWithBoundedWait} -- see {@link #FIRE_AND_FORGET_RETRY_BUDGET}'s own doc for
+     * why a zero-bound call to that method was not actually fire-and-forget in the one way that
+     * mattered (it dropped this cell's own in-flight registration on the first cooldown decline).
+     * This method returns nothing and never blocks the caller at all; the real result (if any) is
+     * picked up later by whichever ordinary caller next asks this cell's own cache state.
+     */
+    public void dispatchCellFetch(double lat, double lon) {
+        if (!cachedWaysForCellOrEmpty(lat, lon).isEmpty() || cellState(lat, lon) != CellState.PENDING) return;
+        long key = cellKeyOf(lat, lon);
+        if (!inFlightByCell.containsKey(key) && inFlightByCell.size() >= MAX_IN_FLIGHT_TILES) {
+            return; // at capacity: drop this speculative dispatch rather than admit yet another distinct in-flight cell
+        }
+        Instant deadline = clock.instant().plus(FIRE_AND_FORGET_RETRY_BUDGET);
+        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k -> {
+            CompletableFuture<List<RoadSegment>> submitted = new CompletableFuture<>();
+            ASYNC_FETCH_EXECUTOR.execute(new PriorityTask(PRIORITY_IMMEDIATE, () -> {
+                try {
+                    submitted.complete(waysForCellRetryingAcrossCooldown(lat, lon, deadline));
+                } catch (Throwable t) {
+                    submitted.completeExceptionally(t);
+                }
+            }));
+            return submitted;
+        });
+        future.whenComplete((result, error) -> inFlightByCell.remove(key, future));
+    }
+
+    /**
      * MINECRAFT-566 comment 55522's other half: "keep eligible immediate demand pending across
      * cooldown" rather than {@link #waysForCell}'s own single attempt, which gives up the instant
      * {@link #attemptFetch} is dispatch-suppressed by {@link #nextEligibleRequestAt} -- even though

@@ -1238,6 +1238,58 @@ actually behaves as the decompiled source describes end to end on a real, runnin
 same disclosed harness gap as every other fix in this class; John's own native infrastructure is
 what will confirm that.
 
+## MINECRAFT-566: a liveness gap in the "fire-and-forget" dispatch itself (comment 55547)
+
+John's source review of `61341d4` confirmed the mixin now hooks the right pre-generation seam, with
+native delayed/cooldown, outage/recovery, and confirmed-empty controls underway -- but flagged one
+remaining gap in parallel: `dispatchRelevantCellFetches` called
+`RoadTileSource.waysForCellWithBoundedWait(lat, lon, Duration.ZERO)` per column, expecting
+`Duration.ZERO` to mean "dispatch and never wait." It does not mean only that.
+
+**Root cause:** `waysForCellWithBoundedWait`'s own `bound` parameter does double duty -- it is both
+the CALLER's own wait timeout (`future.get(bound, ...)`) AND, passed straight through, the
+dispatched task's own internal `waysForCellRetryingAcrossCooldown` retry DEADLINE. With
+`bound = Duration.ZERO`, that internal deadline is also "now" -- so the very first time the retry
+loop finds this cell cooldown-suppressed, its own `wakeAt` (clamped to that zero-width deadline)
+is never after "now," and it gives up and completes immediately, same as a genuine, permanent
+failure would. Completing removes the task from `inFlightByCell` -- this cell's own "current,
+high-priority demand" registration is gone entirely. `ServerCubeWorld` itself only remembers the
+CUBE key (via its own `retryAt`), never this specific tile fetch's own dispatch priority, so once
+that registration is dropped, a DIFFERENT, merely speculative lookahead cell can take the very next
+legal request slot ahead of this genuinely still-wanted one. John's own native description: a
+speculative request C can win the next eligible slot before a still-wanted B's own 100-tick retry
+even gets a chance, and repeated lookahead can starve a real demand even against a fully healthy
+backend -- effectively reintroducing the pre-55528 "gives up on the first decline" bug, specific to
+this one call site's own choice of bound.
+
+**Fix:** a genuinely fire-and-forget dispatch, `RoadTileSource.dispatchCellFetch(lat, lon)` --
+reuses the exact same coalesced, `PRIORITY_IMMEDIATE` dispatch `waysForCellWithBoundedWait` uses,
+but the CALLER never calls `future.get(...)` at all (truly never waits, not even for a moment),
+and the retry loop's own internal deadline is a separate, generous, fixed
+`FIRE_AND_FORGET_RETRY_BUDGET` (30s) completely decoupled from any caller-side wait -- long enough
+to survive an entirely ordinary cooldown without prematurely dropping this cell's own registration.
+This background thread occupying itself for up to that long is the SAME disclosed, pre-existing
+"one shared thread held during a cooldown sleep" limitation already named in this file (not a new
+regression) -- it costs nothing a caller can observe, since nothing calls `.get()` on it.
+
+Also addressed, per John's own explicit asks: `RoadPrefetch.dispatchRelevantCellFetches` now
+deduplicates by actual map cell BEFORE dispatching (collects distinct cell keys across the cube's
+own 256-column scan, dispatches once per distinct cell) rather than redundantly
+checking/re-dispatching the same cell up to 256 times -- "deduplicate relevant footprint tile keys
+before dispatch." "Drain current before speculation" and "cap queue/sleep resources" both continue
+to hold via EXISTING, unmodified machinery once the registration-dropping bug above is fixed: the
+priority queue (`PRIORITY_IMMEDIATE` before `PRIORITY_LOOKAHEAD`) already drains current demand
+first as long as it stays registered, and `MAX_IN_FLIGHT_TILES`/`MAX_COOLDOWN_RETRIES` already cap
+resources -- neither needed new code, just no longer being undermined by the early-exit bug.
+
+Verified: a new `RoadTileSourceTest` case proves `dispatchCellFetch` returns near-instantly (never
+blocks the caller) yet the SAME cell still actually resolves once a real steady-cadence cooldown
+clears -- directly exercising the exact property that was broken. 91/91 tests pass. Not
+independently reproduced here: the specific multi-cell lookahead-starves-current-demand race
+John's own native control describes (A active, B queued, C challenging at the first eligible slot)
+-- the same disclosed harness gap as the rest of this class; his own native infrastructure is what
+found this and will confirm the fix.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

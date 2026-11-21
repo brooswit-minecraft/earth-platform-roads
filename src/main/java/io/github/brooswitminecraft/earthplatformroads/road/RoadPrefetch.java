@@ -204,27 +204,41 @@ public final class RoadPrefetch {
      * MINECRAFT-566 comment 55545: the dispatch counterpart to {@link #isAnyRelevantCellPending} --
      * fires off (never waits on) a fetch for every actual cell this cube's own relevant footprint
      * intersects, exactly the same set {@link #isAnyRelevantCellPending} checks, not a broader
-     * speculative neighborhood. {@link RoadTileSource#waysForCellWithBoundedWait} with
-     * {@link Duration#ZERO} dispatches (coalesced, never a duplicate real request for an
-     * already-in-flight cell) and returns immediately without waiting -- the caller never blocks on
-     * this at all, matching "keep wanted unresolved cubes deferred/retryable without tying up...
-     * worker threads." Redundant calls for columns mapping to the same cell (the ordinary case: one
-     * cell is almost always far larger than one cube) are cheap no-ops once dispatched, so no extra
-     * per-cell deduplication is attempted here.
+     * speculative neighborhood.
+     *
+     * <p><b>Comment 55547, a real liveness gap in the first version:</b> that version called
+     * {@code RoadTileSource.waysForCellWithBoundedWait} with {@link Duration#ZERO} per column,
+     * un-deduplicated. {@code Duration.ZERO} turned out not to be genuinely fire-and-forget --
+     * see {@code RoadTileSource.dispatchCellFetch}'s own doc for why that specific bound dropped
+     * this cell's own current-demand registration on the very first cooldown decline, letting a
+     * merely speculative lookahead cell take the next legal request slot ahead of it (natively
+     * observed starving a real demand even against a healthy backend). Fixed by switching to the
+     * new {@link RoadTileSource#dispatchCellFetch}, a genuinely fire-and-forget dispatch that stays
+     * registered as current, high-priority demand through an entire ordinary cooldown. Also
+     * deduplicates by actual cell before dispatching (the ordinary case: one real map cell is far
+     * larger than one cube, so most of this cube's own 256 columns map to the very same one or two
+     * cells) -- "deduplicate relevant footprint tile keys before dispatch," per John's own
+     * instruction, rather than redundantly re-checking/re-dispatching the same cell up to 256 times.
      */
     public static void dispatchRelevantCellFetches(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
         RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
         if (tiles == null) return;
         MercatorGrid grid = generator.grid();
         int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        java.util.Set<Long> dispatchedCells = new java.util.HashSet<>();
         for (int lx = 0; lx < 16; lx++) {
             for (int lz = 0; lz < 16; lz++) {
                 int worldX = baseX + lx, worldZ = baseZ + lz;
                 int localY = generator.surfaceY(worldX, worldZ) - baseY;
                 if (localY + BASE_PAVING_PADDING_BLOCKS < 0 || localY > 15) continue;
                 GeoPoint point = grid.geographic(worldX, worldZ);
-                tiles.waysForCellWithBoundedWait(point.latitude(), point.longitude(), Duration.ZERO);
-                tiles.enqueueLookaheadAsync(point.latitude(), point.longitude());
+                double lat = point.latitude(), lon = point.longitude();
+                long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+                long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+                long cellKey = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+                if (!dispatchedCells.add(cellKey)) continue; // already dispatched for this exact cell from an earlier column in this same cube
+                tiles.dispatchCellFetch(lat, lon);
+                tiles.enqueueLookaheadAsync(lat, lon);
             }
         }
     }
