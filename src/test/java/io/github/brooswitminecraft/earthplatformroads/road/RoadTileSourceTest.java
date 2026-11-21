@@ -567,4 +567,93 @@ class RoadTileSourceTest {
         assertTrue(source.inFlightCellCountForTests() <= 16,
                 "Expected the number of simultaneously in-flight distinct cells to stay meaningfully capped, got " + source.inFlightCellCountForTests());
     }
+
+    /**
+     * MINECRAFT-566 comment 55522: an immediate (current-cell) request must be picked ahead of a
+     * speculative lookahead request still WAITING in the async executor's own queue, even though
+     * the lookahead was submitted FIRST -- the real bug: "a speculative tile held its own slot while
+     * a distinct current-cell request was already queued... and sent no POST" because a plain FIFO
+     * queue let the earlier-queued lookahead job occupy the executor's one thread first. An
+     * "occupier" request holds that thread busy inside a slow HTTP call; a lookahead and then an
+     * immediate request are queued (in that order) while it is busy; once the occupier finishes,
+     * the immediate request's own HTTP request must land before the lookahead's, despite being
+     * queued second.
+     */
+    @Test
+    void immediateRequestsArePrioritizedOverQueuedLookaheadRequests(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        List<String> requestOrder = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            requestOrder.add(body);
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            byte[] out = EMPTY_RESPONSE.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, out.length);
+            exchange.getResponseBody().write(out);
+            exchange.close();
+        });
+        stub.start();
+        this.server = stub;
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5));
+
+        // Occupier: holds the executor's one thread busy inside the slow HTTP call (lat 60.0, far
+        // from the other two cells below so none of their own bboxes can overlap by coincidence).
+        Thread occupier = new Thread(() -> source.waysForCellWithBoundedWait(60.0, 60.0, Duration.ofSeconds(10)));
+        occupier.start();
+        // Generous (ASYNC_FETCH_EXECUTOR is shared process-wide -- see its own class doc -- so this
+        // must also tolerate a stray slow task left over from a DIFFERENT test's own background
+        // fetch still occupying it when this one starts).
+        for (int i = 0; i < 200 && requestOrder.isEmpty(); i++) Thread.sleep(25);
+        assertEquals(1, requestOrder.size(), "Sanity: expected the occupier's own request to already be in flight before queuing more");
+
+        // Queue a lookahead (around 61.0,61.0), THEN an immediate request (at 62.0,62.0) -- in that
+        // order -- while the executor's one thread is still busy with the occupier.
+        source.enqueueLookaheadAsync(61.0, 61.0);
+        Thread immediate = new Thread(() -> source.waysForCellWithBoundedWait(62.0, 62.0, Duration.ofSeconds(10)));
+        immediate.start();
+
+        occupier.join();
+        immediate.join();
+        for (int i = 0; i < 200 && requestOrder.size() < 3; i++) Thread.sleep(50); // let the lower-priority lookahead's own request eventually land too
+
+        assertEquals(3, requestOrder.size(), "Expected all three requests (occupier, immediate, lookahead) to eventually land");
+        assertTrue(requestOrder.get(1).contains("62.0"),
+                "Expected the immediate request (queued SECOND, at 62.0) to be picked ahead of the lookahead request (queued FIRST, around 61.0) "
+                        + "once the executor's thread freed up, got second request: " + requestOrder.get(1));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55522's other half: "keep eligible immediate demand pending across
+     * cooldown" -- a bounded-wait call whose first attempt lands exactly during this instance's own
+     * steady {@code minRequestInterval} cooldown (from an unrelated, immediately preceding fetch)
+     * must retry once that cooldown passes, as long as its own {@code bound} has not yet elapsed,
+     * rather than giving up the instant the first attempt is declined. The real bug this fixes:
+     * "the queued job immediately dropped unfulfilled in the normal cooldown" when it could have
+     * waited the (short) remaining cooldown out and actually succeeded.
+     */
+    @Test
+    void boundedWaitRetriesAcrossASteadyCooldownRatherThanGivingUpOnTheFirstDecline(@TempDir Path cacheRoot) throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = startStub(requests, ONE_WAY_RESPONSE, 200);
+        RoadTileSource source = new RoadTileSource(endpointOf(stub), cacheRoot, true, Duration.ofSeconds(5), null, Duration.ofMillis(100));
+
+        source.waysForCell(80.0, 80.0); // first cell (a lat/lon unused by any other test in this class): eligible immediately, starts the 100ms cooldown
+        assertEquals(1, requests.get());
+
+        // A different, still-pending cell, requested right away (during the cooldown): the first
+        // internal attempt must be declined (not yet eligible), but the bound comfortably outlasts
+        // the 100ms cooldown (generous on purpose: ASYNC_FETCH_EXECUTOR is shared process-wide --
+        // see its own class doc -- so this must also tolerate a stray slow task left over from a
+        // DIFFERENT test's own background fetch still occupying it), so this must retry and
+        // actually succeed rather than coming back empty.
+        List<RoadSegment> result = List.of();
+        for (int i = 0; i < 10 && result.isEmpty(); i++) {
+            result = source.waysForCellWithBoundedWait(81.0, 81.0, Duration.ofSeconds(5));
+        }
+        assertEquals(1, result.size(), "Expected the bounded wait to retry across the short cooldown and actually succeed, not give up on the first decline");
+    }
 }

@@ -201,6 +201,17 @@ bump: minor
   preserves vanilla leaves through actual random ticks, correctly reopens once a removed log's
   decay control disappears, and leaves off-road/shoulder/support columns and an existing
   player-edited log untouched.
+- Fixed a real scheduling bug in the ordinary-movement prefetch path (comment 55522, reproduced via
+  a real loopback NeoForge/combined-73 fixture): a speculative lookahead fetch and the current
+  cell's own bounded-wait fetch both run through `RoadTileSource`'s single dedicated async thread;
+  a plain FIFO queue let a lookahead job queued moments earlier make an immediate job wait behind it
+  for a slot it did not need to, and the immediate job's own retry attempt during a steady cooldown
+  was a single shot rather than retried, giving up on the first decline even with plenty of its own
+  bound left. `ASYNC_FETCH_EXECUTOR` is now a priority queue (immediate ahead of lookahead, ties by
+  submission order) and `waysForCellWithBoundedWait`'s dispatched task retries across a short
+  cooldown (bounded, never a real attempted failure) instead of giving up immediately. Branch built
+  from the accepted canopy-only commit (`b7ff716`), excluding the separate, not-yet-ready flat-deck
+  prototype entirely, per John's own explicit instruction.
 
 ### Known gaps
 - Canopy clearance (`RoadCanopyClearance`) classifies purely on `RoadNetwork`'s mapped geometry; it
@@ -238,3 +249,15 @@ bump: minor
   `@Redirect` wiring end to end (that would need a real tree/structure actually landing a block over
   this exact pinned column during generation, not reproducible from this harness). Not yet
   confirmed in a live playtest either.
+- Per comment 55522: only the FETCH side (priority + cooldown retry) was fixed; the deeper
+  "bound deferral of only unsaved road-relevant surface cubes" half -- actually retrying a cube's
+  GENERATION once pending data resolves, not just improving how promptly the fetch itself resolves
+  -- was not attempted. That needs the same "verify output against fresh data, retry generation"
+  approach already found buggy once before (the currently-disabled `sectionLooksStale`/stale-retry
+  mechanism), real additional design work.
+- The forced-load (`loadNow`) exception from comment 55524 is unchanged, already documented
+  (`SynchronousLoadGuard`) and already tested (`SynchronousLoadGuardTest`) from earlier in this
+  ticket; John's own real-server confirmation that it holds (zero extra HTTP, a forced arrival can
+  still adopt pending/natural terrain the same way the ordinary-movement path can) is now
+  cross-referenced in `ServerCubeWorldRoadPrefetchMixin`'s own class doc rather than duplicating
+  that coverage. `loadNow`'s own synchronous contract is deliberately left unchanged.

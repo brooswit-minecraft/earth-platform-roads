@@ -54,6 +54,17 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * never touched by either injection, so this never adds HTTP (or anything else) to the server
  * thread.
  *
+ * <p><b>Confirmed on a real server (comments 55522/55524):</b> John independently verified this
+ * exact, already-documented and already-tested ({@code SynchronousLoadGuardTest}) exception against
+ * a real {@code loadNow} arrival -- it adopts whatever natural/pending terrain the generator already
+ * has (never blocking on a fetch), makes zero extra HTTP calls on that thread, and a forced arrival
+ * is therefore subject to the SAME premature-adopted-terrain risk comment 55522 found on the
+ * ordinary-movement path, via this different, deliberately-unfetched entry point. This is a
+ * disclosed, intentional design boundary, not a bug introduced by 55522's own fix below -- changing
+ * {@code loadNow}'s own synchronous contract (returning {@code null}, or blocking it) would risk
+ * every OTHER forced-load caller (portal ground selection among them), which is explicitly out of
+ * scope here; see {@code docs/design.md}'s own note on this known gap.
+ *
  * <p>The injection point inside {@code produce} is immediately BEFORE its call to
  * {@code CubeGenerator.generate(...)} -- after the storage-read fast path has already returned (a
  * saved/edited cube is read and returned above this point without ever reaching here, preserving

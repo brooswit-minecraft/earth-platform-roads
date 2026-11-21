@@ -20,10 +20,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Fetches mapped road data for a tile (the same {@value RoadNetwork#CELL_DEGREES}-degree grid cell
@@ -199,6 +201,45 @@ public final class RoadTileSource {
     }
 
     /**
+     * MINECRAFT-566 comment 55522: an immediate (current-cell, bounded-wait) request and a
+     * speculative lookahead request compete for this SAME single thread; a plain FIFO queue let a
+     * lookahead job that happened to be queued moments earlier make an immediate job wait behind it
+     * for a slot it did not need to wait for. {@code PRIORITY_IMMEDIATE} jobs are always picked
+     * ahead of any {@code PRIORITY_LOOKAHEAD} job still WAITING in the queue (ties broken by
+     * submission order) -- this cannot preempt a job already RUNNING (the provider's own
+     * {@link #networkLock} parallel-1 limit means a genuinely in-flight request must finish
+     * regardless of what arrives after it), but it does stop a newly-queued lookahead job from
+     * jumping ahead of an immediate job that is, or arrives, still waiting.
+     */
+    private static final int PRIORITY_IMMEDIATE = 0;
+    private static final int PRIORITY_LOOKAHEAD = 1;
+    private static final AtomicLong TASK_SEQUENCE = new AtomicLong();
+
+    /** A {@link #ASYNC_FETCH_EXECUTOR} work item ordered by {@link #PRIORITY_IMMEDIATE}/{@link #PRIORITY_LOOKAHEAD} first, submission order second. */
+    private static final class PriorityTask implements Runnable, Comparable<PriorityTask> {
+        private final int priority;
+        private final long sequence;
+        private final Runnable delegate;
+
+        PriorityTask(int priority, Runnable delegate) {
+            this.priority = priority;
+            this.sequence = TASK_SEQUENCE.getAndIncrement();
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void run() {
+            delegate.run();
+        }
+
+        @Override
+        public int compareTo(PriorityTask other) {
+            int byPriority = Integer.compare(priority, other.priority);
+            return byPriority != 0 ? byPriority : Long.compare(sequence, other.sequence);
+        }
+    }
+
+    /**
      * One dedicated, shared, daemon background thread that performs every ACTUAL network wait
      * {@link #waysForCellWithBoundedWait} and {@link #enqueueLookaheadAsync} trigger -- never a
      * generation worker thread. A single thread is enough: {@link #networkLock} already permits only
@@ -207,12 +248,21 @@ public final class RoadTileSource {
      * {@code RoadTileSource} instance, production included) rather than per-instance, since
      * ordinarily there is exactly one production instance anyway and a per-instance pool would leak
      * one thread per short-lived test instance; daemon so it never blocks JVM/test-runner shutdown.
+     * A {@link PriorityBlockingQueue} of {@link PriorityTask} (not the plain FIFO queue
+     * {@link java.util.concurrent.Executors#newSingleThreadExecutor} would give) orders WAITING work
+     * by priority -- see {@link #PRIORITY_IMMEDIATE}'s own doc. Callers submit {@link PriorityTask}
+     * instances directly via {@code execute} (never {@code submit}/{@code supplyAsync}, which would
+     * wrap the task in a type {@link PriorityBlockingQueue} cannot compare), so the exact object this
+     * queue orders is the one whose priority matters.
      */
-    private static final ExecutorService ASYNC_FETCH_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "earthplatformroads-road-tile-fetch");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private static final ExecutorService ASYNC_FETCH_EXECUTOR = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            new PriorityBlockingQueue<>(),
+            runnable -> {
+                Thread thread = new Thread(runnable, "earthplatformroads-road-tile-fetch");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     /**
      * {@link #waysForCell} for this cell, but bounded: if the cell is not already resolved
@@ -246,19 +296,68 @@ public final class RoadTileSource {
         if (!inFlightByCell.containsKey(key) && inFlightByCell.size() >= MAX_IN_FLIGHT_TILES) {
             return List.of(); // at capacity: fail open rather than admit yet another distinct in-flight cell
         }
-        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k ->
-                CompletableFuture.supplyAsync(() -> waysForCell(lat, lon), ASYNC_FETCH_EXECUTOR));
+        Instant deadline = clock.instant().plus(bound);
+        CompletableFuture<List<RoadSegment>> future = inFlightByCell.computeIfAbsent(key, k -> {
+            CompletableFuture<List<RoadSegment>> submitted = new CompletableFuture<>();
+            ASYNC_FETCH_EXECUTOR.execute(new PriorityTask(PRIORITY_IMMEDIATE, () -> {
+                try {
+                    submitted.complete(waysForCellRetryingAcrossCooldown(lat, lon, deadline));
+                } catch (Throwable t) {
+                    submitted.completeExceptionally(t);
+                }
+            }));
+            return submitted;
+        });
         future.whenComplete((result, error) -> inFlightByCell.remove(key, future));
         try {
             return future.get(bound.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             return List.of(); // fail open: the shared future above keeps running regardless
         } catch (ExecutionException e) {
-            return List.of(); // waysForCell itself never throws checked exceptions here, but guard anyway rather than propagate
+            return List.of(); // waysForCellRetryingAcrossCooldown never throws checked exceptions here, but guard anyway rather than propagate
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return List.of();
         }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55522's other half: "keep eligible immediate demand pending across
+     * cooldown" rather than {@link #waysForCell}'s own single attempt, which gives up the instant
+     * {@link #attemptFetch} is dispatch-suppressed by {@link #nextEligibleRequestAt} -- even though
+     * this caller's own {@code deadline} (from {@link #waysForCellWithBoundedWait}'s {@code bound})
+     * may still have most of its budget left. Retries ONLY while the reason nothing resolved is
+     * genuinely this instance's own steady cooldown (sleeping exactly until that cooldown, or this
+     * call's own deadline, whichever comes first, never longer) -- a real ATTEMPTED failure (a
+     * dispatched request that actually failed) is NOT retried here, so a persistently-failing
+     * provider cannot be hammered by this loop; {@link #consecutiveAttemptedFailures}/
+     * {@link #sustainedOutage} already track that case on their own terms. Runs on
+     * {@link #ASYNC_FETCH_EXECUTOR}'s own background thread, never the caller's (generation worker)
+     * thread, so sleeping here never blocks generation. Bounded to
+     * {@value #MAX_COOLDOWN_RETRIES} attempts regardless, so a pathological case (the cooldown
+     * window kept being pushed back by a concurrent caller, say) cannot spin indefinitely even if it
+     * somehow stayed within the deadline the whole time.
+     */
+    private static final int MAX_COOLDOWN_RETRIES = 4;
+
+    private List<RoadSegment> waysForCellRetryingAcrossCooldown(double lat, double lon, Instant deadline) {
+        for (int attempt = 0; attempt < MAX_COOLDOWN_RETRIES; attempt++) {
+            List<RoadSegment> result = waysForCell(lat, lon);
+            if (!result.isEmpty() || cellState(lat, lon) != CellState.PENDING) return result; // genuinely resolved: ready or confirmed-empty
+            Instant now = clock.instant();
+            Instant cooldownUntil = nextEligibleRequestAt;
+            if (!cooldownUntil.isAfter(now)) return List.of(); // not cooldown -- a genuine attempted failure; do not spin on those here
+            Instant wakeAt = cooldownUntil.isBefore(deadline) ? cooldownUntil : deadline;
+            if (!wakeAt.isAfter(now)) return List.of(); // no budget left in our own deadline
+            try {
+                Thread.sleep(Duration.between(now, wakeAt).toMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return List.of();
+            }
+            if (!clock.instant().isBefore(deadline)) return List.of();
+        }
+        return List.of();
     }
 
     /**
@@ -271,13 +370,13 @@ public final class RoadTileSource {
     public void enqueueLookaheadAsync(double lat, double lon) {
         long key = cellKeyOf(lat, lon);
         if (!pendingLookaheadDispatches.add(key)) return; // already queued for this exact center cell; skip rather than pile on another
-        ASYNC_FETCH_EXECUTOR.execute(() -> {
+        ASYNC_FETCH_EXECUTOR.execute(new PriorityTask(PRIORITY_LOOKAHEAD, () -> {
             try {
                 enqueueLookahead(lat, lon);
             } finally {
                 pendingLookaheadDispatches.remove(key);
             }
-        });
+        }));
     }
 
     private static long cellKeyOf(double lat, double lon) {

@@ -790,6 +790,76 @@ clear a column's canopy even though the road surface underneath never actually g
 a disclosed gap, not a fix for that race -- a clean canopy over a column is not evidence the road
 material underneath is correct.
 
+## MINECRAFT-566: ordinary-movement fetch-admission priority and cooldown retry (comments 55522/55526)
+
+A SEPARATE branch from the flat-deck prototype, built from `b7ff716` (canopy clearance only) per
+John's own explicit instruction once his own compiled-build testing confirmed that commit looked
+good on Zippy: "keep this based on the accepted b7 canopy branch (exclude unfinished deck) for a
+clean preview." This slice does not touch `RoadDeck`/`RoadSegment.projectOnto`/`isSameRoadAs` at
+all -- those stay on the other branch, explicitly not promoted here.
+
+**The bug (comment 55522, reproduced via a real loopback NeoForge/combined-73 fixture, not a live
+route):** a speculative lookahead fetch (tile A) and the CURRENT cell's own bounded-wait fetch
+(tile B) both ultimately run through `RoadTileSource`'s single dedicated `ASYNC_FETCH_EXECUTOR`
+thread. The first version used a plain FIFO queue (`Executors.newSingleThreadExecutor`'s default),
+so a lookahead job queued moments before an immediate job's own request could make that immediate
+job wait behind it for a thread-scheduling slot it did not need to wait for -- observed concretely:
+B's own task sat queued (no POST sent at all) while A's request was in flight; by the time A
+released the thread, B's own attempt landed exactly inside this instance's own steady
+`minRequestInterval` cooldown and was declined outright (a single-shot attempt, not retried);
+generation proceeded with natural terrain (grass) while B's data was still genuinely PENDING; and
+once B eventually did resolve, the already-adopted grass cube had already been saved, so a native
+reopen just replayed it -- this mod never retrofits an already-saved column, by existing design.
+
+**Fixed, two parts:**
+- **Priority.** `ASYNC_FETCH_EXECUTOR` is now a `ThreadPoolExecutor` backed by a
+  `PriorityBlockingQueue<PriorityTask>` (a small `Runnable`/`Comparable` wrapper tagging each
+  submission `PRIORITY_IMMEDIATE` or `PRIORITY_LOOKAHEAD`, ties broken by submission order).
+  `waysForCellWithBoundedWait` and `enqueueLookaheadAsync` submit `PriorityTask`s directly via
+  `execute` (never `supplyAsync`/`submit`, which would wrap the task in a type the priority queue
+  cannot compare) so the object the queue actually orders is the one whose priority matters. This
+  cannot preempt a job already RUNNING -- the provider's own `networkLock` parallel-1 limit means a
+  genuinely in-flight request must finish regardless of what arrives after it -- but it does stop a
+  newly-queued lookahead job from jumping ahead of an immediate job that is, or arrives, still
+  waiting in the queue.
+- **Retry across cooldown.** A new `waysForCellRetryingAcrossCooldown`, used only by
+  `waysForCellWithBoundedWait`'s own dispatched task (never by the plain, single-shot
+  `waysForCell`), retries ONLY while the reason nothing resolved is genuinely this instance's own
+  steady cooldown (`nextEligibleRequestAt` still ahead of now) -- sleeping exactly until that
+  cooldown or this call's own deadline, whichever is sooner, never longer, and bounded to a small
+  fixed number of retries regardless. A real ATTEMPTED failure (a request that was actually
+  dispatched and failed) is deliberately NOT retried here, so a persistently-failing provider cannot
+  be hammered by this loop -- `consecutiveAttemptedFailures`/`sustainedOutage` already track that
+  case on their own terms. The sleep happens on `ASYNC_FETCH_EXECUTOR`'s own background thread,
+  never the caller's (generation worker) thread, so it never blocks generation.
+
+**Verified**, against a local HTTP stub (never a real live route): `RoadTileSourceTest
+.immediateRequestsArePrioritizedOverQueuedLookaheadRequests` (an "occupier" request holds the
+executor's one thread busy; a lookahead and then an immediate request are queued, in that order,
+while it is busy; the immediate request's own HTTP request must land before the lookahead's once
+the thread frees up) and `.boundedWaitRetriesAcrossASteadyCooldownRatherThanGivingUpOnTheFirstDecline`
+(a bounded-wait call whose first attempt lands during a short, real cooldown from an unrelated
+immediately-preceding fetch must retry and actually succeed, not give up on the first decline). Both
+tolerate `ASYNC_FETCH_EXECUTOR` being shared process-wide (see its own class doc) by using generous
+bounds/polling rather than tight timing assertions, after an earlier, tighter version of the
+cooldown test was observed to fail when run alongside this file's other, slower tests (a real,
+confirmed cross-test timing interaction via that shared executor, not a bug in the fix itself --
+isolated reruns of the exact same assertions passed cleanly). 86/86 tests pass (2 new).
+
+**Explicitly out of scope, per John's own boundaries:** the deeper "bound deferral of only unsaved
+road-relevant surface cubes" half of 55522's ask -- a generation-level mechanism to actually RETRY
+a cube's generation once pending data resolves, rather than only improving how promptly the FETCH
+itself resolves -- was not attempted. That would need the same kind of "verify output against fresh
+data, retry generation" approach already found buggy once before (the currently-disabled
+`sectionLooksStale`/stale-retry mechanism on the other branch) -- real additional design work, not
+a quick extension of this fix. The forced-load (`loadNow`) exception from comment 55524 is
+unchanged and already documented/tested (`SynchronousLoadGuard`/`SynchronousLoadGuardTest`, both
+predating this slice) -- `ServerCubeWorldRoadPrefetchMixin`'s own class doc now cross-references
+John's confirmation of it rather than duplicating that coverage; deliberately not changing
+`loadNow`'s own synchronous contract, per his explicit "do not... change Sable/portal semantics"
+instruction. No server-thread HTTP, no provider-cadence bypass, no edits to existing saves, and the
+flat-deck prototype remains untouched and not promoted by this branch.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
