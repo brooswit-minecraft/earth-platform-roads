@@ -162,6 +162,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * still exhaust the retries, left as a known, disclosed, deliberately bounded (not unlimited, to
  * avoid an unbounded generation stall) residual gap, not claimed as fully closed.
  *
+ * <p><b>Currently disabled (comments 55505/55507):</b> {@link #MAX_STALE_RETRY_ATTEMPTS} is 0 --
+ * see that field's own doc for the confirmed detector false positives that made this unsafe to
+ * ship as-is. Because the retry loop's condition is {@code attempt < MAX_STALE_RETRY_ATTEMPTS &&
+ * RoadPrefetch.sectionLooksStale(...)}, with the bound at 0 the first half is already false and
+ * Java's {@code &&} never evaluates the second -- {@code sectionLooksStale} is never even called,
+ * which also satisfies comment 55507's separate ask to not run that check unconditionally on
+ * every column/cube.
+ *
  * <h2>A real metadata-leak bug in the retry loop, found by comment 55504 in pre-handoff review</h2>
  * The first version of the retry loop called {@code generate()} on every attempt with the SAME
  * mutable {@code blockEntities}/{@code entities} lists -- but {@code generate()}'s own
@@ -205,12 +213,23 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
      * MINECRAFT-566 comment 55496's residual race, bounded rather than eliminated (see this
      * class's own "known, disclosed residual race" doc section): how many times
      * {@code earthplatformroads$generateWithStaleRetry} will re-evict and regenerate before giving
-     * up and accepting whatever the last attempt produced. In ordinary play this never retries at
-     * all; the race would have to recur on every single attempt to survive this many retries,
-     * which realistically only happens under the kind of deliberately engineered test-latch timing
-     * comment 55496's own reproduction used.
+     * up and accepting whatever the last attempt produced.
+     *
+     * <p><b>Deliberately 0 for now (comments 55505/55507):</b> {@link RoadPrefetch#sectionLooksStale}
+     * was confirmed to have real false positives -- a compiled worker run found it rejecting an
+     * ALREADY-correctly-painted result twice more (burning 2 extra generations for nothing), and a
+     * second diagnostic found it specifically at columns whose real block was legitimately dirt,
+     * not actually wrong, that the detector nonetheless expected to be gravel/blackstone. This is a
+     * real bug in the detector's own logic, not merely a race-timing artifact, and John explicitly
+     * held the retry-enabled commit (31c67c5) back from Zippy for exactly this reason, asking for
+     * "the smaller verified fallback" (this class's eviction-only behavior, matching {@code c78bf01})
+     * while a safer detector (comparing the generation's own input Surface decision, or an explicit
+     * stale-snapshot signal, rather than inferring staleness from final decorated blocks) is
+     * designed. Set back above 0 only once that detector is actually fixed and re-verified --
+     * {@link RoadPrefetch#sectionLooksStale} and the retry loop below are left in place, dormant,
+     * rather than deleted, so re-enabling it is a one-line change once it is safe to.
      */
-    private static final int MAX_STALE_RETRY_ATTEMPTS = 3;
+    private static final int MAX_STALE_RETRY_ATTEMPTS = 0;
 
     @Shadow
     private CubeGenerator generator;
