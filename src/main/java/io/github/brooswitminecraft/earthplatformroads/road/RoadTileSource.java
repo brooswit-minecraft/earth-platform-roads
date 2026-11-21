@@ -538,14 +538,48 @@ public final class RoadTileSource {
      */
     public enum CellState { READY, CONFIRMED_EMPTY, PENDING }
 
-    /** This cell's own cache state on disk, independent of whatever may or may not be in {@link #memory} -- see {@link CellState}. */
+    /**
+     * MINECRAFT-566 comment 55562: this previously stat'd disk directly on EVERY call ({@code
+     * Files.isRegularFile} twice), never consulting {@link #memory} at all -- so a caller re-asking
+     * about the same already-resolved cell (e.g. {@code RoadPrefetch}'s own per-column scans, up to
+     * 256 times for one cube) re-touched the filesystem every single time, even though the cell's
+     * state can never change mid-scan. Fixed by delegating to {@link #readDiskCacheIfPresent} (the
+     * same validated-load helper {@link #cachedWaysForCellOrEmpty}/{@link #waysForCellDetailed}/
+     * {@link #enqueueLookahead} already share): a hit is served from {@link #memory} with zero disk
+     * I/O once any caller has validated it once; a genuine miss ({@code null}, meaning PENDING) is
+     * deliberately never cached, so a later resolution or a transient failure is never masked -- the
+     * on-disk cache's own file-based semantics are completely unchanged, only the in-memory layer on
+     * top of them is now actually used here too.
+     */
     public CellState cellState(double lat, double lon) {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
         String cellId = cellLat + "_" + cellLon;
-        if (Files.isRegularFile(cacheRoot.resolve(cellId + ".json"))) return CellState.READY;
-        if (Files.isRegularFile(cacheRoot.resolve(cellId + ".empty"))) return CellState.CONFIRMED_EMPTY;
-        return CellState.PENDING;
+        Path readyFile = cacheRoot.resolve(cellId + ".json");
+        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
+        List<RoadSegment> loaded = readDiskCacheIfPresent(key, readyFile, emptyFile);
+        if (loaded == null) return CellState.PENDING;
+        return loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562: a monotonic counter bumped exactly when a cell transitions from
+     * "not yet known resolved by this instance" to known READY or CONFIRMED_EMPTY -- i.e. every time
+     * {@link #readDiskCacheIfPresent} or {@link #attemptFetch} populates {@link #memory} for a key
+     * it did not already hold. Deliberately coarse (one counter for every cell this instance ever
+     * tracks, not per-cell): {@code RoadPrefetch}'s own stale-surface-eviction gate uses this as a
+     * cheap, conservative "has anything changed since I last evicted this column" signal -- a
+     * resolution anywhere can cause one extra, harmless eviction for an unrelated column, but the
+     * counter can never fail to advance when a column's OWN relevant cell actually resolves, which
+     * is the one direction that must never be wrong (under-eviction would regress the already-proven
+     * stale-column repaint from comments 55486/55487/55492/55496).
+     */
+    private final AtomicLong resolvedGeneration = new AtomicLong();
+
+    /** The current value of {@link #resolvedGeneration} -- see that field's own doc. */
+    public long resolvedGeneration() {
+        return resolvedGeneration.get();
     }
 
     /**
@@ -560,21 +594,24 @@ public final class RoadTileSource {
      * off-thread for exactly this kind of network-backed data.
      */
     public List<RoadSegment> cachedWaysForCellOrEmpty(double lat, double lon) {
+        // MINECRAFT-566 comment 55562: a real, confirmed bug -- the old version here checked ONLY
+        // the ready (".json") file's existence, never the confirmed-empty (".empty") marker, and
+        // never populated `memory` on a confirmed-empty result at all. Every single call for an
+        // already-resolved-but-empty neighbor cell (the ordinary case: most of the world has no
+        // roads) re-stat'd disk again, forever -- exactly "rendering near absent/confirmed-empty
+        // neighbors can restat all those cells on many block calls." Fixed by delegating to
+        // {@link #readDiskCacheIfPresent}, the same validated-load helper {@link #cellState} now
+        // also uses: a confirmed-empty hit is memoized (as an empty list, same representation this
+        // method already returned) exactly once, then served from memory with zero disk I/O on
+        // every later call for that same cell.
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
-        List<RoadSegment> cached = memory.get(key);
-        if (cached != null) return cached;
         String cellId = cellLat + "_" + cellLon;
         Path readyFile = cacheRoot.resolve(cellId + ".json");
-        if (!Files.isRegularFile(readyFile)) return List.of();
-        try {
-            List<RoadSegment> ways = readCachedCell(readyFile);
-            memory.put(key, ways);
-            return ways;
-        } catch (IOException e) {
-            throw new IllegalStateException("Could not read road tile cache file " + readyFile, e);
-        }
+        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
+        List<RoadSegment> loaded = readDiskCacheIfPresent(key, readyFile, emptyFile);
+        return loaded != null ? loaded : List.of();
     }
 
     /**
@@ -665,6 +702,7 @@ public final class RoadTileSource {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
         memory.put(key, fetched);
+        resolvedGeneration.incrementAndGet(); // a fresh fetch resolving this cell is a real data transition -- see that field's own doc
         consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
     }
@@ -737,18 +775,25 @@ public final class RoadTileSource {
         }
     }
 
-    /** Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss, not an error. */
+    /**
+     * Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss,
+     * not an error. Every successful disk-validated load newly populates {@link #memory} (never a
+     * miss) and bumps {@link #resolvedGeneration} exactly once for that transition -- see that
+     * field's own doc for why.
+     */
     private List<RoadSegment> readDiskCacheIfPresent(long key, Path readyFile, Path emptyFile) {
         List<RoadSegment> cached = memory.get(key);
         if (cached != null) return cached;
         try {
             if (Files.isRegularFile(emptyFile)) {
                 memory.put(key, List.of());
+                resolvedGeneration.incrementAndGet();
                 return List.of();
             }
             if (Files.isRegularFile(readyFile)) {
                 List<RoadSegment> ways = readCachedCell(readyFile);
                 memory.put(key, ways);
+                resolvedGeneration.incrementAndGet();
                 return ways;
             }
         } catch (IOException e) {

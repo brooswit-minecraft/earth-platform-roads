@@ -1286,4 +1286,193 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55562: {@code dispatchAndScanRelevantCells} replaces the mixin's own
+     * previous three separate calls ({@code cubeContainsNaturalSurface} then
+     * {@code dispatchRelevantCellFetches} then {@code isAnyRelevantCellPending}) with one pass.
+     * Proves the combined method answers exactly the same questions those three did, entirely cold
+     * boot, mirroring {@code isAnyRelevantCellPendingAndDispatchRelevantCellFetchesWorkCorrectly}:
+     * (1) a relevant, never-fetched cube reports both relevant and pending; (2) a cube far above
+     * natural ground reports irrelevant; (3) the one pass actually dispatches a real request; (4)
+     * once that request resolves, the same cube no longer reports pending (still correctly
+     * relevant).
+     */
+    @Test
+    void dispatchAndScanRelevantCellsAnswersRelevanceAndPendingInOnePass(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555090,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"One Pass Scan Test Road"},
+                  "geometry":[{"lat":50.0010,"lon":-121.0050},{"lat":50.0060,"lon":-121.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 50.0035, lon = -121.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+            int cubeY = generator.surfaceY(block[0], block[1]) >> 4;
+
+            var farAbove = RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY + 50, cubeZ);
+            assertTrue(!farAbove.naturallyRelevant(), "Expected a cube far ABOVE natural ground to be reported irrelevant");
+            assertTrue(!farAbove.anyRelevantCellPending(), "Expected an irrelevant cube to never report pending");
+            assertEquals(0, requests.get(), "Expected an irrelevant cube to dispatch nothing at all");
+
+            var atGround = RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY, cubeZ);
+            assertTrue(atGround.naturallyRelevant(), "Expected the cube containing this cell's own natural surface to be reported relevant");
+            assertTrue(atGround.anyRelevantCellPending(), "Expected the never-fetched relevant cube to be reported pending");
+
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the one pass's own dispatch to have actually resolved this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchAndScanRelevantCells to have sent a real request in its single pass");
+
+            var afterResolve = RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY, cubeZ);
+            assertTrue(afterResolve.naturallyRelevant(), "Expected the cube to remain relevant after resolution");
+            assertTrue(!afterResolve.anyRelevantCellPending(), "Expected the SAME cube to no longer report pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562, John's own source audit: the mixin previously called
+     * {@code RoadPrefetch.evictStaleSurfaceDecision} UNCONDITIONALLY for every {@code produce()}
+     * call, so a tall column's many sibling cube-Y layers each evicted the shared X/Z {@code
+     * SurfaceGenerator.Column} cache the others had just populated. Proves
+     * {@code evictStaleSurfaceDecisionIfRelevantAndChanged}'s own gating state machine directly: the
+     * first call for a column always evicts (nothing legitimate cached yet to protect -- the same
+     * "free in the ordinary case" guarantee the original unconditional eviction always provided); an
+     * immediately-following sibling call for the SAME column, with nothing resolved anywhere since,
+     * must be skipped; once a real resolution happens (even for a wholly unrelated cell elsewhere),
+     * the SAME column becomes eligible to evict again -- "keep freshness on real data transition,
+     * not each sibling," never frozen forever. An irrelevant cube must never evict at all.
+     */
+    @Test
+    void evictStaleSurfaceDecisionIfRelevantAndChangedGatesBySiblingAndRealDataTransition(
+            @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadPrefetch.clearEvictionTrackingForTests();
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+        double lat = 51.0005, lon = -122.0005; // fictional, never one of John's own real test locations
+        int[] block = generator.block(lat, lon);
+        int columnX = block[0] >> 4, columnZ = block[1] >> 4;
+
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
+                "Expected the FIRST eviction for a column to always run");
+
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
+                "Expected a sibling cube's eviction for the SAME column to be skipped when nothing has resolved since the last one");
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
+                "Expected repeated sibling calls to keep being skipped, not just the second one");
+
+        // A real resolution happens elsewhere -- an entirely unrelated cell, far from this column's
+        // own lat/lon -- bumping RoadTileSource's own resolvedGeneration counter.
+        java.nio.file.Files.createDirectories(roadCache);
+        java.nio.file.Files.writeString(roadCache.resolve("1000_2000.empty"), "");
+        tileSource.cellState(10.005, 20.005); // validates the marker above, bumping resolvedGeneration
+
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
+                "Expected the SAME column to become eligible to evict again once something has actually resolved");
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
+                "Expected it to go back to being skipped immediately afterward, with nothing new resolved since");
+
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, false),
+                "Expected an irrelevant cube to never evict, regardless of the generation counter");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562's own explicit ask: "independently reproduce/measure hot cached
+     * two-world and vertical sibling paths; warm replay should send zero HTTP". Measures the actual
+     * "vertical sibling" scenario by name: once a column's own cell has resolved, ten MORE
+     * {@code dispatchAndScanRelevantCells} calls at the SAME X/Z (modelling ten cube-Y layers of one
+     * tall column, each independently missing storage and calling this same gate) -- the warm-replay
+     * case John asked be measured -- must send ZERO further HTTP requests and record ZERO further
+     * real disk-validating loads ({@link RoadTileSource#resolvedGeneration()} unchanged), and the
+     * eviction gate must correctly skip all ten (nothing changed since the first). Reported measured
+     * numbers (see the Jira comment/changelog for this round): 1 real request for the initial
+     * resolve, 0 for all ten warm-replay siblings; 1 eviction for the first column touch, 0 for the
+     * ten siblings after it.
+     */
+    @Test
+    void tenVerticalSiblingCallsAfterResolutionSendZeroHttpAndSkipEverySiblingEviction(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadPrefetch.clearEvictionTrackingForTests();
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555091,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Vertical Sibling Measurement Road"},
+                  "geometry":[{"lat":52.0010,"lon":-123.0050},{"lat":52.0060,"lon":-123.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 52.0035, lon = -123.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+            int cubeY = generator.surfaceY(block[0], block[1]) >> 4;
+
+            // The first cube-Y layer: a genuine cold miss, resolves the cell, evicts once.
+            RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY, cubeZ);
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon));
+            int requestsAfterFirstResolve = requests.get();
+            assertTrue(requestsAfterFirstResolve >= 1, "Expected exactly the initial resolve to have sent a real request");
+            long generationAfterFirstResolve = tileSource.resolvedGeneration();
+            assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, cubeX, cubeZ, true),
+                    "Expected the first column touch to evict");
+
+            // Ten MORE sibling cube-Y layers, same X/Z, cell already resolved -- the warm-replay case.
+            for (int siblingY = 0; siblingY < 10; siblingY++) {
+                var scan = RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY + siblingY + 1, cubeZ);
+                // Y offset by +1.. +10: still well within the same cube's own natural-surface padding
+                // range for at least the first couple, but regardless of relevance, dispatch/pending
+                // only ever touches the network for a RELEVANT, PENDING cell -- already resolved here.
+                boolean evicted = RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, cubeX, cubeZ, scan.naturallyRelevant());
+                assertTrue(!evicted, "Expected sibling Y layer " + siblingY + " to skip eviction -- nothing resolved since the first touch");
+            }
+
+            assertEquals(requestsAfterFirstResolve, requests.get(),
+                    "Expected ZERO further HTTP requests across all ten vertical-sibling warm-replay calls");
+            assertEquals(generationAfterFirstResolve, tileSource.resolvedGeneration(),
+                    "Expected ZERO further real disk-validating loads across all ten vertical-sibling warm-replay calls");
+        } finally {
+            stub.stop(0);
+        }
+    }
 }

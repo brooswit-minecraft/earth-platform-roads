@@ -347,14 +347,26 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // retryAt/adoptReady machinery defer this exact cube to a later tick, on its own schedule,
         // without this worker thread blocking at all. SynchronousLoadGuard still excludes loadNow's
         // own arrival path entirely -- see that section's own explicit policy statement.
-        if (!SynchronousLoadGuard.isActive()
-                && RoadPrefetch.hasLiveTileSource()
-                && RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ)) {
-            RoadPrefetch.dispatchRelevantCellFetches(earthGenerator, cubeX, cubeY, cubeZ);
-            if (RoadPrefetch.isAnyRelevantCellPending(earthGenerator, cubeX, cubeY, cubeZ)) {
+        // MINECRAFT-566 comment 55562: the three separate full-cube scans this gate used to run
+        // (cubeContainsNaturalSurface, then dispatchRelevantCellFetches, then isAnyRelevantCellPending
+        // -- each independently re-deriving generator.surfaceY for all 256 columns, the pending
+        // check alone calling RoadTileSource.cellState up to 256 times) are now ONE pass via
+        // RoadPrefetch.dispatchAndScanRelevantCells -- see that method's own doc. SynchronousLoadGuard
+        // must still exclude ALL dispatch/pending-check/HTTP from loadNow's own arrival path exactly
+        // as before, so the cheap, dispatch-free RoadPrefetch.cubeContainsNaturalSurface is used
+        // instead whenever the guard is active (or there is no live tile source to dispatch through
+        // at all) -- this changes nothing about WHAT ran under those conditions, only unifies how
+        // relevance is computed afterward for the eviction gate below.
+        boolean naturallyRelevant;
+        if (!SynchronousLoadGuard.isActive() && RoadPrefetch.hasLiveTileSource()) {
+            RoadPrefetch.RelevantCellScanResult scan = RoadPrefetch.dispatchAndScanRelevantCells(earthGenerator, cubeX, cubeY, cubeZ);
+            naturallyRelevant = scan.naturallyRelevant();
+            if (scan.anyRelevantCellPending()) {
                 throw new RoadDataNotReadyException(
                         "road data still pending for cube (" + cubeX + "," + cubeY + "," + cubeZ + ")");
             }
+        } else {
+            naturallyRelevant = RoadPrefetch.cubeContainsNaturalSurface(earthGenerator, cubeX, cubeY, cubeZ);
         }
         // MINECRAFT-566 comment 55486/55487, a real, independently-reproduced staleness bug found
         // in Earth Platform's own code: SurfaceGenerator permanently memoizes this column's whole
@@ -362,11 +374,13 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // every tick for flying logic, well before road data need be ready) -- once cached, this
         // very generate() call about to run would hit that stale entry and never re-invoke
         // surface() at all, no matter how fresh the road data now is. Evict just this one column
-        // (never a global clear), unconditionally -- this is NOT gated by SynchronousLoadGuard,
-        // since it is not HTTP and the exact same staleness risk applies equally to loadNow's own
-        // arrival generate() call. Free in the ordinary case: produce() only ever runs once per
-        // column, so there was nothing legitimate to evict yet.
-        RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
+        // (never a global clear) -- NOT gated by SynchronousLoadGuard (not HTTP; the exact same
+        // staleness risk applies equally to loadNow's own arrival generate() call), but now gated by
+        // relevance and real data transition per comment 55562 -- see
+        // RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged's own doc for why an
+        // unconditional eviction, on every unsaved Y cube regardless of relevance, was itself the
+        // real performance bug this whole slice exists to fix.
+        RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(earthGenerator, cubeX, cubeZ, naturallyRelevant);
         // MINECRAFT-566 comment 55504, a real bug found in pre-handoff review: every retry attempt
         // below was calling generate() with the SAME mutable blockEntities/entities lists -- but
         // generate()'s own structures.place(...) APPENDS to those lists as a side effect (confirmed

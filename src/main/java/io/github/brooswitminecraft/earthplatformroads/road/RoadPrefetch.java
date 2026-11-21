@@ -244,6 +244,59 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55562, John's own source audit: {@code ServerCubeWorldRoadPrefetchMixin}'s
+     * gate previously called {@link #cubeContainsNaturalSurface}, then (if relevant)
+     * {@link #dispatchRelevantCellFetches}, then {@link #isAnyRelevantCellPending} -- THREE
+     * separate full 256-column scans of the exact same cube, each independently re-deriving
+     * {@code generator.surfaceY} from scratch for every column ("the ready gate also rescans
+     * natural heights"), and the pending check alone calling {@code RoadTileSource.cellState} once
+     * per column (up to 256 times, even though most columns in one 16-block cube map to the very
+     * same one or two ~1.1km map cells -- "256 repeated filesystem stats for the same already-cached
+     * tile per pass"). This replaces all three with ONE pass: {@code generator.surfaceY} is read
+     * exactly once per column, and {@code cellState}/dispatch are each invoked at most once per
+     * UNIQUE cell this cube's relevant footprint intersects, not once per column -- "start with a
+     * low-risk one-pass, unique tile state check," per John's own exact phrasing.
+     *
+     * <p>Deliberately NOT a replacement for {@link #cubeContainsNaturalSurface}/
+     * {@link #dispatchRelevantCellFetches}/{@link #isAnyRelevantCellPending} themselves: those stay
+     * exactly as they were (and exactly as tested), since other code may still call them
+     * individually; this is purely a new, additional entry point for the one real hot call site
+     * that was paying for all three separately. Never weakens the correctness-waiting behavior this
+     * mixin relies on: the only difference from calling the three originals in sequence is how many
+     * times the SAME underlying facts get recomputed, never which cells get dispatched for or which
+     * answer "pending" resolves to.
+     */
+    public record RelevantCellScanResult(boolean naturallyRelevant, boolean anyRelevantCellPending) {}
+
+    public static RelevantCellScanResult dispatchAndScanRelevantCells(EarthGenerator generator, int cubeX, int cubeY, int cubeZ) {
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        MercatorGrid grid = generator.grid();
+        int baseX = cubeX << 4, baseZ = cubeZ << 4, baseY = cubeY << 4;
+        boolean naturallyRelevant = false;
+        boolean anyPending = false;
+        java.util.Set<Long> seenCells = tiles == null ? null : new java.util.HashSet<>();
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int worldX = baseX + lx, worldZ = baseZ + lz;
+                int localY = generator.surfaceY(worldX, worldZ) - baseY; // the ONLY surfaceY call per column, not three
+                if (localY + BASE_PAVING_PADDING_BLOCKS < 0 || localY > 15) continue;
+                naturallyRelevant = true;
+                if (tiles == null) continue;
+                GeoPoint point = grid.geographic(worldX, worldZ);
+                double lat = point.latitude(), lon = point.longitude();
+                long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+                long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+                long cellKey = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+                if (!seenCells.add(cellKey)) continue; // already handled this exact cell from an earlier column in this same cube
+                tiles.dispatchCellFetch(lat, lon);
+                tiles.enqueueLookaheadAsync(lat, lon);
+                if (tiles.cellState(lat, lon) == RoadTileSource.CellState.PENDING) anyPending = true;
+            }
+        }
+        return new RelevantCellScanResult(naturallyRelevant, anyPending);
+    }
+
+    /**
      * A cube/chunk index's own center BLOCK coordinate along one axis -- the conversion
      * {@code ServerCubeWorldRoadPrefetchMixin} needs before calling {@link #forColumn} with
      * {@code ServerCubeWorld.produce}'s cube indices (see comment 55476, and that mixin's own doc).
@@ -284,6 +337,55 @@ public final class RoadPrefetch {
     public static void evictStaleSurfaceDecision(EarthGenerator generator, int columnX, int columnZ) {
         ((SurfaceGeneratorColumnCacheAccessor) (Object) generator).earthplatformroads$columns()
                 .remove(surfaceGeneratorColumnKey(columnX, columnZ));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562, John's own source audit: {@code ServerCubeWorldRoadPrefetchMixin}
+     * called {@link #evictStaleSurfaceDecision} UNCONDITIONALLY for every single {@code produce()}
+     * call -- including every unsaved cube at ANY Y, sky and deep underground included -- so a tall
+     * column's many cube-Y layers each evicted the SAME shared X/Z {@code SurfaceGenerator.Column}
+     * cache the others had just populated, forcing every sibling to re-run the raw+road-aware survey
+     * from scratch. Fixed to evict only when BOTH: (1) {@code naturallyRelevant} (this exact cube's
+     * own natural-height relevance, now computed once per {@link #dispatchAndScanRelevantCells} or
+     * the cheap {@link #cubeContainsNaturalSurface} -- an irrelevant sibling has nothing a road
+     * decision could even apply to, so evicting for it is pure waste regardless of staleness), AND
+     * (2) something has actually changed since the last time THIS column was evicted -- "keep
+     * freshness on real data transition, not each sibling." Tracked via {@link RoadTileSource#resolvedGeneration()}:
+     * a coarse, global counter bumped whenever any cell anywhere newly resolves. Deliberately coarse
+     * rather than per-cell-precise -- an unrelated cell resolving can cause one harmless EXTRA
+     * eviction for this column, but the counter can never fail to advance when THIS column's own
+     * relevant cell actually resolves, which is the one direction that must never be wrong (under-
+     * eviction would regress the already-proven stale-column repaint from comments 55486/55487/
+     * 55492/55496 -- see {@code ServerCubeWorldRoadPrefetchMixin}'s own class doc for that history).
+     * The very FIRST call for a given column always evicts (no prior recorded generation to compare
+     * against) -- the same "free in the ordinary case, nothing legitimate to evict yet" guarantee
+     * the original unconditional eviction always provided for a column's first {@code produce()}
+     * call. {@code generator} must be a {@code null} tile source's own generation (no live source at
+     * all, e.g. cache-only or disabled): {@link RoadTileSource#resolvedGeneration()} is then always
+     * {@code 0}, so after the first eviction every later sibling at the same relevance correctly
+     * skips -- there is nothing that could ever "newly resolve" to justify re-evicting.
+     *
+     * @return whether an eviction actually ran, for tests to assert the gating itself, not just its
+     *         downstream effect.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<Long, Long> lastEvictedGenerationByColumn = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static boolean evictStaleSurfaceDecisionIfRelevantAndChanged(EarthGenerator generator, int columnX, int columnZ, boolean naturallyRelevant) {
+        if (!naturallyRelevant) return false;
+        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
+        long currentGeneration = tiles == null ? 0L : tiles.resolvedGeneration();
+        long columnKey = ((long) columnX << 32) ^ (columnZ & 0xFFFFFFFFL);
+        Long previousGeneration = lastEvictedGenerationByColumn.put(columnKey, currentGeneration);
+        if (previousGeneration != null && previousGeneration.longValue() == currentGeneration) {
+            return false; // nothing resolved anywhere since we last evicted this exact column -- nothing to refresh
+        }
+        evictStaleSurfaceDecision(generator, columnX, columnZ);
+        return true;
+    }
+
+    /** Test-only: clears {@link #lastEvictedGenerationByColumn} so each test starts from a known, empty state. */
+    static void clearEvictionTrackingForTests() {
+        lastEvictedGenerationByColumn.clear();
     }
 
     /**

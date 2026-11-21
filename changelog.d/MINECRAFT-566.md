@@ -356,6 +356,81 @@ bump: minor
   terrain, not something to keep waiting on). The ordinary-movement half of this mechanism is now
   independently, natively confirmed across every one of these cases.
 
+### Fixed (comment 55562, ordinary-movement performance -- revisiting known places was extremely slow)
+- John's own source audit found three real, concrete performance bugs in the ordinary-streaming
+  path, separate from and additional to this mechanism's own correctness:
+  1. **Unconditional stale-column eviction, every Y, every sibling.**
+     `ServerCubeWorldRoadPrefetchMixin` called `RoadPrefetch.evictStaleSurfaceDecision`
+     unconditionally for EVERY `produce()` call, including every unsaved sky/deep cube regardless
+     of relevance -- so a tall column's many cube-Y layers each evicted the SAME shared X/Z
+     `SurfaceGenerator.Column` cache the others had just populated, forcing every sibling to
+     re-run the full raw+road-aware survey from scratch. Fixed with
+     `RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged`: evicts only when the cube is
+     naturally-surface-relevant AND something has genuinely resolved since this exact column was
+     last evicted (tracked via a new `RoadTileSource.resolvedGeneration()` counter, bumped whenever
+     any cell newly resolves to READY/CONFIRMED_EMPTY) -- "keep freshness on real data transition,
+     not each sibling." The first touch of any column still always evicts (nothing legitimate
+     cached yet to protect, same guarantee the original unconditional eviction always gave); never
+     gated by `SynchronousLoadGuard` (not HTTP; applies to `loadNow`'s own arrival path too, exactly
+     as before).
+  2. **Three redundant full-cube scans, "the ready gate also rescans natural heights."** The
+     mixin's gate called `cubeContainsNaturalSurface`, then `dispatchRelevantCellFetches`, then
+     `isAnyRelevantCellPending` separately -- three full 256-column scans of the SAME cube, each
+     independently re-deriving `generator.surfaceY` from scratch. Fixed with a new
+     `RoadPrefetch.dispatchAndScanRelevantCells`: one pass, `surfaceY` read exactly once per column,
+     dispatch/pending-check each done at most once per UNIQUE map cell the cube's relevant footprint
+     intersects (typically 1-4, not 256) -- "start with a low-risk one-pass, unique tile state
+     check." The three original, individually-tested methods are left unchanged for existing
+     callers/tests; this is purely a new, additional entry point for the one real hot call site.
+  3. **`cellState`/`cachedWaysForCellOrEmpty` never consulted memory, "256 repeated filesystem
+     stats... restat all cells near absent/confirmed-empty neighbors."** `cellState` stat'd disk
+     directly on every single call. `cachedWaysForCellOrEmpty` (the actual neighbor-candidate read
+     path `RoadNetwork.candidatesNear` calls) checked ONLY the ready marker, never the confirmed-
+     empty one, and never memoized a confirmed-empty result at all -- a REAL, confirmed bug: every
+     call for an already-resolved-but-empty neighbor (the ordinary case, most of the world has no
+     roads) re-stat'd disk forever. Fixed by having both delegate to the existing, already-tested
+     `readDiskCacheIfPresent` validated-load helper: a READY/CONFIRMED_EMPTY hit is memoized exactly
+     once and served from memory with zero further disk I/O; PENDING is deliberately NEVER cached,
+     so a later resolution or transient failure is never masked. The on-disk cache's own file-based
+     semantics are completely unchanged -- only the in-memory layer already used elsewhere in this
+     class is now actually consulted here too.
+- Measured, per John's own explicit ask ("report exact build and measured before/after"): a new
+  "vertical sibling" test (`tenVerticalSiblingCallsAfterResolutionSendZeroHttpAndSkipEverySiblingEviction`)
+  resolves one cell with exactly 1 real HTTP request, evicts exactly once for that column, then
+  drives TEN more sibling cube-Y-layer calls at the same X/Z after resolution -- all ten send ZERO
+  further HTTP requests, record ZERO further real disk-validating loads
+  (`RoadTileSource.resolvedGeneration()` unchanged), and all ten correctly skip re-eviction. Before
+  this fix, those same ten siblings would each have independently re-evicted the shared column
+  cache and re-scanned all 256 columns three times over.
+- Correctness retained, explicitly verified: a cell genuinely transitioning from PENDING to
+  resolved still makes the SAME column eligible to evict and repaint again
+  (`evictStaleSurfaceDecisionIfRelevantAndChangedGatesBySiblingAndRealDataTransition`); an
+  irrelevant cube never evicts regardless of the generation counter; PENDING is never cached
+  (`pendingIsNeverCachedAndAFreshInstanceStillReadsTheRealDiskStateAfterAnEarlierInstanceSawPending`);
+  a fresh `RoadTileSource` instance over the same cache root (the "native reopen" case -- memory
+  caches never survive a restart) still reads the real on-disk state directly, same as the
+  pre-existing `aFreshSourceOverTheSameCacheRootDoesNotRefetch`; the existing
+  `evictingTheStaleSurfaceDecisionFixesARealReproductionOfTheCachingBug`/
+  `evictingAfterTheBoundedWaitSurvivesALowestGroundSurveyRacingInTheMiddleOfIt` stale-column-repaint
+  tests, and the existing outer-strip-boundary tests, are all unmodified and still pass. 97/97 tests
+  pass (`./gradlew compileJava compileTestJava test --rerun`). No server-thread HTTP, no save/cache
+  file-format rewrite, no hosted-provider dependency added, no reduction in the correctness-waiting
+  (`RoadDataNotReadyException`) behavior.
+- Not attempted this round, disclosed explicitly: `resolvedGeneration` is deliberately a single
+  GLOBAL counter, not per-cell -- an unrelated cell resolving anywhere in the world causes one
+  harmless EXTRA eviction for an unrelated column, never an incorrect skip. A per-cell-precise
+  version (tracking exactly which column actually depends on which cell) would narrow this further
+  but was not attempted, since the coarse version is already safe in the one direction that matters
+  (never under-evicts) and the measured "vertical sibling" case above shows it already eliminates
+  the real repeated-work stampede for the common case this comment described. The "hot cached
+  two-world" half of John's own ask (a SECOND, separately-booted generator/world sharing the same
+  on-disk cache root) is covered by the existing `aFreshSourceOverTheSameCacheRootDoesNotRefetch`-
+  style "native reopen" tests above, which already prove a fresh instance reads real disk state
+  correctly and never shares stale in-memory state across instances; a full second-world fixture
+  exercising the actual ordinary-movement mixin end to end (rather than `RoadTileSource` directly)
+  was not additionally built, for the same disclosed "no real `ServerCubeWorld`/`ServerLevel`
+  harness" gap named throughout this whole file.
+
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
   theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube

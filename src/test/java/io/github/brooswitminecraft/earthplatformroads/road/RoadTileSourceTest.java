@@ -338,6 +338,106 @@ class RoadTileSourceTest {
     }
 
     /**
+     * MINECRAFT-566 comment 55562, a real confirmed bug: {@code cachedWaysForCellOrEmpty} used to
+     * check ONLY the ready ({@code .json}) marker's existence, never the confirmed-empty
+     * ({@code .empty}) one, and never memoized a confirmed-empty result at all -- "rendering near
+     * absent/confirmed-empty neighbors can restat all those cells on many block calls" (the ordinary
+     * case: most of the world has no roads). Proves the fix by deleting the on-disk marker AFTER the
+     * first call: if the result were still being re-derived from disk every time, deleting the
+     * marker would flip the answer back to "nothing cached" (an empty list for a different reason --
+     * a genuine miss, not a validated confirmed-empty); if it is genuinely memoized, the SAME
+     * confirmed-empty answer survives the marker's removal. Also proves {@link RoadTileSource#cellState}
+     * shares that exact same memory (both now delegate to the same validated-load helper): it must
+     * still report {@code CONFIRMED_EMPTY}, never falling back to {@code PENDING}, after the file is
+     * gone.
+     */
+    @Test
+    void cachedWaysForCellOrEmptyMemoizesAConfirmedEmptyResultAfterAValidatedDiskLoad(@TempDir Path cacheRoot) throws IOException {
+        double lat = 60.0005, lon = -170.0005; // cell 6000_-17001
+        Path emptyMarker = cacheRoot.resolve("6000_-17001.empty");
+        java.nio.file.Files.createDirectories(cacheRoot);
+        java.nio.file.Files.writeString(emptyMarker, "");
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+
+        assertTrue(source.cachedWaysForCellOrEmpty(lat, lon).isEmpty(), "Expected the confirmed-empty marker to be read on the first, validating call");
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellState(lat, lon),
+                "Expected cellState to agree this cell is confirmed-empty, sharing the same validated memory");
+
+        java.nio.file.Files.delete(emptyMarker); // the on-disk marker is now gone -- only memory can answer correctly from here on
+
+        assertTrue(source.cachedWaysForCellOrEmpty(lat, lon).isEmpty(),
+                "Expected the memoized confirmed-empty answer to survive the marker's removal -- proof this is served from memory, not re-derived from disk");
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellState(lat, lon),
+                "Expected cellState to likewise still report CONFIRMED_EMPTY from memory, never falling back to PENDING just because the file is gone");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562: {@link RoadTileSource#cellState} used to stat disk directly on
+     * every call, never consulting memory. Proves it now memoizes a READY result after a validated
+     * disk load, the same way {@link #cachedWaysForCellOrEmptyMemoizesAConfirmedEmptyResultAfterAValidatedDiskLoad}
+     * proves for CONFIRMED_EMPTY -- deleting the ready file after the first call must not flip the
+     * answer back to PENDING.
+     */
+    @Test
+    void cellStateMemoizesAReadyResultAfterAValidatedDiskLoad(@TempDir Path cacheRoot) throws IOException {
+        double lat = 61.0005, lon = -171.0005; // cell 6100_-17101
+        Path readyFile = cacheRoot.resolve("6100_-17101.json");
+        java.nio.file.Files.createDirectories(cacheRoot);
+        java.nio.file.Files.writeString(readyFile, """
+                {"schema_version":1,"region_id":"memoize-ready-test","ways":[{"way_id":555060,
+                  "way_tags":{"highway":"secondary","name":"Memoize Ready Test Street"},
+                  "centerline":[{"lat":61.0003,"lon":-171.0007},{"lat":61.0007,"lon":-171.0003}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+
+        assertEquals(RoadTileSource.CellState.READY, source.cellState(lat, lon), "Expected the ready file to be read on the first, validating call");
+
+        java.nio.file.Files.delete(readyFile); // the on-disk file is now gone -- only memory can answer correctly from here on
+
+        assertEquals(RoadTileSource.CellState.READY, source.cellState(lat, lon),
+                "Expected the memoized READY answer to survive the file's removal -- proof this is served from memory, not re-derived from disk");
+        assertTrue(!source.cachedWaysForCellOrEmpty(lat, lon).isEmpty(),
+                "Expected cachedWaysForCellOrEmpty to likewise still return the memoized ways, sharing the same memory cellState just populated");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55562's own explicit guardrail: PENDING must NEVER be cached -- a cell
+     * that was never fetched (no marker file at all) must keep reporting PENDING on every call,
+     * never silently flipping to anything else just because it was asked about before. Also the
+     * "native reopen" case: a FRESH {@code RoadTileSource} instance over the same cache root (no
+     * shared in-memory state at all, since memory caches do not survive a restart) must still read
+     * whatever is genuinely on disk, exactly like {@link #aFreshSourceOverTheSameCacheRootDoesNotRefetch}
+     * already proves for {@code waysForCell} -- the new in-memory layer added in this round must
+     * never mask a real restart's own fresh disk read.
+     */
+    @Test
+    void pendingIsNeverCachedAndAFreshInstanceStillReadsTheRealDiskStateAfterAnEarlierInstanceSawPending(@TempDir Path cacheRoot) throws IOException {
+        double lat = 62.0005, lon = -172.0005; // cell 6200_-17201
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellState(lat, lon), "Expected a never-fetched cell to be reported pending");
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellState(lat, lon),
+                "Expected PENDING to stay PENDING on a second call from the SAME instance -- never cached as confirmed-anything");
+
+        // The cell resolves later, via some OTHER path entirely (e.g. a real fetch on a different
+        // thread, or simply a server restart that re-ran an earlier fetch) -- written directly here
+        // to isolate this test from that mechanism.
+        java.nio.file.Files.createDirectories(cacheRoot);
+        java.nio.file.Files.writeString(cacheRoot.resolve("6200_-17201.empty"), "");
+
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellState(lat, lon),
+                "Expected the SAME instance to see the real, now-resolved disk state -- PENDING must never have been cached in a way that masks this");
+
+        // A fresh instance, same cache root, no shared in-memory state at all -- must independently
+        // read the exact same real disk state, never relying on (or being confused by) whatever the
+        // earlier instance's own memory held.
+        RoadTileSource restarted = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, restarted.cellState(lat, lon),
+                "Expected a fresh instance over the same cache root to read the real, already-resolved disk state directly");
+    }
+
+    /**
      * MINECRAFT-566 comment 55474's "distinct diagnostics" for a sustained provider outage, as
      * opposed to an ordinary single pending cell. Three DIFFERENT cells (not the same one retried,
      * since a single awkward tile failing repeatedly is not proof the PROVIDER is down) all
