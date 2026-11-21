@@ -531,12 +531,21 @@ class RoadTilePrefetchMixinTest {
      * capacity-bounded queue), not independently re-proven by a race test.
      */
     @Test
-    void aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        String response = """
-                {"elements":[{"type":"way","id":555028,"nodes":[1,2],
-                  "tags":{"highway":"secondary","name":"Cooldown Test Street"},
-                  "geometry":[{"lat":43.004,"lon":-108.295},{"lat":43.016,"lon":-108.295}]}]}
-                """;
+    void aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests(@TempDir Path roadCache) throws IOException {
+        // MINECRAFT-566 comment 55466: the previous version of this test called prepare again over
+        // the SAME overlapping neighborhood to "prove" retention, which cannot actually distinguish
+        // a retained job from one that was dropped on decline and silently re-added by that same
+        // overlapping rescan -- it also used a 50ms interval, never exercising the real 5s-order
+        // production cadence. This version uses a controlled (fixed, test-set) clock instead of
+        // sleeping, the REAL production-order interval (5 seconds, not shortened), and -- critically
+        // -- drains the retained job through a call that scans a totally DIFFERENT, non-overlapping
+        // neighborhood, so the retained job cannot have been freshly re-added by that call's own
+        // scan. It calls RoadTileSource.enqueueLookahead directly (not through the full generator
+        // mixin) to isolate the queue's retention behavior from the unrelated "own cell" fetch a
+        // real prepareNear call would also perform.
+        String response = "{\"elements\":[{\"type\":\"way\",\"id\":555028,\"nodes\":[1,2],"
+                + "\"tags\":{\"highway\":\"secondary\",\"name\":\"Cooldown Test Street\"},"
+                + "\"geometry\":[{\"lat\":1.0,\"lon\":1.0},{\"lat\":1.001,\"lon\":1.001}]}]}";
         AtomicInteger requests = new AtomicInteger();
         HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         stub.createContext("/", exchange -> {
@@ -550,25 +559,39 @@ class RoadTilePrefetchMixinTest {
         try {
             RoadTileSource tileSource = new RoadTileSource(
                     URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
-                    null, Duration.ofMillis(200));
-            RoadNetwork.setTileSourceForTests(tileSource);
+                    null, Duration.ofSeconds(5)); // the real production-order interval
+            java.time.Instant t0 = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(t0, java.time.ZoneOffset.UTC));
 
-            EarthGenerator generator = bootAndBuildGenerator(demCache);
-            int[] block = generator.block(43.006, -108.295); // cell 4300_-10830
+            // Consume this instance's eligibility on an unrelated cell first, so the upcoming
+            // lookahead attempt is genuinely declined, not accidentally eligible.
+            tileSource.waysForCell(0.005, 0.005); // far from everything below; request #1
+            assertEquals(1, requests.get());
 
-            generator.prepareNear(block[0], block[1]); // own-cell fetch succeeds (#1); the same call's own opportunistic attempt is declined (just inside the 200ms deadline it set)
-            assertEquals(1, requests.get(), "Expected only the own-cell fetch to succeed on the first call");
+            // P1's neighborhood: cell (7000,-13001). Its first-enqueued Moore neighbor (per the
+            // fixed dLat,dLon iteration order) is cell (6999,-13002) -- the job we're tracking.
+            double p1Lat = 70.005, p1Lon = -130.005;
+            double trackedCellRepLat = 6999 * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
+            double trackedCellRepLon = -13002 * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
 
-            // Three more calls at the SAME point, no sleep -- still within the 200ms cooldown.
-            for (int i = 0; i < 3; i++) {
-                generator.prepareNear(block[0], block[1]);
-            }
-            assertEquals(1, requests.get(), "Expected zero additional requests during the cooldown -- no burst, no duplicate fetch");
+            tileSource.enqueueLookahead(p1Lat, p1Lon); // enqueues P1's 8 neighbors, dequeues+attempts the tracked cell -- declined (clock still at t0, deadline is t0+5s from request #1)
+            assertEquals(1, requests.get(), "Expected the lookahead attempt to be declined (still within the real 5s cooldown), not a new request");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(trackedCellRepLat, trackedCellRepLon),
+                    "Expected the tracked cell to stay genuinely pending after being declined");
 
-            Thread.sleep(250); // past the 200ms deadline
+            // Advance the controlled clock past the 5s deadline -- no real sleep.
+            tileSource.setClockForTests(java.time.Clock.fixed(t0.plusSeconds(6), java.time.ZoneOffset.UTC));
 
-            generator.prepareNear(block[0], block[1]); // the still-queued (never lost) neighbor is now eligible
-            assertEquals(2, requests.get(), "Expected exactly one more request once the cooldown genuinely elapsed -- the declined entry was retained, not lost, and not fetched more than once");
+            // P2 is far enough from P1 that their Moore neighborhoods share NO cells -- this call's
+            // own enqueue-scan cannot possibly have (re-)added the tracked cell itself. If the
+            // tracked job dequeued here is still the SAME retained one, not a fresh duplicate, this
+            // proves retention rather than drop-and-rescan.
+            double p2Lat = 80.005, p2Lon = -140.005;
+            tileSource.enqueueLookahead(p2Lat, p2Lon);
+
+            assertEquals(2, requests.get(), "Expected exactly one more request once the clock genuinely passed the deadline");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(trackedCellRepLat, trackedCellRepLon),
+                    "Expected the originally-tracked, retained cell specifically to now be ready -- not lost, and not fetched more than once");
         } finally {
             stub.stop(0);
         }

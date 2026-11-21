@@ -85,6 +85,18 @@ public final class RoadTileSource {
      * cell stays retryable afterward.
      */
     private volatile Instant nextEligibleRequestAt = Instant.EPOCH;
+    /**
+     * Defaults to the real system clock; overridable only via {@link #setClockForTests} so a test
+     * can advance time deterministically (MINECRAFT-566 comment 55466: "add a controlled clock for
+     * the actual rate limit") instead of actually sleeping out a multi-second production interval
+     * or, worse, using an artificially short one that never really exercises the real cadence.
+     */
+    private volatile java.time.Clock clock = java.time.Clock.systemUTC();
+
+    /** Test-only: replace the clock {@link #nextEligibleRequestAt} is measured against, so a test can advance time without a real sleep. */
+    void setClockForTests(java.time.Clock testClock) {
+        this.clock = testClock;
+    }
 
     /**
      * Cells enqueued for best-effort, rate-limited catch-up fetching -- MINECRAFT-566 comment
@@ -281,15 +293,26 @@ public final class RoadTileSource {
 
         long[] next = lookaheadQueue.pollFirst();
         if (next == null) return;
-        queuedCellKeys.remove((next[0] << 32) ^ (next[1] & 0xFFFFFFFFL));
+        long nextKey = (next[0] << 32) ^ (next[1] & 0xFFFFFFFFL);
         // Cell-center representative point; which exact point within the cell doesn't matter since
         // waysForCell resolves it back to the same cell boundaries either way.
         double representativeLat = next[0] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
         double representativeLon = next[1] * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
-        // If not yet rate-limit-eligible, waysForCell declines silently (no marker written, no
-        // exception) -- this cell is no longer queued, but a future enqueueLookahead call for an
-        // overlapping area will see it's still uncached and re-queue it then.
         waysForCell(representativeLat, representativeLon);
+        // MINECRAFT-566 comment 55466: an earlier version removed this cell from queuedCellKeys
+        // unconditionally here, relying on a LATER enqueueLookahead call for an overlapping area to
+        // rediscover it was still uncached and re-queue it -- which happened to work in a test that
+        // kept calling this for the same overlapping neighborhood, but could not actually
+        // distinguish "the original job was retained" from "it was dropped, then a brand new job
+        // for the same cell got added later." If the fetch attempt above didn't actually resolve
+        // this cell (declined as not-yet-eligible, or a genuine failure -- either way it's still
+        // PENDING afterward), put the SAME job back at the front of the queue and keep it marked
+        // queued, so it is the next thing tried again, not silently dropped and left to chance.
+        if (cellState(representativeLat, representativeLon) == CellState.PENDING) {
+            lookaheadQueue.addFirst(next);
+        } else {
+            queuedCellKeys.remove(nextKey); // resolved (ready or confirmed-empty) -- permanently done, not retried
+        }
     }
 
     /** Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss, not an error. */
@@ -338,7 +361,7 @@ public final class RoadTileSource {
             throws IOException {
         String body;
         synchronized (networkLock) {
-            if (Instant.now().isBefore(nextEligibleRequestAt)) {
+            if (clock.instant().isBefore(nextEligibleRequestAt)) {
                 throw new NotYetEligibleException();
             }
             String query = """
@@ -362,7 +385,7 @@ public final class RoadTileSource {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while fetching road tile", e);
             }
-            Instant afterSteadyInterval = Instant.now().plus(minRequestInterval);
+            Instant afterSteadyInterval = clock.instant().plus(minRequestInterval);
             nextEligibleRequestAt = afterSteadyInterval;
             if (response.statusCode() == 429 || response.statusCode() == 503) {
                 // overpass.ch docs (https://overpass.ch/docs, "Limits & plans"/"Errors"): both
@@ -371,7 +394,7 @@ public final class RoadTileSource {
                 // from this instance, whichever (the steady interval or this) is later.
                 response.headers().firstValue("Retry-After").ifPresent(value -> {
                     try {
-                        Instant afterRetryAfter = Instant.now().plusSeconds(Long.parseLong(value.trim()));
+                        Instant afterRetryAfter = clock.instant().plusSeconds(Long.parseLong(value.trim()));
                         if (afterRetryAfter.isAfter(nextEligibleRequestAt)) nextEligibleRequestAt = afterRetryAfter;
                     } catch (NumberFormatException ignored) {
                         // Retry-After may also be an HTTP-date per RFC 9110; not parsed here -- the

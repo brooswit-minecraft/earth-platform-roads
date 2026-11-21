@@ -235,10 +235,25 @@ records what MINECRAFT-566 actually changed and, as importantly, what it did not
   asserts a POST matching that cell's exact bbox and that it ends up `READY` under that key (not
   merely found via the neighbor scan), uses MOVING prepare points that never directly enter the
   successor's cell (so it can only be reached through the lookahead queue), and generates a real
-  block past the first way's own endpoint. `.aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests`
-  (also 55464) proves a declined-as-not-yet-eligible queue entry is retained (fetched successfully
-  once the cooldown genuinely elapses) rather than lost, and that repeated calls during the same
-  cooldown window add zero duplicate requests. `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior`
+  block past the first way's own endpoint.
+  **A real bug in the queue itself, found by comment 55466 reviewing the test rather than the
+  code:** the original `enqueueLookahead` removed a dequeued cell from `queuedCellKeys` 55466
+  unconditionally, whether or not the fetch attempt actually resolved it -- relying on a LATER
+  `enqueueLookahead` call for an OVERLAPPING area to rediscover the cell was still uncached and
+  re-queue it. The first cooldown test called the lookahead repeatedly over the exact same
+  overlapping neighborhood, which happened to work but could not distinguish "the original job was
+  retained" from "it was silently dropped, then a brand-new job for the same cell got added later."
+  Fixed: a dequeued cell whose fetch attempt did not resolve it (declined as not-yet-eligible, or a
+  genuine failure -- either way still `PENDING` afterward) is put back at the front of the queue
+  and stays marked queued, so it is the SAME retained job tried again, never silently dropped.
+  Added `RoadTileSource.setClockForTests`/`clock` (defaults to the real system clock) so a test can
+  advance time deterministically instead of sleeping out -- or, worse, shortening -- the real
+  multi-second production interval.
+  `.aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests` (rewritten for 55466)
+  proves this properly: the real 5-second-order interval (not shortened), a controlled clock (no
+  real sleep), and critically a DRAIN call that scans a totally different, non-overlapping
+  neighborhood -- so the retained job cannot have been freshly re-added by that call's own scan,
+  only genuinely retained from before. `.aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior`
   (55462) matches his own live, read-only diagnosis directly: a pre-existing, install-wide-cache
   neighbor entry from before the fresh test world even started, a multi-segment turning way, a
   real painted block deep in the still-fully-pending own cell's interior, not just at the seam.
