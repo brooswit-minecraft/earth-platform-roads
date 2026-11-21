@@ -80,7 +80,7 @@ public final class RoadCanopyClearance {
                 int naturalY = generator.surfaceY(worldX, worldZ);
                 int waterY = generator.waterY(worldX, worldZ);
                 if (waterY != SurfaceGenerator.DRY && waterY >= naturalY) continue; // underwater: no road deck here either, matching EarthGeneratorRoadMixin's own skip
-                int groundY = RoadDeck.deckY(generator, grid, worldX, worldZ); // the raised-dip-fill floor, never below naturalY
+                int groundY = RoadDeck.deckY(generator, grid, segment, worldX, worldZ); // the raised-dip-fill floor, never below naturalY
                 int firstLocalY = Math.max(0, groundY + 1 - baseY); // strictly ABOVE the deck -- never the deck itself, never below it
                 for (int localY = firstLocalY; localY <= 15; localY++) {
                     BlockState state = section.getBlockState(lx, localY, lz);

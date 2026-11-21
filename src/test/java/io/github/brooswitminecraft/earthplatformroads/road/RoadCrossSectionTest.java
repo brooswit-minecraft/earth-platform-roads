@@ -136,6 +136,117 @@ class RoadCrossSectionTest {
         assertTrue(checked > 0);
     }
 
+    /**
+     * MINECRAFT-566 comment 55513's own deterministic cross-slope acceptance case, run against
+     * {@link RoadDeck#sharedHeight} (the pure geometry/sampling core {@code RoadDeck.deckY}
+     * delegates to) rather than a real generator -- lets this run in the plain (non-modded) JUnit
+     * JVM, same as the rest of this file. A straight 12-block-wide paved road running along Z, with
+     * a real cross/side slope (natural height rises with X, constant along Z): the shared height at
+     * every station must be the max across the road's OWN paved width (never the shoulder's own
+     * higher ground just outside it), giving a perfectly flat transverse deck -- John's own named
+     * "twelve 75s," not the ramped, still-stepped result ({@code [70,71,...,76,76,...]}) the earlier
+     * isotropic-box version produced (independently reproduced on a real compiled build, comment
+     * 55514).
+     */
+    @Test
+    void sharedHeightIsFlatAcrossARealCrossSlopeNotRampedByAnIsotropicWindow() {
+        MercatorGrid grid = GRID;
+        // A perfectly vertical (along Z) centerline at block X=6.0, via round-tripping through the
+        // grid's own inverse projection -- exact in block space regardless of this grid's scale.
+        GeoPoint a = grid.geographic(6.0, 0.0), b = grid.geographic(6.0, 100.0);
+        // pavedHalfWidthBlocks=5.5 makes the paved footprint exactly columns x=0..11 (centers 0.5..11.5,
+        // symmetric around X=6.0, max distance 5.5), and x=-1/x=12 (distance 6.5) exactly the shoulder.
+        RoadSegment segment = new RoadSegment(1L, "cross-slope test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+
+        int worldZ = 50; // well clear of either endpoint, so projection never clamps
+        java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight = (x, z) -> 64 + x;
+        java.util.function.BiPredicate<Integer, Integer> sameRoad =
+                (x, z) -> segment.crossSectionAt(grid, x, z) != CrossSection.OFF_ROAD;
+
+        int[] actual = new int[12];
+        for (int x = 0; x <= 11; x++) {
+            actual[x] = RoadDeck.sharedHeight(segment, grid, x, worldZ, naturalHeight, sameRoad);
+        }
+        for (int x = 0; x <= 11; x++) {
+            assertEquals(75, actual[x], "Expected a flat shared height of 75 (the paved width's own max, at x=11) "
+                    + "at every column across this cross-slope station, got " + java.util.Arrays.toString(actual) + " at x=" + x);
+        }
+
+        // The uphill shoulder (x=12, natural height 76) must never pull the shared height up past 75.
+        assertEquals(RoadSegment.CrossSection.SHOULDER, segment.crossSectionAt(grid, 12, worldZ), "Sanity: x=12 must actually be the shoulder");
+        assertEquals(RoadSegment.CrossSection.SHOULDER, segment.crossSectionAt(grid, -1, worldZ), "Sanity: x=-1 must actually be the shoulder");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55513's explicit ask ("add... a diagonal... case before calling the
+     * deck ready"): the same cross-slope property, on a road that is NOT axis-aligned, where the
+     * sampling direction is a genuine diagonal unit vector rather than a clean (1,0)/(0,1). Exact
+     * equality is not asserted (diagonal sampling rounds to the nearest block, so two adjacent
+     * stations can legitimately land on a slightly different set of integer samples) -- instead this
+     * checks the two properties that matter: the shared height is never below natural ground, and it
+     * changes gradually along the road's own length (no sudden, un-physical jump), for a real
+     * diagonal cross-slope.
+     */
+    @Test
+    void sharedHeightStaysBoundedAndChangesGraduallyAlongADiagonalRoad() {
+        MercatorGrid grid = GRID;
+        GeoPoint a = grid.geographic(0.0, 0.0), b = grid.geographic(200.0, 200.0); // a genuine 45-degree diagonal
+        RoadSegment segment = new RoadSegment(1L, "diagonal test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 4.0, false, false, 0);
+        // A cross-slope transverse to this diagonal: (x - z) is constant ALONG the (1,1) direction
+        // and varies linearly ACROSS it, the diagonal analogue of the straight test's "height = 64+x".
+        java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight = (x, z) -> 64 + Math.floorDiv(x - z, 2);
+        java.util.function.BiPredicate<Integer, Integer> sameRoad =
+                (x, z) -> segment.crossSectionAt(grid, x, z) != CrossSection.OFF_ROAD;
+
+        Integer previous = null;
+        boolean checkedAny = false;
+        for (int t = 50; t <= 150; t++) {
+            if (segment.crossSectionAt(grid, t, t) == CrossSection.OFF_ROAD) continue;
+            checkedAny = true;
+            int shared = RoadDeck.sharedHeight(segment, grid, t, t, naturalHeight, sameRoad);
+            int natural = naturalHeight.apply(t, t);
+            assertTrue(shared >= natural, "Shared height must never be below natural ground on a diagonal road, at t=" + t);
+            if (previous != null) {
+                assertTrue(Math.abs(shared - previous) <= 1,
+                        "Expected the shared height to change gradually along a smooth diagonal grade, got a jump from " + previous + " to " + shared + " at t=" + t);
+            }
+            previous = shared;
+        }
+        assertTrue(checkedAny, "Expected at least one covered station along the diagonal centerline itself");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55513's explicit ask ("add... a... cube-seam case before calling the
+     * deck ready"): the SAME straight cross-slope fixture as
+     * {@code sharedHeightIsFlatAcrossARealCrossSlopeNotRampedByAnIsotropicWindow}, repositioned so
+     * its 12-column paved width straddles a real 16-block cube boundary (columns 10-21, crossing
+     * x=15/16) -- {@code RoadDeck.sharedHeight} is a pure function of coordinates with no concept of
+     * a cube at all, so this is mostly a structural regression guard confirming that stays true
+     * (the flat result must not care which side of x=15/16 a sample happens to fall on).
+     */
+    @Test
+    void sharedHeightStaysFlatAcrossARealCubeBoundary() {
+        MercatorGrid grid = GRID;
+        GeoPoint a = grid.geographic(16.0, 0.0), b = grid.geographic(16.0, 100.0);
+        RoadSegment segment = new RoadSegment(1L, "cube-seam test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+        int worldZ = 50;
+        java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight = (x, z) -> 64 + (x - 10);
+        java.util.function.BiPredicate<Integer, Integer> sameRoad =
+                (x, z) -> segment.crossSectionAt(grid, x, z) != CrossSection.OFF_ROAD;
+
+        boolean sawBothSidesOfTheBoundary = false;
+        int expected = 64 + (21 - 10); // the paved width's own max, at x=21
+        for (int x = 10; x <= 21; x++) {
+            int shared = RoadDeck.sharedHeight(segment, grid, x, worldZ, naturalHeight, sameRoad);
+            assertEquals(expected, shared, "Expected a flat shared height at every column straddling the cube boundary, got a mismatch at x=" + x);
+            if ((x >> 4) != (10 >> 4)) sawBothSidesOfTheBoundary = true;
+        }
+        assertTrue(sawBothSidesOfTheBoundary, "Sanity: expected this fixture's own width to actually straddle a cube boundary (x=15/16)");
+    }
+
     @Test
     void layeredGravelHasNoFallingBlockPhysics() {
         // LayeredBlock extends plain Block, not FallingBlock -- confirmed structurally here so a

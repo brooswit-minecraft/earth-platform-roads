@@ -213,6 +213,17 @@ bump: minor
   clearance floor now uses this same raised height, so the deck/support this builds is not
   immediately cleared out from under itself; `SurfaceGeneratorRoadClearanceMixin` calls
   `RoadDeck.buildAll` before `RoadCanopyClearance.clear` at that one seam.
+- Fixed a real cross-slope bug in the flat-deck prototype, found by John's independent compiled-build
+  reproduction against a deterministic fixture (comments 55513/55514): the original isotropic-box
+  `deckY` reached further ALONG a road than ACROSS it, so a road running transverse to a hillside
+  slope got a ramped, still-stepped result instead of a flat deck. Reworked around a new
+  `RoadSegment.projectOnto` (nearest centerline point + tangent): the shared deck height for a
+  column is now the max natural height sampled ACROSS the road's own paved width at that exact point
+  along it ("station"), restricted to the SAME segment (never a nearby unrelated road) and
+  PAVED/CENTERLINE only (never the uphill shoulder). Verified against John's own exact fixture
+  (twelve columns, all correctly returning the expected shared height), plus new diagonal and
+  cube-boundary-straddling cases and a vertical-seam regenerate-identically check. Also roughly an
+  85% reduction in per-column sample count versus the old isotropic box.
 
 ### Known gaps
 - The flat-deck prototype (`RoadDeck`) does not extend support under the gravel shoulder -- a

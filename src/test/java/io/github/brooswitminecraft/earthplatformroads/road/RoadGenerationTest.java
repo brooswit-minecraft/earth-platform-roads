@@ -48,6 +48,7 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RoadGenerationTest {
     private static EarthGenerator generator;
+    private static MappedRegistry<Biome> biomeRegistry;
     /** A point on the pinned centerline (data/earthplatformroads/roads/regions/yosemite_valley.json), -119.6367003,37.7206145. */
     private static final double ON_ROAD_LAT = 37.7206145, ON_ROAD_LON = -119.6367003;
 
@@ -91,6 +92,7 @@ class RoadGenerationTest {
                 TerrariumTileSource.AWS_TERRAIN_TILES, cache.resolve(TerrariumTileSource.DATASET_ID), true, 512, 6, Duration.ofSeconds(20));
         EarthSettings settings = EarthSettings.at(EarthSettings.DEFAULT_LATITUDE, EarthSettings.DEFAULT_LONGITUDE);
         generator = new EarthGenerator(4747L, biomes, settings, tiles, null, null, null);
+        biomeRegistry = biomes;
     }
 
     private static net.minecraft.world.level.block.state.BlockState surfaceBlockAt(double lat, double lon) {
@@ -363,7 +365,8 @@ class RoadGenerationTest {
         // natural height, now that a nearby higher road column can raise this column's own deck --
         // compute the SAME floor the clearance pass itself will use, rather than assuming it equals
         // natural ground height.
-        int floor = RoadDeck.deckY(generator, generator.grid(), x, z);
+        var onRoadSegment = RoadNetwork.segmentCoveringColumn(generator.grid(), x, z);
+        int floor = RoadDeck.deckY(generator, generator.grid(), onRoadSegment, x, z);
         int cubeX = x >> 4, cubeY = floor >> 4, cubeZ = z >> 4;
         int localFloorY = floor & 15;
         assertTrue(localFloorY <= 13, "Expected the pinned centerline column to leave room for two blocks above its clearance floor "
@@ -425,7 +428,8 @@ class RoadGenerationTest {
             covered[i] = RoadNetwork.coversColumn(grid, x, MEASURED_ROW_Z);
             if (!covered[i]) continue;
             natural[i] = generator.surfaceY(x, MEASURED_ROW_Z);
-            deck[i] = RoadDeck.deckY(generator, grid, x, MEASURED_ROW_Z);
+            var rowSegment = RoadNetwork.segmentCoveringColumn(grid, x, MEASURED_ROW_Z);
+            deck[i] = RoadDeck.deckY(generator, grid, rowSegment, x, MEASURED_ROW_Z);
             assertTrue(deck[i] >= natural[i], "deckY must never be below natural ground at dx=" + dx);
         }
 
@@ -449,7 +453,8 @@ class RoadGenerationTest {
         int[] onRoad = generator.block(ON_ROAD_LAT, ON_ROAD_LON);
         int x = onRoad[0], z = onRoad[1];
         int naturalY = generator.surfaceY(x, z);
-        int deckY = RoadDeck.deckY(generator, generator.grid(), x, z);
+        var onRoadSegment = RoadNetwork.segmentCoveringColumn(generator.grid(), x, z);
+        int deckY = RoadDeck.deckY(generator, generator.grid(), onRoadSegment, x, z);
         assertTrue(deckY > naturalY, "Expected the pinned centerline column to actually be raised by a nearby higher road column; "
                 + "if the real DEM/road geometry changed, re-pin a column this logic actually raises rather than adjusting this test to fit");
 
@@ -467,6 +472,53 @@ class RoadGenerationTest {
             var supportBlock = section.getBlockState(localX, supportLocalY, localZ);
             assertTrue(supportBlock.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS),
                     "Expected stone-brick support directly above natural ground, got " + supportBlock);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55513's explicit ask ("verify one vertical-seam save/reopen"): a
+     * synthetic support/deck column whose natural ground and deck top sit in DIFFERENT cubes (a
+     * genuine vertical cube seam), built via {@link RoadDeck#buildSupportAndDeck} directly against
+     * two real, freshly-constructed {@code LevelChunkSection}s. This harness has no real
+     * {@code ServerLevel}/save-to-disk path to drive an actual save/reopen through (a disclosed,
+     * standing test gap for anything needing one -- see {@code docs/design.md}'s own note); building
+     * each cube's own section FRESH and independently, exactly as a real reopen regenerates/loads
+     * each cube on its own, is the closest proxy available here. Natural-ground cube must show only
+     * support up to its own ceiling (the deck top has not yet appeared); the cube above must show the
+     * deck top at the right local Y with support filling the rest of its own floor below it.
+     */
+    @Test
+    void supportAndDeckAssembleCorrectlyAcrossARealVerticalCubeSeam() {
+        int naturalY = 10; // local Y within cube 0 -- deliberately low, far from either cube's own ceiling/floor
+        int deckY = 20;    // local Y 4 within cube 1 -- a genuine cross-cube-boundary raise (deckY - naturalY = 10)
+        assertTrue(naturalY >> 4 != deckY >> 4, "Sanity: naturalY and deckY must actually land in different cubes");
+
+        LevelChunkSection lowerCube = new LevelChunkSection(biomeRegistry);
+        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerCube, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        for (int localY = (naturalY & 15) + 1; localY <= 15; localY++) {
+            var state = lowerCube.getBlockState(0, localY, 0);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS),
+                    "Expected support all the way to the lower cube's own ceiling (no deck top yet), got " + state + " at local Y=" + localY);
+        }
+
+        LevelChunkSection upperCube = new LevelChunkSection(biomeRegistry);
+        RoadDeck.buildSupportAndDeck(deckY >> 4, upperCube, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        int deckLocalY = deckY & 15;
+        for (int localY = 0; localY < deckLocalY; localY++) {
+            var state = upperCube.getBlockState(0, localY, 0);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS),
+                    "Expected support filling the upper cube's own floor below the deck top, got " + state + " at local Y=" + localY);
+        }
+        var deckBlock = upperCube.getBlockState(0, deckLocalY, 0);
+        assertTrue(deckBlock.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE),
+                "Expected the deck top itself in the upper cube, got " + deckBlock);
+
+        // "Reopening" (regenerating each cube's own section fresh again) must give the identical result.
+        LevelChunkSection lowerAgain = new LevelChunkSection(biomeRegistry);
+        RoadDeck.buildSupportAndDeck(naturalY >> 4, lowerAgain, 0, 0, naturalY, deckY, RoadSegment.CrossSection.PAVED);
+        for (int localY = 0; localY <= 15; localY++) {
+            assertEquals(lowerCube.getBlockState(0, localY, 0), lowerAgain.getBlockState(0, localY, 0),
+                    "Expected the lower cube's own slice to regenerate identically, at local Y=" + localY);
         }
     }
 }

@@ -853,6 +853,54 @@ running Minecraft client); shoulder support (above); junction-specific behavior 
 differently-raised roads cross. This is explicitly a prototype, consistent with the ticket's own
 "not an all-or-nothing rewrite."
 
+## MINECRAFT-566: cross-slope acceptance for the flat deck (comment 55513/55514)
+
+John independently compiled `a63063e`'s `RoadDeck` against a deterministic fixture and confirmed,
+precisely, what the design note above already flagged as untested: a straight 12-block-wide paved
+road running along Z with a real cross/side slope (natural height rising with X, constant along Z)
+produced `[70,71,72,73,74,75,76,76,76,76,76,76]` -- a ramped, still-stepped result, not the flat
+"twelve 75s" 55485 actually asked for. The isotropic box's reach was simply wrong-shaped: it looks
+further ALONG the road than ACROSS it, which fills a dip along the road's own length but cannot
+flatten a slope running transverse to it.
+
+**Fixed** by reworking `deckY` (now `RoadDeck.sharedHeight`, with `deckY` as its thin
+production-facing wrapper) to use `RoadSegment.projectOnto` -- a new method returning the nearest
+point on the centerline to a column (its "station") and the unit tangent there. For a column, the
+shared height is now the max natural height sampled ACROSS the road's own paved width at that exact
+station (along the perpendicular to the tangent, in 0.5-block steps so a diagonal road's own columns
+are not aliased), restricted to samples that are still the SAME segment (`.equals`, never a nearby
+unrelated road -- addresses 55513's own "no influence from... a nearby unrelated road") and still
+PAVED/CENTERLINE (never the shoulder -- addresses "no influence from the uphill shoulder"). Every
+column sharing a station therefore computes the identical shared height, which is what makes the
+deck flat ACROSS the road while a DIFFERENT station still gets its own, independently-computed
+height -- longitudinal grade along the road is preserved, only the transverse profile is flattened.
+
+**Verified** against John's own exact fixture: `RoadCrossSectionTest.sharedHeightIsFlatAcrossARealCrossSlopeNotRampedByAnIsotropicWindow`
+reproduces it precisely (pavement x=0-11, gravel shoulder at x=-1/12, natural height 64+x) and
+asserts all twelve columns return 75, matching his own named acceptance exactly, not an
+approximation. Two more cases from his explicit ask: `.sharedHeightStaysBoundedAndChangesGraduallyAlongADiagonalRoad`
+(a genuine 45-degree road; exact equality is not meaningful for a diagonal, since sampling rounds to
+the nearest block, so this instead checks the height is never below natural ground and never jumps
+more than one block between adjacent stations) and `.sharedHeightStaysFlatAcrossARealCubeBoundary`
+(the same straight fixture repositioned so its paved width straddles x=15/16). All three run as pure
+geometry (no Minecraft bootstrap, no live `RoadNetwork` index) by extracting `RoadDeck.sharedHeight`
+with the natural-height lookup and the same-road check both injected -- `RoadDeck.deckY` itself
+supplies the real ones (`EarthGenerator::surfaceY`, the live spatial index) in production.
+`RoadGenerationTest.supportAndDeckAssembleCorrectlyAcrossARealVerticalCubeSeam` covers 55513's
+"verify one vertical-seam save/reopen" ask: a synthetic column whose natural ground and deck top
+land in different cubes, built via two independently-constructed `LevelChunkSection`s (the closest
+proxy available -- this harness has no real `ServerLevel`/save-to-disk path, a disclosed, standing
+gap noted elsewhere in this document), confirmed to regenerate identically on a repeat build.
+
+**Performance** (per 55513's own ask, "share computation... if it remains expensive," explicitly
+named as a source-based operation count rather than measured timing, since this environment has no
+profiler and no running client to measure a representative section against): the transverse sampler
+visits roughly `2 * pavedHalfWidthBlocks / 0.5 + 1` points per column (about 23 for a 5.5-half-width
+road) versus the old isotropic box's fixed 13x13-1=168 neighbor checks -- an roughly 85% reduction
+per call, and `RoadDeck.buildAll`/`RoadCanopyClearance.clear` each still call this once per covered
+column (reusing the exact same deterministic function rather than caching a value between them, per
+the existing "pure function" pattern this whole mixin pair already relies on for correctness).
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

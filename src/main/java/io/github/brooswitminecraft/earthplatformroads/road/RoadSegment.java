@@ -91,16 +91,52 @@ public record RoadSegment(
      * never returned; callers compare against {@link #pavedHalfWidthBlocks}/{@link #totalHalfWidthBlocks()} themselves.
      */
     public double distanceBlocks(MercatorGrid grid, int x, int z) {
+        return projectOnto(grid, x, z).distance();
+    }
+
+    /**
+     * MINECRAFT-566 comment 55513 (cross-slope acceptance for the flat deck): the nearest point on
+     * this centerline to column {@code (x,z)}, and the unit tangent direction of whichever polyline
+     * leg that nearest point falls on -- what {@link RoadDeck} needs to sample ACROSS the road's own
+     * width at a single STATION (a fixed point along its length), rather than an isotropic box that
+     * does not know which direction is "along the road" versus "across it".
+     */
+    public record Projection(double nearestX, double nearestZ, double tangentX, double tangentZ, double distance) {
+        /** Unit perpendicular to {@link #tangentX}/{@link #tangentZ} -- "across the road" at this exact station. */
+        public double perpendicularX() { return -tangentZ; }
+        public double perpendicularZ() { return tangentX; }
+    }
+
+    public Projection projectOnto(MercatorGrid grid, int x, int z) {
         double px = x + 0.5, pz = z + 0.5;
-        double best = Double.MAX_VALUE;
+        double bestDistSq = Double.MAX_VALUE;
+        double bestNx = 0, bestNz = 0, bestTx = 1, bestTz = 0;
         double prevBx = grid.blockX(centerline[0]), prevBz = grid.blockZ(centerline[0]);
         for (int i = 1; i < centerline.length; i++) {
             double bx = grid.blockX(centerline[i]), bz = grid.blockZ(centerline[i]);
-            best = Math.min(best, distanceToSegment(px, pz, prevBx, prevBz, bx, bz));
+            double dx = bx - prevBx, dz = bz - prevBz;
+            double lengthSquared = dx * dx + dz * dz;
+            double t = lengthSquared == 0 ? 0 : ((px - prevBx) * dx + (pz - prevBz) * dz) / lengthSquared;
+            t = Math.clamp(t, 0, 1);
+            double nx = prevBx + t * dx, nz = prevBz + t * dz;
+            double distSq = (px - nx) * (px - nx) + (pz - nz) * (pz - nz);
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
+                bestNx = nx;
+                bestNz = nz;
+                double length = Math.sqrt(lengthSquared);
+                if (length > 1e-9) {
+                    bestTx = dx / length;
+                    bestTz = dz / length;
+                } else {
+                    bestTx = 1;
+                    bestTz = 0;
+                }
+            }
             prevBx = bx;
             prevBz = bz;
         }
-        return best;
+        return new Projection(bestNx, bestNz, bestTx, bestTz, Math.sqrt(bestDistSq));
     }
 
     /** The WHOLE footprint, paved surface and gravel shoulder alike -- see {@link #crossSectionAt}. */
@@ -190,13 +226,4 @@ public record RoadSegment(
         return shared;
     }
 
-    /** Point-to-segment distance; the segment degenerates to point {@code (ax,az)} when it has zero length. */
-    private static double distanceToSegment(double px, double pz, double ax, double az, double bx, double bz) {
-        double dx = bx - ax, dz = bz - az;
-        double lengthSquared = dx * dx + dz * dz;
-        double t = lengthSquared == 0 ? 0 : ((px - ax) * dx + (pz - az) * dz) / lengthSquared;
-        t = Math.clamp(t, 0, 1);
-        double nx = ax + t * dx, nz = az + t * dz;
-        return Math.hypot(px - nx, pz - nz);
-    }
 }
