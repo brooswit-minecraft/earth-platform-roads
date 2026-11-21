@@ -1464,6 +1464,50 @@ Per John's own explicit instruction, the other two fixes from comment 55562 (the
 dedup, the `RoadTileSource` memory cache) were NOT held up waiting on this -- both ship unchanged
 in the same commit as these two fixes, on the same already-opened PR #4. 98/98 tests pass.
 
+## MINECRAFT-566: the eviction-skip optimization above was itself unsafe, and is reverted (comment 55565)
+
+John's own independent native QA of the exact commit the previous section describes (5bb0b6c)
+reproduced a real late-publication race: a `SurfaceGenerator.column()` computation already in
+flight, parked just before its own internal publish, released only AFTER the eviction gate's own
+eviction had run and verified the shared cache empty, still inserted a stale, pre-resolution
+decision into the now-fresh slot. Persisted grass survived a reopen even though the real cell was
+genuinely READY with exactly one real fetch.
+
+This is the SAME residual race comment 55496's own doc section already discloses (never eliminated
+there either, only narrowed) -- but the skip-on-unchanged-generation optimization the previous two
+sections describe removed a property the ORIGINAL unconditional design always had for free:
+self-healing. Under unconditional eviction, every single sibling touch re-evicted the column
+regardless, so a stale publish from this exact race could only ever survive until the very NEXT
+touch for that column -- a tiny, bounded window. The skip optimization broke that: once a column's
+own eviction was recorded as "done for this generation," a stale publish landing after it could
+persist until some ENTIRELY UNRELATED cell resolved anywhere in the world happened to bump the
+generation counter again -- potentially a very long time. This is a genuine correctness
+regression the optimization introduced, not merely the same narrow race window restated.
+
+**The fix:** per John's own explicit offered fallback -- "repair per actual memo/build provenance,
+or offer a separate fast low-risk unique-state optimization while preserving current freshness
+behavior" -- the per-column/per-generator generation tracking is removed entirely, rather than
+attempting a provenance-based repair (which would need visibility into `SurfaceGenerator`'s own
+internal cache-write identity this mod does not have -- the same reason `sectionLooksStale`'s own
+retry loop elsewhere in this codebase is deliberately bounded rather than a full fix).
+`RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged` is renamed to
+`evictStaleSurfaceDecisionIfRelevant` and simplified to always evict when the cube is naturally
+relevant -- exactly the original unconditional design's own self-healing guarantee, restored. Only
+the relevance gate itself (comment 55562's own change, never implicated in either round's bug
+report) is kept.
+
+The other two comment 55562 fixes (the one-pass scan dedup, the `RoadTileSource` memory cache for
+resolved tiles) are untouched by this revert and continue to ship -- per John's own explicit "do
+not wait for these findings" instruction, this round touches only the eviction-skip mechanism.
+
+**Disclosed cost:** a relevant column's own `SurfaceGenerator.Column` cache is now re-evicted (and
+the natural-height survey it drives re-run) on every sibling touch again -- the same cost the
+original unconditional design always paid. This is a deliberate trade: two independent rounds of
+native QA found the skip optimization unsafe, and a correctness regression (silently-wrong, still-
+saved road terrain) is worse than the performance it bought back. A provenance-based version that
+could safely skip without this risk is left as a possible future refinement, not attempted here.
+97/97 tests pass.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

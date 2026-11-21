@@ -564,25 +564,6 @@ public final class RoadTileSource {
     }
 
     /**
-     * MINECRAFT-566 comment 55562: a monotonic counter bumped exactly when a cell transitions from
-     * "not yet known resolved by this instance" to known READY or CONFIRMED_EMPTY -- i.e. every time
-     * {@link #readDiskCacheIfPresent} or {@link #attemptFetch} populates {@link #memory} for a key
-     * it did not already hold. Deliberately coarse (one counter for every cell this instance ever
-     * tracks, not per-cell): {@code RoadPrefetch}'s own stale-surface-eviction gate uses this as a
-     * cheap, conservative "has anything changed since I last evicted this column" signal -- a
-     * resolution anywhere can cause one extra, harmless eviction for an unrelated column, but the
-     * counter can never fail to advance when a column's OWN relevant cell actually resolves, which
-     * is the one direction that must never be wrong (under-eviction would regress the already-proven
-     * stale-column repaint from comments 55486/55487/55492/55496).
-     */
-    private final AtomicLong resolvedGeneration = new AtomicLong();
-
-    /** The current value of {@link #resolvedGeneration} -- see that field's own doc. */
-    public long resolvedGeneration() {
-        return resolvedGeneration.get();
-    }
-
-    /**
      * Every mapped way already cached for the cell covering {@code lat,lon} -- never fetches, never
      * blocks, never touches the network. This is what {@link RoadNetwork#candidatesNear} calls from
      * the hot generation path ({@code EarthGeneratorRoadMixin}'s {@code surface()} hook): per
@@ -702,7 +683,6 @@ public final class RoadTileSource {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
         memory.put(key, fetched);
-        resolvedGeneration.incrementAndGet(); // a fresh fetch resolving this cell is a real data transition -- see that field's own doc
         consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
     }
@@ -778,8 +758,7 @@ public final class RoadTileSource {
     /**
      * Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss,
      * not an error. Every successful disk-validated load newly populates {@link #memory} (never a
-     * miss) and bumps {@link #resolvedGeneration} exactly once for that transition -- see that
-     * field's own doc for why.
+     * miss).
      */
     private List<RoadSegment> readDiskCacheIfPresent(long key, Path readyFile, Path emptyFile) {
         List<RoadSegment> cached = memory.get(key);
@@ -787,13 +766,11 @@ public final class RoadTileSource {
         try {
             if (Files.isRegularFile(emptyFile)) {
                 memory.put(key, List.of());
-                resolvedGeneration.incrementAndGet();
                 return List.of();
             }
             if (Files.isRegularFile(readyFile)) {
                 List<RoadSegment> ways = readCachedCell(readyFile);
                 memory.put(key, ways);
-                resolvedGeneration.incrementAndGet();
                 return ways;
             }
         } catch (IOException e) {

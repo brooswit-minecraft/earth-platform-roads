@@ -345,92 +345,50 @@ public final class RoadPrefetch {
      * call -- including every unsaved cube at ANY Y, sky and deep underground included -- so a tall
      * column's many cube-Y layers each evicted the SAME shared X/Z {@code SurfaceGenerator.Column}
      * cache the others had just populated, forcing every sibling to re-run the raw+road-aware survey
-     * from scratch. Fixed to evict only when BOTH: (1) {@code naturallyRelevant} (this exact cube's
-     * own natural-height relevance, now computed once per {@link #dispatchAndScanRelevantCells} or
-     * the cheap {@link #cubeContainsNaturalSurface} -- an irrelevant sibling has nothing a road
-     * decision could even apply to, so evicting for it is pure waste regardless of staleness), AND
-     * (2) something has actually changed since the last time THIS column was evicted -- "keep
-     * freshness on real data transition, not each sibling." Tracked via {@link RoadTileSource#resolvedGeneration()}:
-     * a coarse, global counter bumped whenever any cell anywhere newly resolves. Deliberately coarse
-     * rather than per-cell-precise -- an unrelated cell resolving can cause one harmless EXTRA
-     * eviction for this column, but the counter can never fail to advance when THIS column's own
-     * relevant cell actually resolves, which is the one direction that must never be wrong (under-
-     * eviction would regress the already-proven stale-column repaint from comments 55486/55487/
-     * 55492/55496 -- see {@code ServerCubeWorldRoadPrefetchMixin}'s own class doc for that history).
-     * The very FIRST call for a given column always evicts (no prior recorded generation to compare
-     * against) -- the same "free in the ordinary case, nothing legitimate to evict yet" guarantee
-     * the original unconditional eviction always provided for a column's first {@code produce()}
-     * call. {@code generator} must be a {@code null} tile source's own generation (no live source at
-     * all, e.g. cache-only or disabled): {@link RoadTileSource#resolvedGeneration()} is then always
-     * {@code 0}, so after the first eviction every later sibling at the same relevance correctly
-     * skips -- there is nothing that could ever "newly resolve" to justify re-evicting.
+     * from scratch. Fixed to evict only when {@code naturallyRelevant} (this exact cube's own
+     * natural-height relevance, now computed once per {@link #dispatchAndScanRelevantCells} or the
+     * cheap {@link #cubeContainsNaturalSurface} -- an irrelevant sibling has nothing a road decision
+     * could even apply to, so evicting for it is pure waste regardless of staleness).
      *
-     * <p><b>MINECRAFT-566 comment 55564, two real bugs found by John's own independent native
-     * QA/review of this exact method:</b>
+     * <p><b>MINECRAFT-566 comments 55564/55565, a two-round history of trying to ALSO skip
+     * eviction for a relevant sibling once "nothing has changed since," and reverting it:</b>
      *
-     * <p><b>Bug 1, cross-generator isolation:</b> the first version keyed this tracking by packed
-     * X/Z alone, in a single {@code static} map shared by EVERY {@code EarthGenerator} instance.
-     * Two separate generators at the same X/Z (two different worlds, or a fresh generator instance
-     * after a world reload -- the same "stale generator instance" scenario comments 55486/55487
-     * already established is real) could suppress EACH OTHER's first eviction: generator A records
-     * generation N for column (3,5); generator B, an entirely different instance/world that happens
-     * to also touch column (3,5) at its own generation N, would see "already evicted this exact
-     * generation" and wrongly skip -- even though B's OWN {@code SurfaceGenerator} cache was never
-     * touched by A's eviction at all (evicting is always scoped to the generator instance passed
-     * in). Fixed by scoping the tracking PER GENERATOR INSTANCE: a {@code WeakHashMap<EarthGenerator,
-     * ...>} outer map (identity-keyed -- confirmed by reading it, {@code EarthGenerator} is a real
-     * {@code final} class that never overrides {@code equals}/{@code hashCode}, so default reference
-     * identity is exactly right here, and is also why a discarded generator's own entry can be
-     * reclaimed once nothing else references it, bounding growth across world reloads -- "the map
-     * also grows as new columns are visited" is answered at the per-generator level this way, though
-     * a single long-lived generator's own per-column inner map still grows with the columns it
-     * actually visits, same as the original design intentionally accepted).
+     * <p>An earlier version of this method additionally tracked, per column, the
+     * {@link RoadTileSource#resolvedGeneration()} value at the last eviction, skipping the eviction
+     * entirely for a relevant sibling touch if nothing had resolved anywhere since -- "keep
+     * freshness on real data transition, not each sibling." Comment 55564's own independent native
+     * review found that version's tracking map was unscoped (shared across every generator instance,
+     * letting two separate worlds at the same X/Z suppress each other) and recorded the new
+     * generation BEFORE the eviction ran (widening a race window); a fix for both was written and
+     * shipped. <b>Comment 55565's own independent native QA then found the skip-on-unchanged
+     * optimization itself, even after that fix, is unsafe</b>: a real, reproduced "late-publication"
+     * control (a {@code SurfaceGenerator.column()} computation already in flight, parked just before
+     * its own internal publish, released only AFTER this method's own eviction had already run and
+     * verified the shared cache map empty) still inserted a stale, pre-resolution decision into the
+     * now-fresh slot -- exactly the residual race comment 55496's own doc section already discloses
+     * as real and only ever narrowed, never eliminated. The ORIGINAL unconditional-eviction design
+     * tolerated that exact same race by SELF-HEALING on every subsequent sibling touch (a stale
+     * publish could only survive until the very next {@code produce()} call for that column, since
+     * every call evicted again regardless); the skip-on-unchanged optimization removed that
+     * self-healing property, letting a stale publish persist until the next UNRELATED resolution
+     * anywhere in the world happened to bump the generation counter -- potentially a very long time,
+     * a genuine correctness regression, not merely a narrower race window.
      *
-     * <p><b>Bug 2, record-before-evict ordering:</b> the first version recorded the new generation
-     * BEFORE calling {@link #evictStaleSurfaceDecision}, leaving a window in which a competing,
-     * already-in-flight {@code column()} computation (the same residual race comment 55496's own
-     * doc section already discloses, at a different point in this pipeline) could still publish a
-     * stale, pre-resolution result into the now-recorded-fresh slot -- and because the generation
-     * was already recorded, every LATER call at that same generation would trust the stale cache
-     * without ever re-evicting to catch it. Fixed by reordering to evict first, record second --
-     * narrowing (not eliminating; this is the SAME residual race class, not a new one) the window,
-     * matching the identical reordering precedent comment 55492 already established for the OTHER
-     * eviction call site ("the eviction is the very LAST statement... immediately before falling
-     * through").
-     *
-     * <p>"Preserve scoped warm reuse" (John's own explicit ask): the inner per-generator map is
-     * untouched in shape or semantics by either fix -- a single generator's own sibling cube-Y calls
-     * at an unchanged resolution generation still skip re-eviction exactly as before; only which
-     * generator instance's own map gets consulted, and the record/evict order, changed.
-     *
-     * @return whether an eviction actually ran, for tests to assert the gating itself, not just its
-     *         downstream effect.
+     * <p>Per John's own explicit offered fallback ("repair per actual memo/build provenance, or
+     * offer a separate fast low-risk unique-state optimization while preserving current freshness
+     * behavior"): the skip-on-unchanged tracking is REMOVED entirely rather than attempting a
+     * provenance-based repair (which would need visibility into {@code SurfaceGenerator}'s own
+     * internal cache-write identity that this mod does not have access to, the same reason the
+     * {@code sectionLooksStale} retry loop elsewhere in this codebase is deliberately bounded rather
+     * than a full fix). This method now ALWAYS evicts when relevant, exactly matching the original
+     * unconditional design's own freshness/self-healing guarantee -- the only change from the very
+     * first version of this fix is the relevance gate itself (comment 55562's own low-risk,
+     * independently-verified improvement), which was never implicated in either round's bug report.
      */
-    private static final java.util.Map<EarthGenerator, java.util.concurrent.ConcurrentHashMap<Long, Long>> lastEvictedGenerationByGeneratorAndColumn =
-            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
-
-    public static boolean evictStaleSurfaceDecisionIfRelevantAndChanged(EarthGenerator generator, int columnX, int columnZ, boolean naturallyRelevant) {
+    public static boolean evictStaleSurfaceDecisionIfRelevant(EarthGenerator generator, int columnX, int columnZ, boolean naturallyRelevant) {
         if (!naturallyRelevant) return false;
-        RoadTileSource tiles = RoadNetwork.liveTileSourceForPrefetch();
-        long currentGeneration = tiles == null ? 0L : tiles.resolvedGeneration();
-        long columnKey = ((long) columnX << 32) ^ (columnZ & 0xFFFFFFFFL);
-        java.util.concurrent.ConcurrentHashMap<Long, Long> columnsForThisGenerator;
-        synchronized (lastEvictedGenerationByGeneratorAndColumn) {
-            columnsForThisGenerator = lastEvictedGenerationByGeneratorAndColumn.computeIfAbsent(
-                    generator, ignored -> new java.util.concurrent.ConcurrentHashMap<>());
-        }
-        Long previousGeneration = columnsForThisGenerator.get(columnKey);
-        if (previousGeneration != null && previousGeneration.longValue() == currentGeneration) {
-            return false; // nothing resolved anywhere since we last evicted this exact generator's column -- nothing to refresh
-        }
         evictStaleSurfaceDecision(generator, columnX, columnZ);
-        columnsForThisGenerator.put(columnKey, currentGeneration); // recorded AFTER eviction -- narrows comment 55564's "bug 2" window
         return true;
-    }
-
-    /** Test-only: clears {@link #lastEvictedGenerationByGeneratorAndColumn} so each test starts from a known, empty state. */
-    static void clearEvictionTrackingForTests() {
-        lastEvictedGenerationByGeneratorAndColumn.clear();
     }
 
     /**

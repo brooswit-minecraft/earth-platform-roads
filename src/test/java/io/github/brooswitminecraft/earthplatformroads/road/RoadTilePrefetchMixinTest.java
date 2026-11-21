@@ -1354,23 +1354,24 @@ class RoadTilePrefetchMixinTest {
     }
 
     /**
-     * MINECRAFT-566 comment 55562, John's own source audit: the mixin previously called
-     * {@code RoadPrefetch.evictStaleSurfaceDecision} UNCONDITIONALLY for every {@code produce()}
-     * call, so a tall column's many sibling cube-Y layers each evicted the shared X/Z {@code
-     * SurfaceGenerator.Column} cache the others had just populated. Proves
-     * {@code evictStaleSurfaceDecisionIfRelevantAndChanged}'s own gating state machine directly: the
-     * first call for a column always evicts (nothing legitimate cached yet to protect -- the same
-     * "free in the ordinary case" guarantee the original unconditional eviction always provided); an
-     * immediately-following sibling call for the SAME column, with nothing resolved anywhere since,
-     * must be skipped; once a real resolution happens (even for a wholly unrelated cell elsewhere),
-     * the SAME column becomes eligible to evict again -- "keep freshness on real data transition,
-     * not each sibling," never frozen forever. An irrelevant cube must never evict at all.
+     * MINECRAFT-566 comments 55562/55564/55565, the full history: an earlier version of
+     * {@code evictStaleSurfaceDecisionIfRelevant} ALSO tried to skip eviction for a relevant
+     * sibling touch once "nothing has resolved since the last eviction" (tracked via a per-column
+     * generation counter). Comment 55565's own independent native QA found that optimization
+     * unsafe -- a real, reproduced late-publication race (the already-disclosed residual race from
+     * comment 55496) could leave a stale decision in place for however long it took something
+     * UNRELATED to resolve, since the skip removed the original design's own self-healing property
+     * (every sibling touch re-evicting, bounding a stale publish's lifetime to "until the very next
+     * touch"). That tracking was reverted entirely. This proves the CURRENT, reverted method's own
+     * actual behavior directly: a relevant cube ALWAYS evicts, every single touch, with no
+     * memory of "already evicted this generation" at all -- repeated sibling calls for the exact
+     * same column each independently evict again, exactly matching the original unconditional
+     * design's self-healing guarantee. An irrelevant cube never evicts.
      */
     @Test
-    void evictStaleSurfaceDecisionIfRelevantAndChangedGatesBySiblingAndRealDataTransition(
+    void evictStaleSurfaceDecisionIfRelevantAlwaysEvictsARelevantColumnEveryTouchWithNoSkipTracking(
             @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         java.nio.file.Files.createDirectories(roadCache);
-        RoadPrefetch.clearEvictionTrackingForTests();
         RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
         RoadNetwork.setTileSourceForTests(tileSource);
         EarthGenerator generator = bootAndBuildGenerator(demCache);
@@ -1379,46 +1380,31 @@ class RoadTilePrefetchMixinTest {
         int[] block = generator.block(lat, lon);
         int columnX = block[0] >> 4, columnZ = block[1] >> 4;
 
-        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
-                "Expected the FIRST eviction for a column to always run");
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevant(generator, columnX, columnZ, true),
+                "Expected the first eviction for a relevant column to run");
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevant(generator, columnX, columnZ, true),
+                "Expected a sibling cube's eviction for the SAME column to ALSO run -- no generation-based skip anymore, self-healing on every touch");
+        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevant(generator, columnX, columnZ, true),
+                "Expected a THIRD consecutive touch to keep evicting too, not just the second one");
 
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
-                "Expected a sibling cube's eviction for the SAME column to be skipped when nothing has resolved since the last one");
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
-                "Expected repeated sibling calls to keep being skipped, not just the second one");
-
-        // A real resolution happens elsewhere -- an entirely unrelated cell, far from this column's
-        // own lat/lon -- bumping RoadTileSource's own resolvedGeneration counter.
-        java.nio.file.Files.createDirectories(roadCache);
-        java.nio.file.Files.writeString(roadCache.resolve("1000_2000.empty"), "");
-        tileSource.cellState(10.005, 20.005); // validates the marker above, bumping resolvedGeneration
-
-        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
-                "Expected the SAME column to become eligible to evict again once something has actually resolved");
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, true),
-                "Expected it to go back to being skipped immediately afterward, with nothing new resolved since");
-
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, columnX, columnZ, false),
-                "Expected an irrelevant cube to never evict, regardless of the generation counter");
+        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevant(generator, columnX, columnZ, false),
+                "Expected an irrelevant cube to never evict, regardless of how many prior relevant touches happened");
     }
 
     /**
-     * MINECRAFT-566 comment 55562's own explicit ask: "independently reproduce/measure hot cached
-     * two-world and vertical sibling paths; warm replay should send zero HTTP". Measures the actual
-     * "vertical sibling" scenario by name: once a column's own cell has resolved, ten MORE
-     * {@code dispatchAndScanRelevantCells} calls at the SAME X/Z (modelling ten cube-Y layers of one
-     * tall column, each independently missing storage and calling this same gate) -- the warm-replay
-     * case John asked be measured -- must send ZERO further HTTP requests and record ZERO further
-     * real disk-validating loads ({@link RoadTileSource#resolvedGeneration()} unchanged), and the
-     * eviction gate must correctly skip all ten (nothing changed since the first). Reported measured
-     * numbers (see the Jira comment/changelog for this round): 1 real request for the initial
-     * resolve, 0 for all ten warm-replay siblings; 1 eviction for the first column touch, 0 for the
-     * ten siblings after it.
+     * MINECRAFT-566 comment 55562's own still-valid, still-independently-shippable measurement
+     * (comment 55565's own explicit instruction: "do not wait for these findings to apply the
+     * low-risk unique tile state and memory-cache improvements"): once a column's own cell has
+     * resolved, TEN more {@code dispatchAndScanRelevantCells} calls at the SAME X/Z (modelling ten
+     * cube-Y layers of one tall column) must send ZERO further HTTP requests -- the one-pass scan
+     * dedup and the {@code RoadTileSource} memory cache are untouched by the eviction-gating
+     * revert above, and this is exactly what they alone guarantee. (The eviction call itself is
+     * intentionally NOT asserted here to skip anymore -- see the test above for why it correctly no
+     * longer does.)
      */
     @Test
-    void tenVerticalSiblingCallsAfterResolutionSendZeroHttpAndSkipEverySiblingEviction(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+    void tenVerticalSiblingCallsAfterResolutionStillSendZeroFurtherHttp(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
         java.nio.file.Files.createDirectories(roadCache);
-        RoadPrefetch.clearEvictionTrackingForTests();
         AtomicInteger requests = new AtomicInteger();
         String response = """
                 {"elements":[{"type":"way","id":555091,"nodes":[1,2],
@@ -1445,7 +1431,7 @@ class RoadTilePrefetchMixinTest {
             int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
             int cubeY = generator.surfaceY(block[0], block[1]) >> 4;
 
-            // The first cube-Y layer: a genuine cold miss, resolves the cell, evicts once.
+            // The first cube-Y layer: a genuine cold miss, resolves the cell.
             RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY, cubeZ);
             for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
                 Thread.sleep(50);
@@ -1453,70 +1439,16 @@ class RoadTilePrefetchMixinTest {
             assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon));
             int requestsAfterFirstResolve = requests.get();
             assertTrue(requestsAfterFirstResolve >= 1, "Expected exactly the initial resolve to have sent a real request");
-            long generationAfterFirstResolve = tileSource.resolvedGeneration();
-            assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, cubeX, cubeZ, true),
-                    "Expected the first column touch to evict");
 
             // Ten MORE sibling cube-Y layers, same X/Z, cell already resolved -- the warm-replay case.
             for (int siblingY = 0; siblingY < 10; siblingY++) {
-                var scan = RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY + siblingY + 1, cubeZ);
-                // Y offset by +1.. +10: still well within the same cube's own natural-surface padding
-                // range for at least the first couple, but regardless of relevance, dispatch/pending
-                // only ever touches the network for a RELEVANT, PENDING cell -- already resolved here.
-                boolean evicted = RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generator, cubeX, cubeZ, scan.naturallyRelevant());
-                assertTrue(!evicted, "Expected sibling Y layer " + siblingY + " to skip eviction -- nothing resolved since the first touch");
+                RoadPrefetch.dispatchAndScanRelevantCells(generator, cubeX, cubeY + siblingY + 1, cubeZ);
             }
 
             assertEquals(requestsAfterFirstResolve, requests.get(),
-                    "Expected ZERO further HTTP requests across all ten vertical-sibling warm-replay calls");
-            assertEquals(generationAfterFirstResolve, tileSource.resolvedGeneration(),
-                    "Expected ZERO further real disk-validating loads across all ten vertical-sibling warm-replay calls");
+                    "Expected ZERO further HTTP requests across all ten vertical-sibling warm-replay scans");
         } finally {
             stub.stop(0);
         }
-    }
-
-    /**
-     * MINECRAFT-566 comment 55564, the first of two real bugs John's own independent native QA
-     * found in the eviction-gating mechanism above: the first version keyed its tracking by packed
-     * X/Z ALONE, in a single map shared by every {@code EarthGenerator} instance -- so two SEPARATE
-     * generators (two different worlds, or a fresh instance after a reload) touching the identical
-     * column could suppress EACH OTHER's first eviction, even though evicting is always scoped to
-     * whichever generator instance is actually passed in, and generator B's own {@code
-     * SurfaceGenerator} cache was never touched by generator A's eviction at all. Proves the fix
-     * directly: two real, separately-booted generators at the IDENTICAL column X/Z each get their
-     * own genuinely-first eviction -- generator B's own first touch must NOT be skipped just because
-     * generator A already touched that same X/Z.
-     */
-    @Test
-    void twoSeparateGeneratorsAtTheIdenticalColumnDoNotSuppressEachOthersFirstEviction(
-            @TempDir Path demCacheA, @TempDir Path demCacheB, @TempDir Path roadCache) throws Exception {
-        java.nio.file.Files.createDirectories(roadCache);
-        RoadPrefetch.clearEvictionTrackingForTests();
-        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
-        RoadNetwork.setTileSourceForTests(tileSource);
-
-        // Two entirely separate EarthGenerator instances (modelling two separate worlds), each with
-        // its OWN demCache -- but deliberately evicting at the SAME column X/Z index on both, since
-        // the bug is specifically about two DIFFERENT generator instances colliding on identical
-        // column coordinates.
-        EarthGenerator generatorA = bootAndBuildGenerator(demCacheA);
-        EarthGenerator generatorB = bootAndBuildGenerator(demCacheB);
-        int columnX = 777, columnZ = -333; // arbitrary, shared by both generators on purpose
-
-        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
-                "Expected generator A's first touch of this column to evict");
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
-                "Expected generator A's own sibling touch of the SAME column to still be correctly skipped");
-
-        assertTrue(RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorB, columnX, columnZ, true),
-                "Expected generator B's first touch of the IDENTICAL column X/Z to evict too -- a DIFFERENT generator instance must never be suppressed by A's own already-recorded eviction");
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorB, columnX, columnZ, true),
-                "Expected generator B's own sibling touch to now be correctly skipped, scoped to B alone");
-
-        // Confirms A's own tracking is still intact and independent of B's: A should still correctly
-        // skip (no real resolution happened anywhere since A's own last eviction).
-        assertTrue(!RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(generatorA, columnX, columnZ, true),
-                "Expected generator A's own tracking to remain correctly skipped, unaffected by generator B's activity");
     }
 }

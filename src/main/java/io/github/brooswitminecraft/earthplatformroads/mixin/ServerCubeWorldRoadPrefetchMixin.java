@@ -376,11 +376,14 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // surface() at all, no matter how fresh the road data now is. Evict just this one column
         // (never a global clear) -- NOT gated by SynchronousLoadGuard (not HTTP; the exact same
         // staleness risk applies equally to loadNow's own arrival generate() call), but now gated by
-        // relevance and real data transition per comment 55562 -- see
-        // RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged's own doc for why an
-        // unconditional eviction, on every unsaved Y cube regardless of relevance, was itself the
-        // real performance bug this whole slice exists to fix.
-        RoadPrefetch.evictStaleSurfaceDecisionIfRelevantAndChanged(earthGenerator, cubeX, cubeZ, naturallyRelevant);
+        // relevance alone per comment 55562 -- see RoadPrefetch.evictStaleSurfaceDecisionIfRelevant's
+        // own doc for why an unconditional eviction, on every unsaved Y cube regardless of relevance,
+        // was itself the real performance bug this whole slice exists to fix, AND for why that same
+        // doc's "skip for an unchanged sibling" follow-on optimization was tried and then reverted
+        // (comment 55565: a real correctness regression in the already-disclosed residual
+        // publish-race, comment 55496) -- this call always evicts a relevant column, exactly
+        // matching the original design's own self-healing freshness guarantee.
+        RoadPrefetch.evictStaleSurfaceDecisionIfRelevant(earthGenerator, cubeX, cubeZ, naturallyRelevant);
         // MINECRAFT-566 comment 55504, a real bug found in pre-handoff review: every retry attempt
         // below was calling generate() with the SAME mutable blockEntities/entities lists -- but
         // generate()'s own structures.place(...) APPENDS to those lists as a side effect (confirmed

@@ -458,6 +458,52 @@ bump: minor
   round; only which generator instance's own map gets consulted, and the record/evict order, changed.
   98/98 tests pass (`./gradlew compileJava compileTestJava test --rerun`).
 
+### Reverted (comment 55565): the eviction-skip optimization above was itself unsafe
+- John's own independent native QA of the exact commit above (5bb0b6c) reproduced a real
+  late-publication race on `5bb0b6c`: a `SurfaceGenerator.column()` computation already in flight,
+  parked just before its own internal publish, released only AFTER the eviction gate's own eviction
+  had run and verified the shared cache empty, still inserted a stale, pre-resolution decision into
+  the now-fresh slot -- persisted grass survived a reopen even though the real cell was genuinely
+  READY. This is the SAME already-disclosed residual race comment 55496's own doc section names
+  (never eliminated there either, only narrowed) -- but the skip-on-unchanged-generation
+  optimization above removed the ORIGINAL unconditional design's own self-healing property: every
+  sibling touch used to re-evict regardless, bounding a stale publish's survival to "until the very
+  next touch for that column"; skipping sibling evictions let a stale publish persist until the
+  next UNRELATED cell resolved anywhere in the world, potentially a very long time. A genuine
+  correctness regression, not merely a narrower race window.
+- Per John's own explicit offered fallback ("repair per actual memo/build provenance, or offer a
+  separate fast low-risk unique-state optimization while preserving current freshness behavior"):
+  the per-column/per-generator generation tracking (`lastEvictedGenerationByGeneratorAndColumn`,
+  `RoadTileSource.resolvedGeneration()`, and comment 55564's own two fixes to that tracking) is
+  REMOVED entirely -- a provenance-based repair would need visibility into `SurfaceGenerator`'s own
+  internal cache-write identity this mod does not have, the same reason `sectionLooksStale`'s own
+  retry loop elsewhere in this file is deliberately bounded rather than a full fix. `RoadPrefetch
+  .evictStaleSurfaceDecisionIfRelevantAndChanged` is renamed to `evictStaleSurfaceDecisionIfRelevant`
+  and now ALWAYS evicts when the cube is naturally relevant -- exactly the original unconditional
+  design's own self-healing freshness guarantee, with only the relevance gate itself (comment
+  55562's own low-risk, never-implicated improvement) retained.
+- The other two comment 55562 fixes (one-pass scan dedup, `RoadTileSource` memory cache for
+  resolved tiles) are UNCHANGED and continue to ship, per John's own explicit "do not wait for
+  these findings" instruction -- this revert touches only the eviction-skip mechanism.
+- Test changes: the three tests whose entire premise was the now-removed skip tracking
+  (`evictStaleSurfaceDecisionIfRelevantAndChangedGatesBySiblingAndRealDataTransition`,
+  `tenVerticalSiblingCallsAfterResolutionSendZeroHttpAndSkipEverySiblingEviction`,
+  `twoSeparateGeneratorsAtTheIdenticalColumnDoNotSuppressEachOthersFirstEviction`) are replaced by
+  `evictStaleSurfaceDecisionIfRelevantAlwaysEvictsARelevantColumnEveryTouchWithNoSkipTracking`
+  (proves every relevant touch evicts again, no memory of prior evictions) and
+  `tenVerticalSiblingCallsAfterResolutionStillSendZeroFurtherHttp` (keeps proving the still-valid,
+  independently-shippable zero-further-HTTP measurement from comment 55562, with no claim about
+  eviction count). 97/97 tests pass.
+- Known, disclosed limitation of this exact candidate: reverting removes the "zero eviction for
+  ten warm-replay vertical siblings" measurement -- a relevant column's own `SurfaceGenerator.Column`
+  cache IS now re-evicted (and the natural-height survey it drives re-run) on every sibling touch
+  again, the same cost the original unconditional design always paid for every relevant column.
+  This is the deliberate, disclosed cost of correctness: John's own two rounds of native QA found
+  the alternative unsafe twice, and a correctness regression is worse than the performance it was
+  meant to buy back. Whether a SAFE version of this optimization (one that actually inspects memo/
+  build provenance rather than inferring freshness from an external counter) is worth the added
+  complexity is left for a future round, not attempted here.
+
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
   theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube
