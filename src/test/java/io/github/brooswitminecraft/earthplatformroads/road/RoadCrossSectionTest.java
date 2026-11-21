@@ -273,8 +273,8 @@ class RoadCrossSectionTest {
         var highColumn = RoadDeck.computeStation(slopedRoad, grid, 11, worldZ, slopedHeight, sameRoad);
         assertEquals(75, highColumn.height());
         assertEquals(75, slopedHeight.apply(11, worldZ), "Sanity: x=11 must actually already be at the shared height");
-        assertTrue(highColumn.crossSlopeDetected(), "Expected the natural-high column to still be flagged cross-sloped, "
-                + "so its cap gets repainted to match its raised neighbors rather than keeping a stale partial layer");
+        assertTrue(highColumn.crossSlopeDetected(), "Expected the natural-high column to still be flagged cross-sloped "
+                + "(production does not yet act on this flag -- see RoadDeck.buildSupportAndDeck's own doc for why the first repaint attempt was reverted)");
 
         // A perfectly flat road (same construction, but every sampled column shares one height) must
         // never be flagged -- the common case, which must stay a complete no-op.
@@ -286,6 +286,53 @@ class RoadCrossSectionTest {
         var flatColumn = RoadDeck.computeStation(flatRoad, grid, 5, worldZ, flatHeight, sameFlatRoad);
         assertEquals(70, flatColumn.height());
         assertTrue(!flatColumn.crossSlopeDetected(), "Expected a perfectly flat road to never be flagged cross-sloped");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55518: reproduces the real halo-boundary bug end to end through
+     * {@link RoadDeck#station} using {@link RoadSegment#isSameRoadAs} (production's own matcher,
+     * not {@code .equals}) -- the same real wayId as two SEPARATE {@code RoadSegment} instances with
+     * distinct backing arrays (as two independent tile/cache files parsing the same way would each
+     * produce), east side higher than west. The west column must discover the east side's higher
+     * natural ground THROUGH the other instance and flag the station cross-sloped -- not silently
+     * stay unaware of it the way plain record equality did.
+     */
+    @Test
+    void stationMatchesTheSameWayAcrossTwoIndependentlyParsedInstancesAtAHaloBoundary() {
+        MercatorGrid grid = GRID;
+        GeoPoint a = grid.geographic(6.0, 0.0), b = grid.geographic(6.0, 100.0);
+        // Two separate RoadSegment objects, same real wayId, deliberately distinct GeoPoint[] array
+        // instances (new GeoPoint[] {...} twice, never shared) -- exactly what two tile files each
+        // independently parsing the same way would produce.
+        RoadSegment westInstance = new RoadSegment(777L, "halo test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+        RoadSegment eastInstance = new RoadSegment(777L, "halo test road", RoadClass.SECONDARY,
+                new GeoPoint[] {a, b}, new long[0], 5.5, false, false, 0);
+        assertFalse(westInstance.equals(eastInstance), "Sanity: these must be the real bug's shape (distinct arrays, record equals rejects them)");
+
+        int worldZ = 50;
+        // West side (x<6) only visible through westInstance; east side (x>=6) only visible through
+        // eastInstance -- modelling the west copy having "dropped out of the lookup halo" for the
+        // east samples, and vice versa. Natural height: west flat at 100, east flat at 108.
+        java.util.function.BiFunction<Integer, Integer, Integer> naturalHeight = (x, z) -> x < 6 ? 100 : 108;
+        java.util.function.BiPredicate<Integer, Integer> sameRoadViaIsSameRoadAs =
+                (x, z) -> {
+                    RoadSegment owner = x < 6 ? westInstance : eastInstance;
+                    return westInstance.isSameRoadAs(owner); // production's own matcher, queried from the west column's own perspective
+                };
+
+        var fromWest = RoadDeck.computeStation(westInstance, grid, 0, worldZ, naturalHeight, sameRoadViaIsSameRoadAs);
+        assertEquals(108, fromWest.height(), "Expected the west column to discover the east side's higher ground THROUGH the other instance");
+        assertTrue(fromWest.crossSlopeDetected());
+
+        // The old, broken behavior (plain .equals) for direct comparison -- documents the actual bug this fixes.
+        java.util.function.BiPredicate<Integer, Integer> sameRoadViaPlainEquals =
+                (x, z) -> {
+                    RoadSegment owner = x < 6 ? westInstance : eastInstance;
+                    return westInstance.equals(owner);
+                };
+        var fromWestBroken = RoadDeck.computeStation(westInstance, grid, 0, worldZ, naturalHeight, sameRoadViaPlainEquals);
+        assertEquals(100, fromWestBroken.height(), "Documenting the actual pre-fix bug: plain equals never discovers the east side at all");
     }
 
     @Test

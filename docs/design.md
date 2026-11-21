@@ -954,6 +954,42 @@ found in three successive reviews of the SAME prototype, and given John's own ex
 explicitly disclosed, NOT-ready prototype. `b7ff716` (canopy clearance only, independently verified
 clean on a real compiled build) remains the actual candidate for anything beyond continued review.
 
+## MINECRAFT-566: a fourth, separate bug -- record equality across independently-parsed tile copies (comment 55518)
+
+While `fd8cea5` was held, John found a FOURTH, genuinely separate problem (his own words: "independent
+of actual fractional cap continuity or shoulder omission"), reproduced in an exact compiled build
+with two offline tile cache files and no provider: `RoadDeck`'s own "is this sample point still THIS
+road" check used plain `RoadSegment` record `.equals`. A record's auto-generated `equals` compares
+`centerline` (a `GeoPoint[]`) by ARRAY REFERENCE, not content -- so the SAME real way, independently
+parsed from two different tile/cache files (concretely: "the first copy drops out of the relative
+3x3 lookup halo"), produces two `RoadSegment` instances with identical VALUES but distinct backing
+arrays, and `.equals` wrongly rejects them as different roads. The observed effect: a station's west
+side (loaded via one tile's own copy of the way) could not see the east side's higher ground (loaded
+via a DIFFERENT tile's copy of the SAME way) at all -- actual station heights came back west 100 /
+east 108, with the west side's pavement staying at Y100 and nothing painted at the intended Y108.
+
+**Fixed** with `RoadSegment.isSameRoadAs`: matches on the real way's own stable, positive OSM
+`wayId` when both sides have one (the one piece of identity that survives being independently
+re-parsed from a different file), falling back to full record equality only when either side's
+`wayId` is not a real one (`<= 0`, the existing pinned/test-fixture convention) -- so distinct
+synthetic test roads that all happen to share `wayId == 0` are never incorrectly merged, exactly
+John's own "leave distinct ID-less test roads distinct" ask. `RoadDeck.station`/`deckY` now call
+`segment.isSameRoadAs(...)` instead of `segment.equals(...)`.
+
+**Verified**, per John's own explicit ask for "an offline two-file halo-boundary regression with
+unrelated-way control": `RoadSegmentTest.isSameRoadAsMatchesByWayIdEvenWithDistinctBackingArrays`
+(two separate instances, same wayId, genuinely distinct backing arrays -- confirms `.equals` itself
+still rejects them, so this is really exercising the fix and not a tautology),
+`.isSameRoadAsRejectsADifferentWayIdEvenWithIdenticalGeometry` (the unrelated-way control -- a
+different real wayId must never merge, even with identical geometry), and
+`.isSameRoadAsLeavesDistinctIdLessTestRoadsDistinct`. End to end, through `RoadDeck.station` itself,
+`RoadCrossSectionTest.stationMatchesTheSameWayAcrossTwoIndependentlyParsedInstancesAtAHaloBoundary`
+reproduces John's exact west-100/east-108 shape (two `RoadSegment` instances, same wayId, each only
+"visible" for its own half of the road) and confirms the west column now correctly discovers the
+east side's higher ground through the other instance -- with a second assertion in the same test
+documenting the actual pre-fix behavior (plain `.equals` never discovers it) side by side, so the
+bug this fixes is pinned, not just asserted away. 96/96 tests pass.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

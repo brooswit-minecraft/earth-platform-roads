@@ -65,6 +65,29 @@ public record RoadSegment(
         this(0L, name, RoadClass.SECONDARY, centerline, new long[0], pavedHalfWidthBlocks, false, false, 0);
     }
 
+    /**
+     * MINECRAFT-566 comment 55518: {@code RoadDeck}'s own "is this sample point still THIS road"
+     * check used plain record {@code .equals}, which compares {@code centerline} as a {@code GeoPoint[]}
+     * -- array fields compare by REFERENCE under a record's auto-generated {@code equals}, not by
+     * content. The same real way, independently parsed from two different tile/cache files (a real,
+     * reproduced scenario: "the first copy drops out of the relative 3x3 lookup halo"), yields two
+     * {@code RoadSegment} instances with identical VALUES but distinct backing arrays -- record
+     * equality wrongly rejects them as different roads, which silently excluded the OTHER side's
+     * samples from a station's cross-width scan right at that halo boundary.
+     *
+     * <p>Matches on the real way's own stable, positive OSM {@code wayId} when both sides have one
+     * (the only identity that survives being independently re-parsed from a different file) --
+     * falling back to full record equality when either side's {@code wayId} is not a real one
+     * ({@code <= 0}, the pinned/test-fixture convention -- see the minimal constructor's own doc),
+     * so distinct synthetic test roads that all happen to share {@code wayId == 0} are never
+     * incorrectly merged.
+     */
+    public boolean isSameRoadAs(RoadSegment other) {
+        if (other == null) return false;
+        if (wayId > 0 && other.wayId > 0) return wayId == other.wayId;
+        return equals(other);
+    }
+
     /** The full footprint's own half-width, paved surface plus the gravel shoulder on each side. */
     public double totalHalfWidthBlocks() {
         return pavedHalfWidthBlocks + SHOULDER_WIDTH_BLOCKS;

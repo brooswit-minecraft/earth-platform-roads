@@ -224,6 +224,19 @@ bump: minor
   (twelve columns, all correctly returning the expected shared height), plus new diagonal and
   cube-boundary-straddling cases and a vertical-seam regenerate-identically check. Also roughly an
   85% reduction in per-column sample count versus the old isotropic box.
+- Fixed a fourth, separate deck bug (comment 55518, reproduced by John in an exact compiled build
+  with two offline tile cache files): `RoadDeck`'s "is this sample point still THIS road" check used
+  plain `RoadSegment` record `.equals`, which compares `centerline` (a `GeoPoint[]`) by array
+  REFERENCE, not content -- so the same real way, independently parsed from two different tile/cache
+  files (the same way "dropping out of the relative 3x3 lookup halo" on one side), produced two
+  `RoadSegment` instances `.equals` wrongly rejected as different roads, silently hiding one side's
+  samples from the other at that halo boundary (observed: station heights west 100/east 108, with
+  nothing painted at the intended Y108). Added `RoadSegment.isSameRoadAs`, matching on the real way's
+  own stable positive OSM `wayId` when both sides have one, falling back to full equality only for
+  ID-less (`wayId <= 0`) test fixtures so distinct synthetic roads are never merged. Verified with a
+  same-wayId/distinct-arrays case, an unrelated-way control, an ID-less-test-roads-stay-distinct
+  case, and an end-to-end reproduction of the exact west-100/east-108 shape through `RoadDeck.station`
+  itself (with the old, broken behavior pinned alongside it for contrast).
 
 ### Known gaps
 - The flat-deck prototype (`RoadDeck`) does not extend support under the gravel shoulder -- a

@@ -70,16 +70,25 @@ public final class RoadDeck {
      * MINECRAFT-566 comment 55516: whether a station's own transverse sample actually found a real
      * cross-slope ({@code minSampledHeight != maxSampledHeight} among qualifying samples) -- NOT
      * just whether THIS column itself needed raising. The natural-high column of a cross-raised
-     * station has {@code height() == naturalY} for ITSELF (nothing to raise), but still needs its
-     * OWN surface repainted to the same plain flat cap its raised neighbors get; a station with no
-     * cross-slope at all (the overwhelmingly common case) must leave {@code surface()}'s own
-     * material/layering completely alone. See {@link #buildSupportAndDeck}'s own use of this.
+     * station has {@code height() == naturalY} for ITSELF (nothing to raise); a first attempt at
+     * using this flag to also force a repaint of that column's own cap was tried and REVERTED (see
+     * {@link #buildSupportAndDeck}'s own doc) after it broke an existing longitudinal-smoothness
+     * regression test. This flag is kept, correct and tested, as a building block for a real fix,
+     * but production code does not currently act on it.
      */
     public record Station(int height, boolean crossSlopeDetected) {}
 
+    /**
+     * {@code segment} must be the SAME segment {@code RoadNetwork.segmentCoveringColumn(grid,
+     * worldX, worldZ)} already found for this column -- passed in rather than re-looked-up, since
+     * every caller already has it in hand. Samples are matched to {@code segment} via
+     * {@link RoadSegment#isSameRoadAs}, not plain {@code .equals} (comment 55518: record equality
+     * wrongly rejects the same real way re-parsed from a different tile/cache file as a distinct
+     * road, since its {@code centerline} array compares by reference).
+     */
     public static Station station(EarthGenerator generator, MercatorGrid grid, RoadSegment segment, int worldX, int worldZ) {
         return computeStation(segment, grid, worldX, worldZ, generator::surfaceY,
-                (sx, sz) -> segment.equals(RoadNetwork.segmentCoveringColumn(grid, sx, sz)));
+                (sx, sz) -> segment.isSameRoadAs(RoadNetwork.segmentCoveringColumn(grid, sx, sz)));
     }
 
     /**
