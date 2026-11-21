@@ -675,6 +675,31 @@ yellow-terracotta centerline and gravel shoulders.
   existing blackstone layering's own disposable-profile playtest, was not attempted here either --
   this agent's environment has no running Minecraft client.
 
+## MINECRAFT-566: why a flat road deck (comment 55485) is a materially bigger change than it looks
+
+Investigated (not implemented) via CFR-decompiling the real `SurfaceGenerator`/`EarthGenerator`
+classes for understanding only (nothing copied from the decompiled source into this codebase).
+
+`SurfaceGenerator.terrain()` derives EVERY block it paints for a column -- top material at depth 0,
+`under()` at depth 1-3, natural rock below that -- from `col.height[gi]`, the cached NATURAL ground
+height written by `EarthGenerator.ground(int, int, int[])`. `surface()` (what
+`EarthGeneratorRoadMixin` already hooks, and the ONLY hook this mod has ever used) only ever picks
+WHICH MATERIAL paints at the column's EXISTING natural height -- it has no way to raise where "the
+surface" actually is. A flat deck spanning a dip, by definition, needs some columns painted TALLER
+than their own natural ground, which means the only real lever is `ground()`'s own output -- and
+that same value is what EarthGenerator's cave placement (`below.kind`/`caveField`), structure
+placement (`surfaceY`), biome sampling, vegetation/tree decoration, and the water table all derive
+from too. Overriding it is categorically different from, and riskier than, the surface-MATERIAL-only
+changes this mod has made so far (including everything evaluated and declined for the 55496/55498
+residual-race work) -- it is the single most foundational input in the whole generation pipeline,
+with a correspondingly wide, hard-to-predict blast radius, and no way to visually verify the result
+without a real running game.
+
+**Not attempted this pass**, consistent with 55485's own explicit "if support work makes a larger
+iteration, provide the verified styling preview separately with honest limits" -- the styling slice
+(comment 55484) stands as shipped; this flat-deck/stone-brick-support work remains queued, now with
+a concrete understanding of the real mechanism and risk, not a vague "later."
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this
