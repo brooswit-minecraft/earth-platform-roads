@@ -325,6 +325,102 @@ public final class RoadPrefetch {
     }
 
     /**
+     * MINECRAFT-566 comment 55568, John's own independent prototype closing the residual
+     * late-publish race (comment 55496, confirmed real and natively reproduced in comment 55565):
+     * a per-{@code SurfaceGenerator}-instance "build lease" for each column. {@code column(int,int)}
+     * (via the new {@code SurfaceGeneratorColumnLeaseMixin}) captures the CURRENT lease for its own
+     * column key at method {@code HEAD} -- before it ever consults {@code columns.get(key)} -- and
+     * carries it through, via MixinExtras {@code @Share}, to the exact {@code
+     * ConcurrentHashMap.putIfAbsent} call site that would otherwise publish this invocation's own
+     * (possibly stale) result unconditionally. That publish is now wrapped to re-check the lease
+     * immediately before publishing: if the column's lease has since rotated (meaning an eviction
+     * ran in between), the publish is REJECTED outright -- "publication after invalidation is
+     * rejected," closing exactly the race window unconditional re-eviction could only ever narrow,
+     * never eliminate. "Publication before invalidation is removed" needs no new mechanism: a
+     * publish that lands BEFORE an eviction simply gets cleaned up by that eviction's own
+     * {@code columns.remove(key)}, exactly as it always has.
+     *
+     * <p>Deliberately scoped PER GENERATOR INSTANCE ({@link java.util.WeakHashMap}, identity-keyed)
+     * -- the exact same lesson comment 55564's own real bug already taught this file once: a single
+     * shared/static map would let two separate generator instances (two worlds, or a fresh instance
+     * after a reload) collide on identical column coordinates. A discarded generator's own lease
+     * state is reclaimed once nothing else references it.
+     *
+     * <p>{@code epoch} (bumped only when {@code column()}'s own {@code columns.clear()} fires, via
+     * {@code SurfaceGeneratorColumnLeaseMixin}'s own second {@code @WrapOperation} -- "coordinate
+     * the existing {@code columns.clear}", confirmed real by reading the decompiled class: it
+     * clears the whole map once {@code columns.size() > 8192}) invalidates EVERY outstanding lease
+     * at once, since a bulk clear wipes every column's entry simultaneously -- a late builder racing
+     * that clear is rejected the same way a late builder racing one targeted eviction is.
+     * {@code rotation} (bumped by {@link #evictStaleSurfaceDecision} itself, below, for exactly the
+     * ONE column it targets) invalidates just that one column. A captured lease must match BOTH
+     * components to still be considered current.
+     */
+    public record ColumnLease(long epoch, long rotation) {}
+
+    private static final class GeneratorLeaseState {
+        /**
+         * The SHORT shared metadata critical section John's own design calls for -- guards only
+         * this generator's own {@code epoch}/{@code perColumnRotations} bookkeeping, NEVER held
+         * around {@code column()}'s own terrain sampling, any HTTP, or any wait of any kind.
+         */
+        final Object lock = new Object();
+        long epoch;
+        final java.util.Map<Long, Long> perColumnRotations = new java.util.HashMap<>();
+    }
+
+    private static final java.util.Map<EarthGenerator, GeneratorLeaseState> LEASE_STATE_BY_GENERATOR =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    private static GeneratorLeaseState leaseState(EarthGenerator generator) {
+        synchronized (LEASE_STATE_BY_GENERATOR) {
+            return LEASE_STATE_BY_GENERATOR.computeIfAbsent(generator, ignored -> new GeneratorLeaseState());
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568: the lease {@code SurfaceGeneratorColumnLeaseMixin} captures at
+     * {@code column()}'s own {@code HEAD}, before that method ever consults its cache.
+     */
+    public static ColumnLease captureColumnLease(EarthGenerator generator, long columnKey) {
+        GeneratorLeaseState state = leaseState(generator);
+        synchronized (state.lock) {
+            return new ColumnLease(state.epoch, state.perColumnRotations.getOrDefault(columnKey, 0L));
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568: whether {@code capturedLease} is STILL the current lease for
+     * this exact column -- {@code false} means an eviction (targeted, or a bulk {@code
+     * columns.clear()}) ran at some point between the capture and this check, so publishing the
+     * invocation that captured it would be publishing a now-possibly-stale result. Called from
+     * {@code SurfaceGeneratorColumnLeaseMixin}'s own {@code @WrapOperation} on {@code
+     * ConcurrentHashMap.putIfAbsent}, immediately before deciding whether to let that real call
+     * through at all.
+     */
+    public static boolean publishIfLeaseStillMatches(EarthGenerator generator, long columnKey, ColumnLease capturedLease) {
+        GeneratorLeaseState state = leaseState(generator);
+        synchronized (state.lock) {
+            return new ColumnLease(state.epoch, state.perColumnRotations.getOrDefault(columnKey, 0L)).equals(capturedLease);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568, "coordinate the existing {@code columns.clear}": called from
+     * {@code SurfaceGeneratorColumnLeaseMixin}'s own {@code @WrapOperation} wrapping the real bulk
+     * {@code columns.clear()} call inside {@code column()} itself (confirmed real: it fires once
+     * {@code columns.size() > 8192}) -- bumps the WHOLE generator's own epoch, invalidating every
+     * column's own previously-captured lease at once, matching the real clear's own "every column"
+     * scope exactly.
+     */
+    public static void bumpGeneratorEpochForFullClear(EarthGenerator generator) {
+        GeneratorLeaseState state = leaseState(generator);
+        synchronized (state.lock) {
+            state.epoch++;
+        }
+    }
+
+    /**
      * Evicts this one column's possibly-stale cached {@code Surface} decision (see
      * {@link SurfaceGeneratorColumnCacheAccessor}'s own doc for the real bug this guards against)
      * -- narrow, per-column, never a global cache clear. Column/chunk coordinates, matching
@@ -333,10 +429,21 @@ public final class RoadPrefetch {
      * so a direct cast to an interface its own Java source never declares implementing (which this
      * Mixin-woven accessor interface is, from the compiler's perspective at compile time) would not
      * compile without it.
+     *
+     * <p>MINECRAFT-566 comment 55568: also rotates this column's own lease (see
+     * {@link #publishIfLeaseStillMatches}'s own doc), atomically with the removal itself, under the
+     * SAME short per-generator lock -- "invalidate rotates/detaches that lease and removes the
+     * entry under a SHORT shared metadata critical section." Since every eviction caller in this
+     * codebase already funnels through this one method, the lease rotation applies everywhere
+     * eviction already happens, with no new call sites needed anywhere else.
      */
     public static void evictStaleSurfaceDecision(EarthGenerator generator, int columnX, int columnZ) {
-        ((SurfaceGeneratorColumnCacheAccessor) (Object) generator).earthplatformroads$columns()
-                .remove(surfaceGeneratorColumnKey(columnX, columnZ));
+        long key = surfaceGeneratorColumnKey(columnX, columnZ);
+        GeneratorLeaseState state = leaseState(generator);
+        synchronized (state.lock) {
+            state.perColumnRotations.merge(key, 1L, Long::sum);
+            ((SurfaceGeneratorColumnCacheAccessor) (Object) generator).earthplatformroads$columns().remove(key);
+        }
     }
 
     /**

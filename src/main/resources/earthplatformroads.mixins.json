@@ -8,6 +8,7 @@
     "EarthGeneratorPrepareMixin",
     "ServerCubeWorldRoadPrefetchMixin",
     "SurfaceGeneratorColumnCacheAccessor",
+    "SurfaceGeneratorColumnLeaseMixin",
     "SurfaceGeneratorRoadClearanceMixin"
   ],
   "injectors": {

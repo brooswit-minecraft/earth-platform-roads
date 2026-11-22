@@ -1451,4 +1451,115 @@ class RoadTilePrefetchMixinTest {
             stub.stop(0);
         }
     }
+
+    /**
+     * MINECRAFT-566 comment 55568, John's own independent prototype for closing the residual
+     * late-publish race ({@code ServerCubeWorldRoadPrefetchMixin}'s own "known, disclosed residual
+     * race" doc section; comment 55496, natively confirmed real in comment 55565): a per-column,
+     * per-generator "build lease," captured at {@code SurfaceGenerator.column()}'s own entry and
+     * re-checked immediately before that method's own real {@code putIfAbsent} publish. This is the
+     * SAME real, compiled {@link RoadPrefetch} API {@code SurfaceGeneratorColumnLeaseMixin} itself
+     * calls (not a reimplementation or a mock of it) -- the exact "helper-only adversarial model"
+     * John's own prototype already proved, now as a real, run test in this repository.
+     *
+     * <p>Proves BOTH orderings his own design names in one pass: "publication before invalidation
+     * is removed" (a lease captured and checked with NOTHING resolved in between still matches --
+     * the ordinary, non-racing case) and "publication after invalidation is rejected" (a lease
+     * captured, then an eviction runs, THEN the SAME captured lease is checked again -- it must no
+     * longer match, since that eviction rotated it).
+     */
+    @Test
+    void publishIfLeaseStillMatchesAllowsBeforeEvictionAndRejectsAfter(@TempDir Path demCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int columnX = 71, columnZ = -233; // arbitrary, never touched by anything else in this test
+        long columnKey = RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ);
+
+        var capturedBeforeEviction = RoadPrefetch.captureColumnLease(generator, columnKey);
+        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedBeforeEviction),
+                "Expected a lease checked with nothing resolved in between to still match -- 'publication before invalidation is removed,' the ordinary non-racing case");
+
+        RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+
+        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedBeforeEviction),
+                "Expected the SAME, now-stale captured lease to be rejected once an eviction has rotated it -- 'publication after invalidation is rejected,' the real property this mechanism adds");
+
+        // A FRESH capture, taken AFTER the eviction, must be the new current lease -- proving the
+        // rotation is real (not merely "never matches anything again") and the next genuine
+        // invocation can still publish normally.
+        var capturedAfterEviction = RoadPrefetch.captureColumnLease(generator, columnKey);
+        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedAfterEviction),
+                "Expected a freshly-captured lease, taken after the eviction, to be the new current lease");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568: rotating one column's lease must never affect a DIFFERENT
+     * column's own lease, even on the SAME generator instance -- narrow, per-column invalidation,
+     * matching {@code evictStaleSurfaceDecision}'s own long-standing "narrow, per-column, never a
+     * global cache clear" contract exactly.
+     */
+    @Test
+    void evictingOneColumnNeverAffectsASiblingColumnsLease(@TempDir Path demCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        long columnAKey = RoadPrefetch.surfaceGeneratorColumnKey(72, -234);
+        long columnBKey = RoadPrefetch.surfaceGeneratorColumnKey(73, -235);
+
+        var leaseA = RoadPrefetch.captureColumnLease(generator, columnAKey);
+        var leaseB = RoadPrefetch.captureColumnLease(generator, columnBKey);
+
+        RoadPrefetch.evictStaleSurfaceDecision(generator, 72, -234); // evicts column A only
+
+        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnAKey, leaseA),
+                "Expected column A's own lease to be rejected after its own eviction");
+        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnBKey, leaseB),
+                "Expected column B's own lease to be UNAFFECTED by column A's own eviction");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568: the SAME cross-generator-isolation lesson comment 55564's own
+     * real bug already taught this file once, applied here too -- two SEPARATE generator instances
+     * must never share or collide on lease state, even at identical column coordinates.
+     */
+    @Test
+    void twoSeparateGeneratorsHaveEntirelyIndependentLeaseState(@TempDir Path demCacheA, @TempDir Path demCacheB) throws Exception {
+        EarthGenerator generatorA = bootAndBuildGenerator(demCacheA);
+        EarthGenerator generatorB = bootAndBuildGenerator(demCacheB);
+        int columnX = 74, columnZ = -236; // identical coordinates on purpose, on both generators
+
+        var leaseA = RoadPrefetch.captureColumnLease(generatorA, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ));
+        var leaseB = RoadPrefetch.captureColumnLease(generatorB, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ));
+
+        RoadPrefetch.evictStaleSurfaceDecision(generatorA, columnX, columnZ); // evicts generator A's own column only
+
+        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generatorA, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseA),
+                "Expected generator A's own lease to be rejected after its own eviction");
+        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generatorB, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseB),
+                "Expected generator B's own lease, at the IDENTICAL column coordinates, to be entirely unaffected by generator A's own eviction");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55568's own "coordinate the existing columns.clear": the real
+     * {@code SurfaceGenerator.column()} method clears its WHOLE {@code columns} map once it exceeds
+     * 8192 entries (confirmed by reading the real, decompiled class -- see
+     * {@code SurfaceGeneratorColumnLeaseMixin}'s own class doc). Driving that real threshold from
+     * this harness is impractical (it would need 8193 real, distinct columns actually generated);
+     * this instead proves the {@link RoadPrefetch} API the Mixin's own clear-wrapping injector
+     * calls: bumping the generator's epoch must invalidate EVERY column's own previously-captured
+     * lease at once, matching a real bulk clear's own "every column" scope.
+     */
+    @Test
+    void bumpGeneratorEpochForFullClearInvalidatesEveryColumnsCapturedLeaseAtOnce(@TempDir Path demCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        long columnAKey = RoadPrefetch.surfaceGeneratorColumnKey(75, -237);
+        long columnBKey = RoadPrefetch.surfaceGeneratorColumnKey(76, -238);
+
+        var leaseA = RoadPrefetch.captureColumnLease(generator, columnAKey);
+        var leaseB = RoadPrefetch.captureColumnLease(generator, columnBKey);
+
+        RoadPrefetch.bumpGeneratorEpochForFullClear(generator);
+
+        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnAKey, leaseA),
+                "Expected column A's own previously-captured lease to be rejected after a bulk clear-equivalent epoch bump");
+        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnBKey, leaseB),
+                "Expected column B's own previously-captured lease to ALSO be rejected -- a bulk clear invalidates every column at once, not just one");
+    }
 }

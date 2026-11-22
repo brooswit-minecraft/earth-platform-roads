@@ -538,6 +538,65 @@ bump: minor
   Entirely disposable `@TempDir` caches throughout, per his own "never edit user cache" instruction
   -- no real/user cache file was read, written, or inspected by this change or its tests.
 
+### Added (comment 55568, a per-column "build lease" closing the residual publish race)
+- John's own independent prototype for the residual late-publish race `ServerCubeWorldRoadPrefetchMixin`'s
+  own doc already discloses (comment 55496, natively confirmed real in comment 55565): unconditional
+  re-eviction on every relevant touch only ever narrowed that race to "stale for at most until the
+  very next touch" -- it never eliminated it. New `SurfaceGeneratorColumnLeaseMixin` targets the
+  real, decompiled `SurfaceGenerator.column(int,int)` method directly (confirmed: `columns.get(key)`
+  first, then expensive terrain sampling, then `if (columns.size() > 8192) columns.clear();` then
+  `columns.putIfAbsent(key, made)` -- a SECOND, unrelated `putIfAbsent` call exists in this same real
+  class, on a different `grounds` field inside a different method, never touched by this fix's own
+  method-scoped injectors):
+  - A plain `@Inject` at `HEAD` -- before `column()` ever consults its cache -- captures the current
+    "build lease" for this exact column (`RoadPrefetch.captureColumnLease`, scoped per
+    `EarthGenerator` INSTANCE via a `WeakHashMap`, the same cross-generator-isolation lesson comment
+    55564's own real bug already taught this file once), carried through to the publish check below
+    via a `@Share`d `LocalRef` (per-invocation, never a static field -- comment 55556's own "global
+    hold flag leaks" finding, not repeated here).
+  - A `@WrapOperation` on the real `columns.putIfAbsent(key, made)` call re-checks the lease
+    immediately before publishing (`RoadPrefetch.publishIfLeaseStillMatches`): if an eviction
+    (targeted, or a bulk clear) rotated it in between, the real publish is SKIPPED entirely --
+    "publication after invalidation is rejected" -- returning the map's current value for that key
+    instead, mimicking `putIfAbsent`'s own real contract. "Publication before invalidation is
+    removed" needs no new mechanism: a publish landing before an eviction is simply cleaned up by
+    that eviction's own `columns.remove(key)`, unchanged.
+  - A `@WrapOperation` on the real `columns.clear()` call ("coordinate the existing
+    `columns.clear`" -- confirmed real, firing once this generator's own map exceeds 8192 entries)
+    bumps this generator's own epoch after the real clear runs, invalidating every column's
+    previously-captured lease at once, matching the clear's own "every column" scope.
+  - `RoadPrefetch.evictStaleSurfaceDecision` itself now rotates the targeted column's own lease AND
+    removes the cache entry atomically, under one short, per-generator lock ("invalidate
+    rotates/detaches that lease and removes the entry under a SHORT shared metadata critical
+    section") -- since every eviction caller in this codebase already funnels through this one
+    method, the new rotation applies everywhere eviction already happens, with no new call sites
+    needed. That lock is NEVER held around `column()`'s own terrain sampling, any HTTP, or any wait.
+  - Per John's own explicit "keep retouch eviction on relevant workers initially; no global skip":
+    this is purely additive underneath the existing eviction-frequency behavior, not a replacement
+    for it -- the reverted skip-on-unchanged-generation optimization (comments 55564/55565) is NOT
+    reintroduced under any name.
+- New tests (`publishIfLeaseStillMatchesAllowsBeforeEvictionAndRejectsAfter`,
+  `evictingOneColumnNeverAffectsASiblingColumnsLease`,
+  `twoSeparateGeneratorsHaveEntirelyIndependentLeaseState`,
+  `bumpGeneratorEpochForFullClearInvalidatesEveryColumnsCapturedLeaseAtOnce`) drive the REAL,
+  compiled `RoadPrefetch` lease API directly -- the same "helper-only adversarial model" John's own
+  prototype already proved, now as real, run tests in this repository -- proving both orderings his
+  own design names, per-column isolation, per-generator isolation, and the bulk-clear-equivalent
+  epoch bump. Driving the real 8192-entry `columns.clear()` threshold itself from this harness is
+  impractical (would need 8193 real, distinct generated columns); the epoch-bump test covers the
+  `RoadPrefetch` side of that coordination instead. 103/103 tests pass.
+- `./gradlew compileJava` is clean against the real `combined-73` dependency -- Mixin's own
+  annotation processor validated the exact `column(II)...`, `clear()V`, and
+  `putIfAbsent(Object,Object)Object` target descriptors (including that the `putIfAbsent` and
+  `clear` calls genuinely exist, exactly once each, inside `column(int,int)` specifically) against
+  the real classpath.
+- Known, disclosed limitation of this exact candidate, same as every other Mixin fix in this entire
+  ticket: no test here drives the real, compiled `SurfaceGenerator.column()` method itself (no real
+  `ServerLevel`/live NeoForge environment in this harness) -- whether this Mixin actually weaves and
+  fires as written, including whether `@Share` correctly threads the captured lease from the
+  `@Inject` through to both `@WrapOperation`s in one real invocation, is NOT independently verified
+  here. John's own native infrastructure is what will confirm that.
+
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
   theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube
