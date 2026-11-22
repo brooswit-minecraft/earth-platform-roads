@@ -1,0 +1,147 @@
+name: Build Roads
+
+on:
+  # MINECRAFT-567 (Wroosbit comment 55600): this branch's own PR (#8) is stacked on PR #7
+  # (minecraft-567-road-fetch-telemetry), not main -- main's own copy of this workflow only
+  # triggers for a main-based pull_request/push, so a plain unmodified copy of it (added here
+  # verbatim first, confirmed via commit 030504c's own zero check-runs) never actually fires for
+  # this stacked PR regardless of the file being present. Both feature branch names are added
+  # here, in THIS COPY ONLY (main's own workflow file is untouched), purely so the existing build
+  # job actually runs for this exact stacked head -- no job logic changed, no new release
+  # automation invented, no merge-to-main authorized.
+  pull_request:
+    branches: [main, minecraft-567-road-fetch-telemetry]
+  push:
+    branches: [main, minecraft-567-road-fetch-telemetry, minecraft-567-loopback-proxy-client]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      artifact: ${{ steps.version.outputs.artifact }}
+      jar_sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set artifact version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          prerelease = False
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              tag = os.environ["GITHUB_REF_NAME"]
+              num = r"(?:0|[1-9][0-9]*)"
+              pre_id = rf"(?:{num}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+              semver = rf"v({num}\.{num}\.{num})(?:-({pre_id}(?:\.{pre_id})*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+              match = re.fullmatch(semver, tag)
+              if match is None:
+                  raise SystemExit("Release tag must be v followed by an exact SemVer version")
+              version = tag[1:]
+              prerelease = match.group(2) is not None
+          else:
+              run = os.environ["GITHUB_RUN_NUMBER"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              commit = os.environ["GITHUB_SHA"][:12]
+              version = f"0.0.0-preview.{run}.{attempt}.g{commit}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print(f"version={version}", file=out)
+              print(f"prerelease={str(prerelease).lower()}", file=out)
+              print(f"artifact=earthplatformroads-{version}", file=out)
+          PY
+      - name: Fetch and verify public build dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p libs
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --output libs/earthplatform-0.1.0-alpha.73.jar \
+            https://github.com/pirut/earth-platform/releases/download/combined-73/earthplatform-combined-73.jar
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --output libs/layeredslopes-0.2.0.jar \
+            https://github.com/brooswit-minecraft/layered-slopes/releases/download/v0.2.0/layeredslopes-0.2.0.jar
+          sha256sum --check --strict <<'SHA256'
+          e921b0284f0f94e77af43307dfa4bebcf3659c5889eebfb37d39a45966022a41  libs/earthplatform-0.1.0-alpha.73.jar
+          0d6ef73152d99e9de1278f272fe1f40fec039a2b1d31d32bd38af7e0f79b2878  libs/layeredslopes-0.2.0.jar
+          SHA256
+      - name: Build jar with repository wrapper
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./gradlew --no-daemon --console=plain "-Pmod_version=$VERSION" jar
+      - name: Verify and stage only the Roads jar
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACT: ${{ steps.version.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          jar="$ARTIFACT.jar"
+          python3 - "$jar" "$VERSION" <<'PY'
+          import sys, tomllib, zipfile
+
+          jar, version = sys.argv[1:]
+          with zipfile.ZipFile("build/libs/" + jar) as z:
+              meta = tomllib.loads(z.read("META-INF/neoforge.mods.toml").decode())
+          if not any(m["modId"] == "earthplatformroads" and m["version"] == version for m in meta["mods"]):
+              raise SystemExit("Roads mod ID/version does not match the expected artifact")
+          PY
+          mkdir -p staging
+          cp "build/libs/$jar" "staging/$jar"
+          (cd staging && sha256sum "$jar" > SHA256SUMS)
+          printf 'sha256=%s\n' "$(cut -d ' ' -f 1 staging/SHA256SUMS)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: staging/
+          if-no-files-found: error
+
+  publish-github-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: staging
+      - name: Verify exact jar before publishing
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          ARTIFACT: ${{ needs.build.outputs.artifact }}
+          JAR_SHA256: ${{ needs.build.outputs.jar_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+          test "$ARTIFACT" = "earthplatformroads-$VERSION"
+          [[ "$JAR_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          cd staging
+          printf '%s  %s.jar\n' "$JAR_SHA256" "$ARTIFACT" | sha256sum --check --strict
+          printf '%s  %s.jar\n' "$JAR_SHA256" "$ARTIFACT" > SHA256SUMS
+      - name: Create GitHub release for existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ARTIFACT: ${{ needs.build.outputs.artifact }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "${flags[@]}" \
+            "staging/$ARTIFACT.jar" staging/SHA256SUMS

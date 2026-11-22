@@ -9,7 +9,9 @@ import io.earthplatform.geography.globe.MercatorGrid;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -197,6 +199,49 @@ public final class RoadNetwork {
      * this per-save would mean resolving the active save's own directory from inside a mixin on
      * {@code EarthGenerator} (which does not expose one), not attempted here.
      */
+    /**
+     * MINECRAFT-567 (butchr reviews 55604, and the follow-up DNS-rebinding finding on GitHub comment
+     * 7085974767): the loopback-proxy slice's whole safety story depends on this switch only ever
+     * sending requests to the local machine. {@code URI.create} alone accepts any well-formed URI,
+     * including a real remote host, so this validates scheme (HTTP(S) only, no credentials leak via
+     * other schemes) and resolves the configured host to confirm it is actually a loopback address.
+     *
+     * <p>Resolving the hostname here is not enough by itself: if the returned URI still carried the
+     * original hostname, {@code HttpClient} would resolve it AGAIN at connection time, and a hostname
+     * that happened to answer loopback during this check (DNS rebinding, or a resolver/hosts change
+     * in between) could then connect off-box after validation -- a classic check-then-use gap. So
+     * this returns a rewritten URI whose host is the validated literal loopback address itself
+     * (scheme/port/path/query preserved); {@code HttpClient} connects to that literal address
+     * directly, with no second hostname resolution able to redirect it anywhere else.
+     *
+     * <p>Returns {@code null} for anything not usable as a loopback endpoint (bad syntax, non-HTTP(S)
+     * scheme, missing host, DNS failure, or a host that resolves off-box) -- the caller then falls
+     * through to the same network-disabled {@code about:blank} source as an unconfigured switch,
+     * never to the real direct-provider endpoint.
+     */
+    static URI pinnedLoopbackHttpEndpoint(String endpointProperty) {
+        try {
+            URI uri = URI.create(endpointProperty);
+            String scheme = uri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+                return null;
+            }
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return null;
+            InetAddress[] resolved = InetAddress.getAllByName(host);
+            if (resolved.length == 0) return null;
+            for (InetAddress address : resolved) {
+                if (!address.isLoopbackAddress()) return null;
+            }
+            String literalHost = resolved[0].getHostAddress();
+            if (resolved[0] instanceof java.net.Inet6Address) literalHost = "[" + literalHost + "]";
+            return new URI(uri.getScheme(), uri.getUserInfo(), literalHost, uri.getPort(), uri.getPath(),
+                    uri.getQuery(), uri.getFragment());
+        } catch (IllegalArgumentException | UnknownHostException | java.net.URISyntaxException e) {
+            return null;
+        }
+    }
+
     private static RoadTileSource buildDefaultTileSource() {
         try {
             Path cacheRoot = tileCacheRootOverride != null
@@ -205,6 +250,46 @@ public final class RoadNetwork {
 
             if (tileEndpointOverride != null) {
                 return new RoadTileSource(tileEndpointOverride, cacheRoot, true, TILE_FETCH_TIMEOUT);
+            }
+
+            // MINECRAFT-567 (John comments 55588/55593): a SEPARATE, opt-in, credential-free
+            // loopback-proxy mode, checked strictly BEFORE the ordinary direct-Overpass.ch opt-in
+            // chain below so that chain's own code path stays byte-for-byte unchanged whenever this
+            // switch is off (the ordinary, unmodified state of a real install: both
+            // Boolean.getBoolean and System.getProperty below return false/null with nothing set).
+            // Not a save-file/world setting -- gated on a JVM -D system property only, exactly like
+            // the existing previewProvider/previewEndpoint switches it sits beside.
+            boolean loopbackProxyEnabled = Boolean.getBoolean("earthplatformroads.loopbackProxyEnabled");
+            if (loopbackProxyEnabled) {
+                String loopbackEndpointProperty = System.getProperty("earthplatformroads.loopbackProxyEndpoint");
+                URI pinnedLoopbackEndpoint = loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()
+                        ? null : pinnedLoopbackHttpEndpoint(loopbackEndpointProperty);
+                if (pinnedLoopbackEndpoint == null) {
+                    // Enabled but not configured, or configured with a non-HTTP(S)/non-loopback
+                    // target: a network-disabled source, exactly like the ordinary "opted in but
+                    // under-provisioned" case below -- never a silent fallback to the real
+                    // Overpass.ch direct endpoint, and never a send to a destination outside this
+                    // slice's loopback-only safety boundary (butchr reviews 55604 and the
+                    // DNS-rebinding follow-up on GitHub comment 7085974767).
+                    return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
+                }
+                long loopbackMinIntervalMs = Long.getLong("earthplatformroads.loopbackProxyMinRequestIntervalMs", 0L);
+                boolean telemetryReportingEnabledForLoopback = Boolean.getBoolean("earthplatformroads.fetchTelemetryReportingEnabled");
+                long telemetryReportIntervalSecondsForLoopback = Long.getLong(
+                        "earthplatformroads.fetchTelemetryReportIntervalSeconds", DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS);
+                // Credential-free by design (John comment 55588: "do not send keys to the proxy from
+                // Roads"): apiKey is always null here, regardless of whether
+                // EARTHPLATFORMROADS_PREVIEW_API_KEY happens to be set for direct mode. This is also
+                // structurally enforced one layer down -- RoadTileSource.shouldSendApiKeyTo only ever
+                // attaches a key when the configured endpoint exactly equals the Overpass.ch
+                // CREDENTIAL_BOUND_ENDPOINT, which a loopback URL never does -- but passing null here
+                // too means the key is never even held by a loopback-mode RoadTileSource instance.
+                // pinnedLoopbackEndpoint's host is the validated literal loopback address itself
+                // (never the original hostname), so HttpClient has no hostname left to resolve a
+                // second time -- it connects to that literal address directly.
+                return new RoadTileSource(pinnedLoopbackEndpoint, cacheRoot, true, TILE_FETCH_TIMEOUT,
+                        null, Duration.ofMillis(loopbackMinIntervalMs),
+                        telemetryReportingEnabledForLoopback, Duration.ofSeconds(telemetryReportIntervalSecondsForLoopback));
             }
 
             boolean optedIntoPreview = "overpass-ch".equals(System.getProperty("earthplatformroads.previewProvider"));
