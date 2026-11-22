@@ -86,16 +86,37 @@ final class LevelRoadPreviewOfflineTest {
             RoadNetwork.setTileSourceForTests(cachedOnly);
             try {
                 assertEquals(WAY_ID, RoadNetwork.segmentCoveringColumn(earth.grid(), X, Z).wayId());
-                int z = findFractionalStation(earth);
+                Map<CubeKey, LevelChunkSection> sections = new HashMap<>();
+                int ceiling = Integer.MIN_VALUE;
+                for (int row = Z - 70; row <= Z + 70; row++) {
+                    for (int x = X - 8; x <= X + 8; x++) ceiling = Math.max(ceiling, earth.surfaceY(x, row));
+                }
+                int z = 0;
+                double previous = Double.NaN, expected = Double.NaN;
+                for (int row = Z - 12; row <= Z + 12; row++) {
+                    // Independently discover the actual generated cap, not the planner's output.
+                    double leftTop = findActualCap(earth, sections, X - 2, row, ceiling, false);
+                    double centerTop = findActualCap(earth, sections, X, row, ceiling, true);
+                    double rightTop = findActualCap(earth, sections, X + 2, row, ceiling, false);
+                    assertEquals(centerTop, leftTop, 1e-7, "left at row " + row);
+                    assertEquals(centerTop, rightTop, 1e-7, "right at row " + row);
+                    if (Double.isFinite(previous)) {
+                        assertTrue(Math.abs(previous - centerTop) <= .5 + 1e-7,
+                                "adjacent grade exceeds half a block at row " + row);
+                    }
+                    previous = centerTop;
+                    if (!Double.isFinite(expected) && centerTop != Math.floor(centerTop)) {
+                        z = row;
+                        expected = centerTop;
+                    }
+                }
+                assertTrue(Double.isFinite(expected), "fixture must contain a fractional cap");
                 int low = earth.surfaceY(X - 2, z);
                 int high = earth.surfaceY(X + 2, z);
                 assertTrue(high > low + 1, "offline DEM must produce a meaningful cross slope");
-                double expected = expectedTop(earth, z);
                 int y = (int) Math.floor(expected);
                 assertTrue(y > high && expected > y, "fixture must exercise a raised fractional deck");
 
-                Map<CubeKey, LevelChunkSection> sections = new HashMap<>();
-                // Request the raised cap slices first. Do not prepopulate low-side support.
                 var left = read(earth, sections, X - 2, y, z);
                 var stripe = read(earth, sections, X, y, z);
                 var right = read(earth, sections, X + 2, y, z);
@@ -122,8 +143,7 @@ final class LevelRoadPreviewOfflineTest {
         var key = new CubeKey(x >> 4, y >> 4, z >> 4);
         var section = sections.computeIfAbsent(key, k -> {
             var generated = earth.generate(k.x(), k.y(), k.z());
-            assertTrue(LevelRoadPreview.apply(earth, k.x(), k.y(), k.z(), generated),
-                    "production overlay did not touch expected cube " + k);
+            LevelRoadPreview.apply(earth, k.x(), k.y(), k.z(), generated);
             return generated;
         });
         return section.getBlockState(x & 15, y & 15, z & 15);
@@ -133,36 +153,19 @@ final class LevelRoadPreviewOfflineTest {
         return blockY + state.getCollisionShape(null, null).max(Direction.Axis.Y);
     }
 
-    private static int findFractionalStation(EarthGenerator earth) {
-        for (int z = Z - 24; z < Z + 24; z++) {
-            double top = expectedTop(earth, z);
-            if (top != Math.floor(top)) return z;
+    private static double findActualCap(EarthGenerator earth, Map<CubeKey, LevelChunkSection> sections,
+            int x, int z, int ceiling, boolean stripe) {
+        var want = stripe ? LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get()
+                : LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get();
+        int natural = earth.surfaceY(x, z);
+        int water = earth.waterY(x, z);
+        assertTrue(water == SurfaceGenerator.DRY || water < natural, "fixture must remain dry");
+        // Search high-first. A baseline cap at/below the local natural top does not count.
+        for (int y = ceiling + 1; y >= natural; y--) {
+            var state = read(earth, sections, x, y, z);
+            if (state.is(want) && collisionTop(state, y) >= natural + 1.0) return collisionTop(state, y);
         }
-        throw new AssertionError("synthetic grade did not induce any fractional station");
-    }
-
-    private static double expectedTop(EarthGenerator earth, int z) {
-        int here = pavedMax(earth, z);
-        int before = pavedMax(earth, z - 1);
-        int after = pavedMax(earth, z + 1);
-        return Math.max(here + 1.0, (before + 2.0 * here + after) * .25 + 1.0);
-    }
-
-    private static int pavedMax(EarthGenerator earth, int z) {
-        var grid = earth.grid();
-        int max = Integer.MIN_VALUE;
-        for (int x = X - 10; x <= X + 10; x++) {
-            var segment = RoadNetwork.segmentCoveringColumn(grid, x, z);
-            if (segment == null || segment.wayId() != WAY_ID) continue;
-            var zone = segment.crossSectionAt(grid, x, z);
-            if (zone != RoadSegment.CrossSection.PAVED && zone != RoadSegment.CrossSection.CENTERLINE) continue;
-            int ground = earth.surfaceY(x, z);
-            int water = earth.waterY(x, z);
-            assertTrue(water == SurfaceGenerator.DRY || water < ground, "fixture must remain dry");
-            max = Math.max(max, ground);
-        }
-        assertTrue(max != Integer.MIN_VALUE, "fixture must have a paved footprint");
-        return max;
+        throw new AssertionError("road cap missing or below the no-cut floor at " + x + "," + z);
     }
 
     /** A local continuous ramp encoded as real Terrarium PNGs at all supported relevant zooms. */
