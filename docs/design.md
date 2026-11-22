@@ -1508,6 +1508,39 @@ saved road terrain) is worse than the performance it bought back. A provenance-b
 could safely skip without this risk is left as a possible future refinement, not attempted here.
 97/97 tests pass.
 
+## MINECRAFT-566: two real bugs in the shared disk-read helper, found before packaging 50f64e6 (comment 55567)
+
+Before this commit's own eventual packaging, review of `readDiskCacheIfPresent`/the new
+`readDiskCacheUncached` found two real correctness bugs, plus one allocation regression:
+
+**Bug 1 -- wrong precedence.** The helper checked the `.empty` marker BEFORE the `.json` ready
+file, the opposite of this codebase's own established readiness/paint precedence (valid geometry
+always wins). A cell with BOTH files present -- a stale `.empty` left behind from an earlier
+genuinely-empty fetch, followed later by a real `.json` write once a road is actually found there
+(`attemptFetch` never cleans up the other marker kind when it writes a new one) -- would have been
+memoized as confirmed-empty, silently hiding an already-written real road. Fixed by checking the
+ready file first.
+
+**Bug 2 -- an unvalidated marker trusted as confirmed.** The helper trusted mere file existence as
+proof of a genuine confirmation, never inspecting the marker's own content. A malformed or
+truncated marker (a crash mid-write, disk corruption) would have been silently treated as a real
+"no road here" answer -- a disk READ failure, indistinguishable from never having been written at
+all. Fixed by `isValidEmptyMarker`: a genuinely empty (0-byte) file is accepted outright
+(preserving this whole test suite's own long-standing convention for a lightweight marker, so no
+existing fixture needed to change), while a non-empty file must actually parse as the same valid
+JSON `writeCachedCell` always writes for a real confirmed-empty result -- anything else falls
+through to PENDING, never a false confirmation.
+
+**Allocation regression, restored.** `cellState`/`cachedWaysForCellOrEmpty` now check `memory`
+directly first, before building the `cellId` string and resolving two `Path` objects -- the
+previous version always paid for that construction regardless of whether a warm hit made it
+unnecessary. The actual disk-read-and-validate logic only runs on a genuine cold miss now.
+
+Per John's own explicit instruction, no "before/after" timing numbers from the prior round are
+carried forward to this commit -- a fresh, independent performance/race benchmark is his own next
+step. 99/99 tests pass. Entirely disposable `@TempDir` caches throughout, per his own "never edit
+user cache" instruction.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

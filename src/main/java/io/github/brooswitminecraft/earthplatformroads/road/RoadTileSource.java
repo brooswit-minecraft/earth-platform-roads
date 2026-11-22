@@ -555,10 +555,14 @@ public final class RoadTileSource {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
-        String cellId = cellLat + "_" + cellLon;
-        Path readyFile = cacheRoot.resolve(cellId + ".json");
-        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
-        List<RoadSegment> loaded = readDiskCacheIfPresent(key, readyFile, emptyFile);
+        // MINECRAFT-566 comment 55567: "keep the shared helper's warm memory.get before computing
+        // cellId/resolving path objects -- the old warm paint path was allocation-free here." Check
+        // memory FIRST, before building the cellId string and the two Path objects below -- a warm
+        // hit (the ordinary case for any cell already touched once) now costs exactly one map
+        // lookup, matching the original zero-allocation warm path, rather than always paying for a
+        // String concat and two Path.resolve calls regardless of whether they end up needed.
+        List<RoadSegment> warm = memory.get(key);
+        List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
         if (loaded == null) return CellState.PENDING;
         return loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY;
     }
@@ -588,10 +592,10 @@ public final class RoadTileSource {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
-        String cellId = cellLat + "_" + cellLon;
-        Path readyFile = cacheRoot.resolve(cellId + ".json");
-        Path emptyFile = cacheRoot.resolve(cellId + ".empty");
-        List<RoadSegment> loaded = readDiskCacheIfPresent(key, readyFile, emptyFile);
+        // MINECRAFT-566 comment 55567: same warm-path allocation concern as cellState's own doc --
+        // check memory before building cellId/Path objects at all.
+        List<RoadSegment> warm = memory.get(key);
+        List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
         return loaded != null ? loaded : List.of();
     }
 
@@ -756,27 +760,91 @@ public final class RoadTileSource {
     }
 
     /**
-     * Memory, then disk ({@code .empty}/{@code .json}) -- {@code null} means a genuine cache miss,
+     * Memory, then disk ({@code .json}/{@code .empty}) -- {@code null} means a genuine cache miss,
      * not an error. Every successful disk-validated load newly populates {@link #memory} (never a
      * miss).
      */
     private List<RoadSegment> readDiskCacheIfPresent(long key, Path readyFile, Path emptyFile) {
         List<RoadSegment> cached = memory.get(key);
         if (cached != null) return cached;
+        return readDiskCacheUncached(key, readyFile, emptyFile);
+    }
+
+    /**
+     * MINECRAFT-566 comment 55567: {@link #cellState}/{@link #cachedWaysForCellOrEmpty} already
+     * check {@link #memory} themselves (their own "warm, allocation-free" fast path) before ever
+     * building a {@code cellId} string or resolving a {@code Path} -- this overload lets them defer
+     * that work to here, on the cold path only, rather than duplicating the actual disk-read/
+     * validate logic below.
+     */
+    private List<RoadSegment> readDiskCacheUncached(long key, long cellLat, long cellLon) {
+        String cellId = cellLat + "_" + cellLon;
+        return readDiskCacheUncached(key, cacheRoot.resolve(cellId + ".json"), cacheRoot.resolve(cellId + ".empty"));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55567, two real bugs John's own review found in this exact method:
+     *
+     * <p><b>Bug 1 -- wrong precedence.</b> The previous version checked the {@code .empty} marker
+     * BEFORE the {@code .json} ready file, the opposite of the already-installed {@code cf8c013}
+     * preview's own readiness/paint precedence (valid geometry always wins). A cell that somehow
+     * ends up with BOTH files present (a stale {@code .empty} marker left over from an earlier,
+     * genuinely-empty fetch, later followed by a real write of {@code .json} once a road was
+     * actually found covering it -- {@code attemptFetch} itself never cleans up a prior marker of
+     * the other kind when it writes a new one) would have been memoized as confirmed-empty,
+     * silently hiding a real, already-written road. Fixed by checking {@code readyFile} first.
+     *
+     * <p><b>Bug 2 -- an unvalidated marker is trusted as confirmed.</b> The previous version trusted
+     * {@code Files.isRegularFile(emptyFile)} alone -- mere EXISTENCE -- as proof of a genuine
+     * confirmation, never inspecting the file's own contents. A malformed or truncated marker (a
+     * crash mid-write, disk corruption) would have been silently treated as a real "no road here"
+     * answer rather than what it actually is: a disk READ failure, indistinguishable from never
+     * having been written at all. Fixed by {@link #isValidEmptyMarker}: a genuinely EMPTY file (0
+     * bytes -- the long-standing convention this whole test suite already uses for a lightweight,
+     * contentless marker) is accepted outright; a NON-empty file must actually parse as the same
+     * valid JSON {@link #writeCachedCell} itself always writes for a real confirmed-empty result
+     * (schema/bbox/ways, with an empty {@code ways} array) -- anything else (garbage, a truncated
+     * write) is rejected, falling through to {@code null} (PENDING), never silently accepted as a
+     * real confirmation. A rejected marker is deliberately NOT deleted or overwritten here -- this
+     * method only reads; the next real fetch attempt (whenever one happens) will overwrite it via
+     * {@link #writeCachedCell}'s own atomic move, same as any other retry.
+     */
+    private List<RoadSegment> readDiskCacheUncached(long key, Path readyFile, Path emptyFile) {
         try {
-            if (Files.isRegularFile(emptyFile)) {
-                memory.put(key, List.of());
-                return List.of();
-            }
             if (Files.isRegularFile(readyFile)) {
                 List<RoadSegment> ways = readCachedCell(readyFile);
                 memory.put(key, ways);
                 return ways;
             }
+            if (Files.isRegularFile(emptyFile) && isValidEmptyMarker(emptyFile)) {
+                memory.put(key, List.of());
+                return List.of();
+            }
         } catch (IOException e) {
             throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
         }
         return null;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55567: see {@link #readDiskCacheUncached}'s own "Bug 2" doc for the full
+     * reasoning. A 0-byte file is accepted outright (this whole test suite's own long-standing
+     * convention for a deliberate, contentless marker); otherwise the content must actually parse as
+     * valid JSON the same way a real {@link #readCachedCell} load would -- {@link #writeCachedCell}
+     * always writes a full, real JSON document even for a confirmed-empty result, so any genuinely
+     * production-written marker parses cleanly. Catches both a checked {@link IOException} (disk
+     * read failure) and the unchecked parse exceptions Gson's own JSON parser throws for malformed
+     * content (there is no narrower common supertype across both without a broader catch), treating
+     * either uniformly as "not a valid marker," never a hard failure of this whole lookup.
+     */
+    private boolean isValidEmptyMarker(Path emptyFile) throws IOException {
+        if (Files.size(emptyFile) == 0) return true;
+        try {
+            readCachedCell(emptyFile);
+            return true;
+        } catch (IOException | RuntimeException malformed) {
+            return false;
+        }
     }
 
     /** Thrown by {@link #fetchCell} when {@link #nextEligibleRequestAt} hasn't passed yet; never leaves this class. */

@@ -504,6 +504,40 @@ bump: minor
   build provenance rather than inferring freshness from an external counter) is worth the added
   complexity is left for a future round, not attempted here.
 
+### Fixed (comment 55567, two real bugs in the shared disk-read helper, found before packaging 50f64e6)
+- **Bug 1, wrong precedence:** the shared `readDiskCacheIfPresent`/`readDiskCacheUncached` helper
+  checked the `.empty` marker BEFORE the `.json` ready file -- the opposite of this codebase's own
+  established readiness/paint precedence (valid geometry always wins). A cell that somehow ends up
+  with BOTH files present (a stale `.empty` marker left behind from an earlier genuinely-empty
+  fetch, followed later by a real `.json` write once a road actually covers it -- `attemptFetch`
+  never cleans up the OTHER marker kind when it writes a new one) would have been memoized as
+  confirmed-empty, silently hiding an already-written real road. Fixed by checking `readyFile`
+  first. Proven by a new test, `aValidReadyFileWinsOverAStaleEmptyMarkerForTheSameCell` (both
+  `cellState` and the actual neighbor-read path `cachedWaysForCellOrEmpty`, plus a fresh instance
+  with no shared memory to rule out this only being an ordering artifact).
+- **Bug 2, an unvalidated marker trusted as confirmed:** the helper trusted mere file EXISTENCE
+  (`Files.isRegularFile`) as proof of a genuine confirmed-empty answer, never inspecting the
+  marker's own contents. A malformed or truncated marker (a crash mid-write, disk corruption) would
+  have been silently treated as a real "no road here" answer -- a disk READ failure,
+  indistinguishable from never having been written at all. Fixed by `isValidEmptyMarker`: a
+  genuinely EMPTY (0-byte) file is accepted outright (this whole test suite's own long-standing
+  convention for a lightweight, contentless marker, preserved deliberately so existing fixtures
+  were not broken); a NON-empty file must actually parse as the same valid JSON `writeCachedCell`
+  itself always writes for a real confirmed-empty result -- anything else falls through to
+  genuinely PENDING, never a false confirmation. Proven by a new test,
+  `aMalformedEmptyMarkerIsNeverTrustedAsConfirmedButAGenuinelyEmptyOneStillIs`.
+- **Allocation on the warm path, restored:** `cellState`/`cachedWaysForCellOrEmpty` now check
+  `memory` directly, FIRST, before building the `cellId` string and resolving the two `Path`
+  objects -- the previous version always paid for that construction regardless of whether a warm
+  hit made it unnecessary, a real regression from the original, allocation-free warm path. The
+  actual disk-read-and-validate logic (now shared via `readDiskCacheUncached`) is only reached on a
+  genuine cold miss.
+- Per John's own explicit instruction, no "before/after" timing numbers from the prior round are
+  carried forward to this head -- a fresh, independent performance/race benchmark against this
+  exact commit is his own next step, not reported here. 99/99 tests pass (97 existing + 2 new).
+  Entirely disposable `@TempDir` caches throughout, per his own "never edit user cache" instruction
+  -- no real/user cache file was read, written, or inspected by this change or its tests.
+
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
   theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube

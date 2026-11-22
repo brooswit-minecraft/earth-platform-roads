@@ -821,4 +821,75 @@ class RoadTileSourceTest {
         assertEquals(1, requests.get(), "Expected EXACTLY one real request -- a genuine attempted failure must never be retried by the cooldown-retry loop");
         assertEquals(RoadTileSource.CellState.PENDING, source.cellState(90.0, 90.0), "Expected the cell to stay genuinely pending (retryable later), not confirmed-empty");
     }
+
+    /**
+     * MINECRAFT-566 comment 55567's own "Bug 1": the shared disk-read helper previously checked the
+     * {@code .empty} marker BEFORE the {@code .json} ready file -- the opposite of this codebase's
+     * own established readiness/paint precedence, where valid geometry always wins. Reproduces the
+     * exact scenario named: a cell that somehow has BOTH a real, valid {@code .json} (a genuine
+     * road) AND a stale {@code .empty} marker left over from an earlier state. The cell must resolve
+     * as READY with the real way, never CONFIRMED_EMPTY -- proven both via {@code cellState} and via
+     * {@code cachedWaysForCellOrEmpty} (the actual neighbor-read/paint path), and proven again from a
+     * FRESH instance over the same disposable cache root (no shared in-memory state at all) to rule
+     * out this only being a memory-ordering artifact of one particular instance's own call order.
+     * Entirely a disposable {@code @TempDir} cache -- never touches any real/user cache, per John's
+     * own explicit instruction.
+     */
+    @Test
+    void aValidReadyFileWinsOverAStaleEmptyMarkerForTheSameCell(@TempDir Path cacheRoot) throws IOException {
+        double lat = 63.0005, lon = -173.0005; // cell 6300_-17301
+        java.nio.file.Files.createDirectories(cacheRoot);
+        // The stale, left-behind marker from some earlier, genuinely-empty state.
+        java.nio.file.Files.writeString(cacheRoot.resolve("6300_-17301.empty"), "");
+        // A real, valid, already-written road for the SAME cell -- the production writer's own
+        // exact schema (schema_version/region_id/bbox/ways), not a synthetic shortcut.
+        String realRoadJson = """
+                {"schema_version":1,"region_id":"tile_63.0_-173.01","fetched_at":"2026-01-01T00:00:00Z",
+                 "bbox":{"min_lat":63.0,"min_lon":-173.01,"max_lat":63.01,"max_lon":-173.0},
+                 "ways":[{"way_id":555200,"way_tags":{"highway":"secondary","name":"Precedence Test Street"},
+                 "centerline":[{"lat":63.004,"lon":-173.005},{"lat":63.006,"lon":-173.005}],
+                 "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(cacheRoot.resolve("6300_-17301.json"), realRoadJson);
+
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        assertEquals(RoadTileSource.CellState.READY, source.cellState(lat, lon),
+                "Expected the valid ready file to win over the stale empty marker, never CONFIRMED_EMPTY");
+        assertTrue(!source.cachedWaysForCellOrEmpty(lat, lon).isEmpty(),
+                "Expected the real neighbor-read path to actually return the real way, not an empty list");
+
+        // A fresh instance, no shared memory state at all -- rules out this only holding because of
+        // THIS instance's own particular call order.
+        RoadTileSource freshSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        assertEquals(RoadTileSource.CellState.READY, freshSource.cellState(lat, lon),
+                "Expected a FRESH instance over the same disk state to also prefer the valid ready file");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55567's own "Bug 2": the shared disk-read helper previously trusted
+     * {@code Files.isRegularFile} on the {@code .empty} marker ALONE -- mere existence -- as proof
+     * of a genuine confirmation, never inspecting its actual contents. A malformed/truncated marker
+     * (a crash mid-write, disk corruption) must NOT be treated as a real "no road here" answer --
+     * that is a disk READ failure, indistinguishable from never having been written at all, so the
+     * cell must still report PENDING (retryable), never CONFIRMED_EMPTY. A genuinely EMPTY (0-byte)
+     * marker -- this whole test suite's own long-standing convention -- must still be accepted, so
+     * this is not a blanket rejection of every lightweight test fixture already in use elsewhere.
+     */
+    @Test
+    void aMalformedEmptyMarkerIsNeverTrustedAsConfirmedButAGenuinelyEmptyOneStillIs(@TempDir Path cacheRoot) throws IOException {
+        double malformedLat = 64.0005, malformedLon = -174.0005; // cell 6400_-17401
+        double genuinelyEmptyLat = 64.0005, genuinelyEmptyLon = -173.9905; // cell 6400_-17400, adjacent, distinct key
+        java.nio.file.Files.createDirectories(cacheRoot);
+        // Truncated/garbled content -- not valid JSON, not zero bytes either -- modelling a crash
+        // mid-write or on-disk corruption, never a real writeCachedCell output.
+        java.nio.file.Files.writeString(cacheRoot.resolve("6400_-17401.empty"), "{\"schema_versio");
+        // The genuine, long-standing test convention: a deliberate, contentless marker.
+        java.nio.file.Files.writeString(cacheRoot.resolve("6400_-17400.empty"), "");
+
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellState(malformedLat, malformedLon),
+                "Expected a malformed/truncated empty marker to be treated as a disk read failure, never as a real confirmation");
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellState(genuinelyEmptyLat, genuinelyEmptyLon),
+                "Expected the genuinely empty (0-byte) marker -- this suite's own long-standing convention -- to still be accepted");
+    }
 }
