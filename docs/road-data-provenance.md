@@ -52,6 +52,17 @@ OSM looks like today, not the pinned 2026-11-19 snapshot. The pinned JSON
 resource in this repo, not a fresh fetch, is this prototype's actual data
 source -- that's the point of pinning it.
 
+## MINECRAFT-566: a second fixture was attempted and not obtained
+
+The ticket suggests a second, geographically separate ingest fixture (Presidio Parkway) using a
+dated Geofabrik Northern California extract (`norcal-261101.osm.pbf`). This repo has no PBF-parsing
+tooling, so a live Overpass fetch was tried instead, matching this file's existing pattern. The
+Overpass API's public endpoint returned `502 Gateway Timeout -- This Overpass API server is
+currently at capacity` for a bounding-box query during this work; per its own guidance this calls
+for exponential-backoff retry, which was not pursued further within this pass. No second fixture is
+bundled as a result -- see `docs/design.md`'s MINECRAFT-566 section and the ticket comment for the
+up-to-date status.
+
 ## Why six blocks wide
 
 OSM tags this way `lanes=2`; a half-width of 3 blocks (6 blocks total)
