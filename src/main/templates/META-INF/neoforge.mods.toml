@@ -31,5 +31,12 @@ description='''Blackstone road surfaces mapped from OpenStreetMap onto Earth Pla
     ordering="AFTER"
     side="BOTH"
 
+[[dependencies.${mod_id}]]
+    modId="layeredslopes"
+    type="required"
+    versionRange="[0.2.0,0.3.0)"
+    ordering="AFTER"
+    side="BOTH"
+
 [[mixins]]
 config="${mod_id}.mixins.json"

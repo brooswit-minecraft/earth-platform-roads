@@ -1,0 +1,1505 @@
+package io.github.brooswitminecraft.earthplatformroads.road;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.mojang.serialization.Lifecycle;
+import com.sun.net.httpserver.HttpServer;
+import io.earthplatform.geography.globe.TerrariumTileSource;
+import io.earthplatform.minecraft.cubic.Cube;
+import io.earthplatform.minecraft.cubic.CubeKey;
+import io.earthplatform.minecraft.cubic.CubeWorld;
+import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import io.earthplatform.minecraft.cubic.earth.EarthSettings;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.MappedRegistry;
+import net.minecraft.core.RegistrationInfo;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.data.registries.VanillaRegistries;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * Proves {@code EarthGeneratorPrepareMixin} actually does what MINECRAFT-566's review demanded:
+ * calling Earth Platform's own {@code prepareNear} -- its documented "fetch ahead of generation"
+ * entry point, the same one {@code /earth travel} calls off-thread before a player lands -- through
+ * the real mixin on a real generator must populate {@code RoadTileSource}'s cache, so that a later,
+ * cache-only {@code RoadNetwork} lookup (the one {@code EarthGeneratorRoadMixin}'s hot {@code
+ * surface()} path uses) finds the data without itself ever touching the network.
+ */
+class RoadTilePrefetchMixinTest {
+    @AfterEach
+    void cleanUp() {
+        RoadNetwork.setTileSourceForTests(null);
+    }
+
+    private static EarthGenerator bootAndBuildGenerator(Path demCache) throws Exception {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        HolderLookup.Provider lookup = VanillaRegistries.createLookup();
+        MappedRegistry<Biome> biomes = new MappedRegistry<>(Registries.BIOME, Lifecycle.stable());
+        lookup.lookupOrThrow(Registries.BIOME).listElements()
+                .forEach(holder -> biomes.register(holder.key(), holder.value(), RegistrationInfo.BUILT_IN));
+        for (String name : List.of("glacial_lake")) {
+            try (var in = EarthGenerator.class.getResourceAsStream("/data/earthplatform/worldgen/biome/" + name + ".json")) {
+                var json = com.google.gson.JsonParser.parseReader(new java.io.InputStreamReader(in));
+                Biome biome = Biome.DIRECT_CODEC.parse(
+                        net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE, lookup), json).getOrThrow();
+                biomes.register(
+                        net.minecraft.resources.ResourceKey.create(Registries.BIOME,
+                                net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("earthplatform", name)),
+                        biome, RegistrationInfo.BUILT_IN);
+            }
+        }
+        TerrariumTileSource tiles = new TerrariumTileSource(
+                TerrariumTileSource.AWS_TERRAIN_TILES, demCache.resolve(TerrariumTileSource.DATASET_ID), true, 512, 6, Duration.ofSeconds(20));
+        EarthSettings settings = EarthSettings.at(EarthSettings.DEFAULT_LATITUDE, EarthSettings.DEFAULT_LONGITUDE);
+        return new EarthGenerator(4747L, biomes, settings, tiles, null, null, null);
+    }
+
+    @Test
+    void prepareNearPopulatesTheCacheWithoutSurfaceEverFetching(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555002,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Prefetch Test Street"},
+                  "geometry":[{"lat":37.7240,"lon":-119.6365},{"lat":37.7241,"lon":-119.6366}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] block = generator.block(EarthSettings.DEFAULT_LATITUDE, EarthSettings.DEFAULT_LONGITUDE);
+
+            // Before prepareNear runs, the cache-only lookup must be empty -- nothing fetched yet.
+            assertTrue(RoadNetwork.segmentCoveringColumn(generator.grid(), block[0], block[1]) == null
+                    || requests.get() == 0, "Expected no road-data fetch before prepareNear runs");
+            assertEquals(0, requests.get());
+
+            // Earth Platform's own "fetch ahead of generation" entry point; the mixin taps it.
+            // This mixin fetches the point's own cell synchronously (comment 55456: a 9-cell
+            // version was tried and found to interact badly with the provider's own rate limit --
+            // see EarthGeneratorPrepareMixin's own class doc), then opportunistically fetches AT
+            // MOST ONE additional cell from its bounded lookahead queue (comment 55460) -- which
+            // this zero-interval test source makes immediately eligible too, hence 2 total requests
+            // here, not 1. (The boundary-seam-for-a-single-crossing-way fix itself lives on the read
+            // side, RoadNetwork.candidatesNear, exercised by this class's other tests.)
+            generator.prepareNear(block[0], block[1]);
+            assertEquals(2, requests.get(), "Expected the point's own cell plus one opportunistic lookahead-queue fetch");
+
+            // Now a cache-only lookup (what the hot surface() generation path actually uses) must
+            // find the prefetched way, with no additional network request.
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), block[0], block[1]);
+            assertTrue(covering != null && covering.wayId() == 555002L,
+                    "Expected the prefetched way to be found by a cache-only lookup after prepareNear");
+            assertEquals(2, requests.get(), "The cache-only lookup after prepareNear must not trigger any further fetch");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55454's original defect, demonstrated with the CORRECT fix (comment
+     * 55456: a read-side neighbor check, not a multi-cell prefetch): John saw a live road abruptly
+     * end on bare ground at a tile boundary -- his own read of the player's tile and its neighbors
+     * found 7/8 with no ready/empty marker at all. This test fetches only ONE cell directly
+     * (bypassing the mixin, so it is not even the point this specific call tests) and confirms a
+     * real mapped way whose geometry crosses into the adjacent, NEVER-fetched neighbor cell is
+     * still found there -- because {@code RoadNetwork.candidatesNear} now also reads the
+     * neighbor's cache (empty, in this case) AND the fetched cell's cache, and the fetched cell's
+     * own data already carries the crossing way's full geometry (a live provider's bbox query
+     * returns the whole way for any cell it merely touches).
+     */
+    @Test
+    void aSingleFetchCarriesACrossingRoadIntoItsNeverFetchedNeighbor(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // A synthetic way crossing the real cell boundary at lat=5.01 (CELL_DEGREES=0.01): its
+        // southern point at lat=5.006 is in cell 500_-3001, its northern point at lat=5.016 is in
+        // the adjacent cell 501_-3001, which this test NEVER fetches. A real Overpass-shaped
+        // response returns the WHOLE way's geometry for either cell's bbox query, same as the real
+        // provider would.
+        String response = """
+                {"elements":[{"type":"way","id":555020,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Boundary Test Street"},
+                  "geometry":[{"lat":5.006,"lon":-30.004},{"lat":5.016,"lon":-30.004}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            // Only cell 500_-3001 is ever fetched -- cell 501_-3001 (the neighbor) never is.
+            tileSource.waysForCell(5.008, -30.004);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] northColumn = generator.block(5.014, -30.004); // inside the never-fetched neighbor cell 501_-3001, on the way's own line
+
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), northColumn[0], northColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555020L,
+                    "Expected the crossing way to still be found in the never-fetched neighbor cell, via the read-side neighbor check. Got " + covering);
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55456's explicit ask: "a production-cadence stub regression from empty
+     * cache exercising the actual prepare-to-generation path... no arbitrary sleep or throttle
+     * removal." Uses the SAME {@code previewMinRequestIntervalMs} order of magnitude as the real
+     * production default (5000ms, see {@code RoadNetwork.DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS}),
+     * from a genuinely empty cache, through the real mixin and real generation -- not a direct,
+     * bypassing call, and not a zeroed-out rate limit. Exactly one real fetch happens (comment
+     * 55454's original 9-call approach would have had 8 of those 9 rejected by this same real
+     * interval, which is precisely what this test guards against regressing to); a neighboring
+     * column's road candidate is present via the read-side check before generation ever runs there.
+     */
+    @Test
+    void aProductionCadenceEmptyCacheRunCarriesTheSeamThroughRealGeneration(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        String response = """
+                {"elements":[{"type":"way","id":555021,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Boundary Fix Street"},
+                  "geometry":[{"lat":6.006,"lon":-31.004},{"lat":6.016,"lon":-31.004}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            // The real production rate limit, not zero -- this is the exact condition 55456 found
+            // the original fix attempt never actually exercised.
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10),
+                    null, Duration.ofMillis(5000));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] southBlock = generator.block(6.008, -31.004); // inside cell 600_-3101
+
+            // The real off-thread fetch-ahead path a player's ordinary travel/pregen calls.
+            generator.prepareNear(southBlock[0], southBlock[1]);
+            assertEquals(1, requests.get(), "Expected exactly one real fetch -- the point's own cell only, never a burst that a real rate limit would partly reject");
+
+            // The neighboring cell (601_-3101) was never itself fetched; the crossing way's full
+            // geometry already came back on cell 600_-3101's own fetch. Generation must find it
+            // there via the read-side neighbor check, with no further network request at all --
+            // including no attempt blocked by the still-active 5-second next-eligible deadline.
+            int[] northColumn = generator.block(6.014, -31.004);
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), northColumn[0], northColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555021L,
+                    "Expected the crossing way present at the neighboring column before generation, under the real rate limit. Got " + covering);
+            assertEquals(1, requests.get(), "Expected the neighbor-cell read to trigger no additional request");
+            // Not asserting an actual painted block here: these synthetic coordinates (chosen only
+            // to land cleanly on a cell boundary, not for real terrain) may fall in open ocean,
+            // where EarthGeneratorRoadMixin correctly skips painting a road underwater regardless
+            // of this fix -- that would be a false failure unrelated to what this test checks. The
+            // "candidate present before generation" claim is exactly what segmentCoveringColumn
+            // proves; the next test closes the "not surface placement" gap named in comment 55458.
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55458's own named gap: "Production-cadence test proved cache-only
+     * lookup across the tile edge, not surface placement." This test closes it, at real,
+     * unambiguously dry-land coordinates (near Boulder, Colorado -- chosen by me, not any of
+     * John's locations) so {@code EarthGeneratorRoadMixin}'s own "skip if under water" check can
+     * never produce a false failure the way it would have at the previous test's synthetic,
+     * possibly-oceanic coordinates. Same mechanism as before (one cell fetched, its neighbor never
+     * fetched, a real production-order rate limit), but this time actually calls {@code
+     * generator.generate} at the boundary column and asserts a real road-surface block is placed.
+     */
+    @Test
+    void theReadSideNeighborCheckActuallyPaintsARoadSurfaceAtTheBoundaryColumn(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        String response = """
+                {"elements":[{"type":"way","id":555022,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Boulder Boundary Street"},
+                  "geometry":[{"lat":40.006,"lon":-105.27},{"lat":40.016,"lon":-105.27}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10),
+                    null, Duration.ofMillis(5000)); // the real production-order rate limit, not zeroed
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] southBlock = generator.block(40.008, -105.27); // cell 4000_-10527
+
+            generator.prepareNear(southBlock[0], southBlock[1]);
+            assertEquals(1, requests.get(), "Expected exactly one real fetch -- the point's own cell only");
+
+            int[] northColumn = generator.block(40.014, -105.27); // the never-fetched neighbor cell 4001_-10527, on the way's own line
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), northColumn[0], northColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555022L,
+                    "Expected the crossing way present at the neighboring column. Got " + covering);
+            assertEquals(1, requests.get(), "Expected the neighbor-cell read to trigger no additional request");
+
+            int groundY = generator.surfaceY(northColumn[0], northColumn[1]);
+            var section = generator.generate(northColumn[0] >> 4, groundY >> 4, northColumn[1] >> 4);
+            var state = section.getBlockState(northColumn[0] & 15, groundY & 15, northColumn[1] & 15);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
+                    "Expected real generation to paint road surface at the boundary column, got " + state);
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55462: his own read-only check of the real Zippy occurrence found the
+     * one ready neighbor cell actually PREDATED the fresh test world by ~44 minutes (an old,
+     * install-wide cache entry from an earlier session, not something fetched live), the player's
+     * own tile genuinely pending, and the visible gap extending well into the own tile's interior
+     * (~80 blocks), not just at the exact seam. He asked for exactly this shape of evidence instead
+     * of only a seam-center sample: a PRE-WARMED (written to disk before anything in this test
+     * runs, like a real leftover from an earlier session) neighbor cell containing a real
+     * multi-segment, TURNING way (not a simple 2-point line) that bends after crossing into the
+     * never-fetched "own" cell and continues deep into its interior. The own cell is never fetched
+     * at all in this test -- no prepareNear call for it, matching "the own tile was still pending."
+     */
+    @Test
+    void aPreWarmedNeighborsTurningWayIsFoundDeepInAnUnfetchedCellsInterior(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Neighbor cell 4004_-10530 (lat in [40.04,40.05)) gets a pre-warmed ready file, written
+        // directly to disk -- simulating a stale, pre-existing cache entry, never fetched by this
+        // test. Its way bends at (40.052,-105.2945), just after crossing into the "own" cell
+        // 4005_-10530 (lat in [40.05,40.06)), and continues to (40.058,-105.293) -- deep in that
+        // cell's interior, not at the seam.
+        java.nio.file.Files.createDirectories(roadCache);
+        String preWarmedNeighborJson = """
+                {"schema_version":1,"region_id":"pre-warmed","ways":[{"way_id":555023,
+                  "way_tags":{"highway":"secondary","name":"Turning Interior Street"},
+                  "centerline":[{"lat":40.042,"lon":-105.295},{"lat":40.052,"lon":-105.2945},{"lat":40.058,"lon":-105.293}],
+                  "node_ids":[1,2,3],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(roadCache.resolve("4004_-10530.json"), preWarmedNeighborJson);
+
+        // No HTTP stub needed at all -- this test proves the read-side neighbor check works purely
+        // from a pre-existing cache file, with the own cell never fetched (allowNetwork is
+        // irrelevant here since waysForCell for the own cell is simply never called).
+        RoadTileSource tileSource = new RoadTileSource(
+                URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+        // Confirm the own cell is genuinely pending, matching "the own tile was still pending" --
+        // not confirmed-empty, not ready.
+        assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(40.058, -105.293),
+                "Expected the own cell to be genuinely pending -- never fetched in this test");
+
+        // A column well into the interior of the own cell (not at the seam) on the bent segment.
+        int[] interiorColumn = generator.block(40.056, -105.2935);
+        var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), interiorColumn[0], interiorColumn[1]);
+        assertTrue(covering != null && covering.wayId() == 555023L,
+                "Expected the pre-warmed neighbor's turning way to be found deep in the never-fetched cell's interior. Got " + covering);
+
+        int groundY = generator.surfaceY(interiorColumn[0], interiorColumn[1]);
+        var section = generator.generate(interiorColumn[0] >> 4, groundY >> 4, interiorColumn[1] >> 4);
+        var state = section.getBlockState(interiorColumn[0] & 15, groundY & 15, interiorColumn[1] & 15);
+        assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                        || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                        || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                        || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
+                "Expected real generation to paint road surface deep in the interior, got " + state);
+    }
+
+    /**
+     * MINECRAFT-566 comment 55464's correction to the previous version of this test: that stub
+     * ignored the actual bbox and answered by request COUNT alone (A for #1, B for every later
+     * request), so a request to the WRONG neighbor cell would still receive way B's data and the
+     * read-side neighbor scan could pass for the wrong reason -- never actually proving the
+     * lookahead queue reached cell B specifically. It also gave the shared node (id 2) two
+     * different coordinates across A's and B's geometry, which is not how OSM data works (a shared
+     * node is the same physical point everywhere it's referenced).
+     *
+     * <p>This version dispatches by the REAL bbox parsed out of each POST body: cell A's bbox gets
+     * way A alone; cell B's bbox gets BOTH A and B (A's own endpoint -- the shared node -- sits
+     * just inside B, so a real Overpass-protocol query for B's bbox would legitimately return A
+     * too, since A touches that bbox); every other cell's bbox gets a genuinely empty result. The
+     * shared node (id 2) has the exact same coordinate in both ways' geometry. Explicitly asserts a
+     * POST was made matching cell B's own bbox and that cell B ends up {@code READY} under that
+     * exact key -- not just that the read-side scan happened to find the way somewhere nearby.
+     * Uses MOVING prepare points (simulating a player actually traveling along the road, not
+     * repeatedly preparing the same stationary point) and a real, controlled production-order
+     * cadence (a short but nonzero interval, real wall-clock gaps between calls, never a sleep used
+     * to fake out the limit). Finally generates and asserts a real road-surface block PAST A's own
+     * endpoint, inside B's own continuation.
+     */
+    @Test
+    void aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Cell A: 4100_-10630, bbox [41.00,41.01) x [-106.30,-106.29). Cell B: 4101_-10630, bbox
+        // [41.01,41.02) x [-106.30,-106.29). Shared node 2 at (41.0101,-106.295) -- just inside B.
+        double aMinLat = 41.00, aMaxLat = 41.01, bMinLat = 41.01, bMaxLat = 41.02;
+        double cellMinLon = -106.30, cellMaxLon = -106.29;
+        String responseAOnly = """
+                {"elements":[{"type":"way","id":555024,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Successor Street A"},
+                  "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0101,"lon":-106.295}]}]}
+                """;
+        String responseAAndB = """
+                {"elements":[
+                  {"type":"way","id":555024,"nodes":[1,2],
+                    "tags":{"highway":"secondary","name":"Successor Street A"},
+                    "geometry":[{"lat":41.004,"lon":-106.295},{"lat":41.0101,"lon":-106.295}]},
+                  {"type":"way","id":555025,"nodes":[2,3],
+                    "tags":{"highway":"secondary","name":"Successor Street B"},
+                    "geometry":[{"lat":41.0101,"lon":-106.295},{"lat":41.016,"lon":-106.295}]}
+                ]}
+                """;
+        String responseEmpty = "{\"elements\":[]}";
+
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger bBboxRequests = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            String body;
+            if (approx(minLat, aMinLat) && approx(maxLat, aMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                body = responseAOnly;
+            } else if (approx(minLat, bMinLat) && approx(maxLat, bMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                bBboxRequests.incrementAndGet();
+                body = responseAAndB;
+            } else {
+                body = responseEmpty; // every other neighbor cell: a genuinely empty result, not fabricated
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofMillis(50));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+            // MOVING prepares: a sequence of different points, advancing north along the road's own
+            // line, as a player's ordinary travel would actually generate -- not the same
+            // stationary point repeated.
+            // Deliberately stays within cell A's own lat range the whole time (41.00-41.0099) --
+            // cell B must be reached ONLY through the lookahead queue catching up a Moore
+            // neighbor, never because the player's own point ever directly entered B (that would
+            // just be the ordinary single-cell fetch, not what this test is proving). Enough
+            // distinct points for the queue (one Moore-neighbor dequeue per call, after the first
+            // call's own-cell fetch consumes that call's own eligibility slot) to work through to
+            // cell B's own position in the 8-neighbor enqueue order.
+            double[] travelLats = {41.001, 41.002, 41.003, 41.004, 41.005, 41.006, 41.007, 41.008, 41.0085, 41.009};
+            for (double travelLat : travelLats) {
+                int[] block = generator.block(travelLat, -106.295);
+                generator.prepareNear(block[0], block[1]);
+                Thread.sleep(60); // real wall-clock gap, comfortably past the 50ms interval -- never a sleep substituting for the rate limit itself
+            }
+
+            assertTrue(bBboxRequests.get() >= 1, "Expected at least one real POST matching cell B's own bbox, not just a nearby neighbor -- got " + requests.get() + " total requests");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(41.013, -106.295),
+                    "Expected cell B to genuinely be READY under its own key, not merely found via the read-side neighbor scan of a different cell");
+
+            // Generate and assert a real road-surface block PAST A's own endpoint, inside B's own
+            // continuation -- not at the shared node, and not a candidate-only check.
+            int[] pastAColumn = generator.block(41.013, -106.295);
+            var covering = RoadNetwork.segmentCoveringColumn(generator.grid(), pastAColumn[0], pastAColumn[1]);
+            assertTrue(covering != null && covering.wayId() == 555025L,
+                    "Expected successor way B to cover a column past A's own endpoint. Got " + covering);
+            int groundY = generator.surfaceY(pastAColumn[0], pastAColumn[1]);
+            var section = generator.generate(pastAColumn[0] >> 4, groundY >> 4, pastAColumn[1] >> 4);
+            var state = section.getBlockState(pastAColumn[0] & 15, groundY & 15, pastAColumn[1] & 15);
+            assertTrue(state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                            || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                            || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get()),
+                    "Expected a real road-surface block past A's endpoint, on way B's own continuation, got " + state);
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    private static boolean approx(double a, double b) {
+        return Math.abs(a - b) < 1e-6;
+    }
+
+    /**
+     * MINECRAFT-566 comment 55462's diagnostic request: {@code RoadNetwork.diagnoseColumn} must
+     * distinguish all four causes, not just whether a road renders. One generator, four real
+     * columns, four real cells, one each.
+     */
+    @Test
+    void diagnoseColumnDistinguishesAllFourCauses(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+
+        // Cell 4200_-10730 (covered): a real, ready, non-bridge way.
+        java.nio.file.Files.writeString(roadCache.resolve("4200_-10730.json"), """
+                {"schema_version":1,"region_id":"covered","ways":[{"way_id":555026,
+                  "way_tags":{"highway":"secondary","name":"Covered Street"},
+                  "centerline":[{"lat":42.004,"lon":-107.295},{"lat":42.006,"lon":-107.295}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+        // Cell 4201_-10730 (bridge-excluded): a real, ready way, but tagged bridge=true.
+        java.nio.file.Files.writeString(roadCache.resolve("4201_-10730.json"), """
+                {"schema_version":1,"region_id":"bridge","ways":[{"way_id":555027,
+                  "way_tags":{"highway":"secondary","name":"Bridge Street"},
+                  "centerline":[{"lat":42.014,"lon":-107.295},{"lat":42.016,"lon":-107.295}],
+                  "node_ids":[3,4],"bridge":true,"tunnel":false}]}
+                """);
+        // Cell 4203_-10730 (confirmed empty): a real, ready-but-empty marker.
+        java.nio.file.Files.writeString(roadCache.resolve("4203_-10730.empty"), "");
+        // Cell 4202_-10730 (pending): no marker file at all -- never fetched.
+
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        var grid = generator.grid();
+
+        int[] coveredColumn = generator.block(42.005, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.COVERED, RoadNetwork.diagnoseColumn(grid, coveredColumn[0], coveredColumn[1]));
+
+        int[] bridgeColumn = generator.block(42.015, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.EXCLUDED_BRIDGE_OR_TUNNEL, RoadNetwork.diagnoseColumn(grid, bridgeColumn[0], bridgeColumn[1]));
+
+        int[] pendingColumn = generator.block(42.025, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.PENDING_NO_DATA, RoadNetwork.diagnoseColumn(grid, pendingColumn[0], pendingColumn[1]));
+
+        int[] confirmedEmptyColumn = generator.block(42.035, -107.295);
+        assertEquals(RoadNetwork.ColumnDiagnosis.CONFIRMED_EMPTY_NO_ROAD, RoadNetwork.diagnoseColumn(grid, confirmedEmptyColumn[0], confirmedEmptyColumn[1]));
+    }
+
+    /**
+     * MINECRAFT-566 comment 55474's "distinct diagnostics" for a sustained provider outage: a
+     * column whose own cell is pending AND this tile source's last several real fetch attempts
+     * (elsewhere) have all failed must read as {@code PENDING_PROVIDER_OUTAGE}, not the ordinary
+     * {@code PENDING_NO_DATA} {@link #diagnoseColumnDistinguishesAllFourCauses} already covers.
+     */
+    @Test
+    void diagnoseColumnReturnsProviderOutageAfterSeveralConsecutiveRealFailures(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer failingStub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        failingStub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "service unavailable".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(503, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        failingStub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + failingStub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5));
+            // Three real, dispatched failures across three different cells, nowhere near the
+            // never-fetched column this test diagnoses below.
+            tileSource.waysForCell(60.0, 20.0);
+            tileSource.waysForCell(60.02, 20.0);
+            tileSource.waysForCell(60.04, 20.0);
+            assertEquals(3, requests.get());
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            var grid = generator.grid();
+            int[] pendingColumn = generator.block(42.025, -107.295); // never touched by any waysForCell call above
+            assertEquals(RoadNetwork.ColumnDiagnosis.PENDING_PROVIDER_OUTAGE, RoadNetwork.diagnoseColumn(grid, pendingColumn[0], pendingColumn[1]));
+        } finally {
+            failingStub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55476: a confirmed "wrong tile" bug -- {@code ServerCubeWorld.produce}'s
+     * x/z are CUBE indices, not the BLOCK coordinates {@code RoadPrefetch.forColumn} actually
+     * expects (the same contract {@code prepare}/{@code prepareNear}'s own callers already honor).
+     * This drives the exact fixed call sequence (cube index -&gt;
+     * {@code RoadPrefetch.cubeIndexToBlockCenter} -&gt; {@code RoadPrefetch.forColumn}) with an
+     * off-origin, nonzero/negative cube index against a real HTTP stub, asserting the real POST
+     * bbox matches the CORRECT (block-center) cell and explicitly RULING OUT the wrong, raw-cube-
+     * index bbox the original bug would have requested instead -- not just that some bbox was sent.
+     */
+    @Test
+    void ordinaryStreamingPrefetchConvertsCubeIndexToBlockCoordinatesNotTheRawCubeBbox(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        var grid = generator.grid();
+
+        // An off-origin, nonzero/negative cube index pair -- large enough in magnitude that treating
+        // it AS a block coordinate (the bug) and converting it to its real block-center (the fix)
+        // land in two entirely different, non-adjacent 0.01-degree cells (a difference of ~15*16
+        // blocks here is many kilometres, far more than one cell's own ~1.1km span).
+        int cubeX = -12345, cubeZ = 6789;
+        int fixedBlockX = RoadPrefetch.cubeIndexToBlockCenter(cubeX);
+        int fixedBlockZ = RoadPrefetch.cubeIndexToBlockCenter(cubeZ);
+        assertEquals(cubeX, fixedBlockX >> 4, "Sanity: the converted block coordinate must still round-trip to the same cube index");
+        assertEquals(cubeZ, fixedBlockZ >> 4, "Sanity: the converted block coordinate must still round-trip to the same cube index");
+
+        var correctPoint = grid.geographic(fixedBlockX, fixedBlockZ);
+        var buggyPoint = grid.geographic(cubeX, cubeZ); // what the ORIGINAL bug would have queried: the raw cube index used as a block coordinate
+        long correctCellLat = (long) Math.floor(correctPoint.latitude() / RoadNetwork.CELL_DEGREES);
+        long correctCellLon = (long) Math.floor(correctPoint.longitude() / RoadNetwork.CELL_DEGREES);
+        long buggyCellLat = (long) Math.floor(buggyPoint.latitude() / RoadNetwork.CELL_DEGREES);
+        long buggyCellLon = (long) Math.floor(buggyPoint.longitude() / RoadNetwork.CELL_DEGREES);
+        assertTrue(correctCellLat != buggyCellLat || correctCellLon != buggyCellLon,
+                "Sanity: the chosen cube index must make the buggy and fixed cells genuinely different, or this test cannot distinguish them");
+
+        AtomicInteger correctCellRequests = new AtomicInteger(), buggyCellRequests = new AtomicInteger();
+        double correctMinLat = correctCellLat * RoadNetwork.CELL_DEGREES, correctMinLon = correctCellLon * RoadNetwork.CELL_DEGREES;
+        double buggyMinLat = buggyCellLat * RoadNetwork.CELL_DEGREES, buggyMinLon = buggyCellLon * RoadNetwork.CELL_DEGREES;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        stub.createContext("/", exchange -> {
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            if (matcher.find()) {
+                double minLat = Double.parseDouble(matcher.group(1)), minLon = Double.parseDouble(matcher.group(2));
+                if (Math.abs(minLat - correctMinLat) < 1e-9 && Math.abs(minLon - correctMinLon) < 1e-9) correctCellRequests.incrementAndGet();
+                if (Math.abs(minLat - buggyMinLat) < 1e-9 && Math.abs(minLon - buggyMinLon) < 1e-9) buggyCellRequests.incrementAndGet();
+            }
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            // Exactly what ServerCubeWorldRoadPrefetchMixin's injection does after its fix. (Also
+            // triggers one opportunistic lookahead-neighbor request, same as prepare/prepareNear's
+            // own prefetch -- irrelevant to this test, which only cares about the correct vs. buggy
+            // cell, not the total request count.)
+            RoadPrefetch.forColumn(generator, fixedBlockX, fixedBlockZ);
+
+            assertTrue(correctCellRequests.get() >= 1, "Expected at least one request matching the CORRECT (block-center) cell's bbox");
+            assertEquals(0, buggyCellRequests.get(), "Expected NO request matching the buggy raw-cube-index bbox");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55464's explicit ask: a cooldown-declined lookahead-queue entry must
+     * stay pending/eligible for a LATER attempt (never permanently lost), repeated calls during the
+     * same cooldown window must not create duplicate queue entries or a burst of requests ("without
+     * re-enqueue overlap"), and the one-in-flight guarantee must hold throughout. With a 200ms
+     * interval: the first prepare call's own-cell fetch succeeds (request #1) and immediately sets
+     * the next-eligible deadline ~200ms out, so THAT SAME call's own opportunistic lookahead
+     * attempt is declined (too soon after the fetch that just set the deadline). Three more
+     * prepare calls at the same point, with no sleep, must add ZERO further requests (every
+     * opportunistic attempt during the cooldown is correctly declined, not duplicated or bursted).
+     * Only after sleeping past the deadline does a fifth call's lookahead attempt finally succeed
+     * (request #2) -- proving the declined cell was retained across the cooldown, not lost, and
+     * that nothing was fetched twice in the meantime. "One in-flight" and "bounded priority" are
+     * structural here (a single-threaded sequence of calls through one instance's networkLock and
+     * capacity-bounded queue), not independently re-proven by a race test.
+     */
+    @Test
+    void aCooldownDeclinedLookaheadEntryStaysEligibleWithoutDuplicateRequests(@TempDir Path roadCache) throws IOException {
+        // MINECRAFT-566 comment 55466: the previous version of this test called prepare again over
+        // the SAME overlapping neighborhood to "prove" retention, which cannot actually distinguish
+        // a retained job from one that was dropped on decline and silently re-added by that same
+        // overlapping rescan -- it also used a 50ms interval, never exercising the real 5s-order
+        // production cadence. This version uses a controlled (fixed, test-set) clock instead of
+        // sleeping, the REAL production-order interval (5 seconds, not shortened), and -- critically
+        // -- drains the retained job through a call that scans a totally DIFFERENT, non-overlapping
+        // neighborhood, so the retained job cannot have been freshly re-added by that call's own
+        // scan. It calls RoadTileSource.enqueueLookahead directly (not through the full generator
+        // mixin) to isolate the queue's retention behavior from the unrelated "own cell" fetch a
+        // real prepareNear call would also perform.
+        String response = "{\"elements\":[{\"type\":\"way\",\"id\":555028,\"nodes\":[1,2],"
+                + "\"tags\":{\"highway\":\"secondary\",\"name\":\"Cooldown Test Street\"},"
+                + "\"geometry\":[{\"lat\":1.0,\"lon\":1.0},{\"lat\":1.001,\"lon\":1.001}]}]}";
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofSeconds(5)); // the real production-order interval
+            java.time.Instant t0 = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(t0, java.time.ZoneOffset.UTC));
+
+            // Consume this instance's eligibility on an unrelated cell first, so the upcoming
+            // lookahead attempt is genuinely declined, not accidentally eligible.
+            tileSource.waysForCell(0.005, 0.005); // far from everything below; request #1
+            assertEquals(1, requests.get());
+
+            // P1's neighborhood: cell (7000,-13001). Its first-enqueued Moore neighbor (per the
+            // fixed dLat,dLon iteration order) is cell (6999,-13002) -- the job we're tracking.
+            double p1Lat = 70.005, p1Lon = -130.005;
+            double trackedCellRepLat = 6999 * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
+            double trackedCellRepLon = -13002 * RoadNetwork.CELL_DEGREES + RoadNetwork.CELL_DEGREES / 2;
+
+            tileSource.enqueueLookahead(p1Lat, p1Lon); // enqueues P1's 8 neighbors, dequeues+attempts the tracked cell -- declined (clock still at t0, deadline is t0+5s from request #1)
+            assertEquals(1, requests.get(), "Expected the lookahead attempt to be declined (still within the real 5s cooldown), not a new request");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(trackedCellRepLat, trackedCellRepLon),
+                    "Expected the tracked cell to stay genuinely pending after being declined");
+
+            // Advance the controlled clock past the 5s deadline -- no real sleep.
+            tileSource.setClockForTests(java.time.Clock.fixed(t0.plusSeconds(6), java.time.ZoneOffset.UTC));
+
+            // P2 is far enough from P1 that their Moore neighborhoods share NO cells -- this call's
+            // own enqueue-scan cannot possibly have (re-)added the tracked cell itself. If the
+            // tracked job dequeued here is still the SAME retained one, not a fresh duplicate, this
+            // proves retention rather than drop-and-rescan.
+            double p2Lat = 80.005, p2Lon = -140.005;
+            tileSource.enqueueLookahead(p2Lat, p2Lon);
+
+            assertEquals(2, requests.get(), "Expected exactly one more request once the clock genuinely passed the deadline");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(trackedCellRepLat, trackedCellRepLon),
+                    "Expected the originally-tracked, retained cell specifically to now be ready -- not lost, and not fetched more than once");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55468's explicit ask: cell A fails TWICE (a real dispatched failure --
+     * a persistent 504, not just "declined as too soon"), and cell B still becomes {@code READY} in
+     * between, without A ever being falsely marked confirmed-empty and without violating the
+     * global one-in-flight/backoff guarantees. Dispatches by the real bbox parsed from each POST
+     * (A's bbox -> 504 every time; B's bbox -> a real way), and pre-seeds six of the eight Moore
+     * neighbors as already confirmed-empty so only A and B ever actually enter the queue, keeping
+     * the FIFO rotation simple and directly observable: A (first-enqueued) fails and rotates to the
+     * BACK, so B (now at the front) gets its own turn next, rather than A monopolizing every future
+     * slot the way the pre-55468 code would have.
+     */
+    @Test
+    void aPersistentlyFailingCellRotatesBehindItsNeighborsWithoutFalseEmptyOrBurst(@TempDir Path roadCache) throws IOException {
+        // Lat values kept well away from the poles (90.x would be an invalid WGS84 coordinate,
+        // which is exactly what an earlier version of this test used by mistake near its own
+        // 90-degree "own" point -- a real bug caught by the parser itself, not the test's
+        // assertions).
+        double pLat = 45.005, pLon = -150.005; // own cell 4500_-15001
+        // A = 4499_-15001 (first-enqueued Moore neighbor); B = 4501_-15001 (seventh-enqueued).
+        double aMinLat = 44.99, aMaxLat = 45.00, bMinLat = 45.01, bMaxLat = 45.02;
+        double cellMinLon = -150.01, cellMaxLon = -150.00;
+        double aRepLat = 44.995, aRepLon = -150.005;
+        double bRepLat = 45.015, bRepLon = -150.005;
+
+        java.nio.file.Files.createDirectories(roadCache);
+        // Six filler Moore neighbors, PLUS the own point's own cell (4500_-15001) -- in real usage
+        // via the mixin, the own cell is always already fetched by waysForCell before
+        // enqueueLookahead ever runs, so it's never still sitting uncached when the neighbor scan
+        // happens; this test calls enqueueLookahead directly (to isolate the queue mechanism), so
+        // it has to pre-seed that same "already resolved" state itself. All pre-seeded
+        // confirmed-empty so the enqueue scan skips them entirely -- only A and B ever actually
+        // enter the queue, keeping the rotation directly observable.
+        for (String fillerCellId : new String[] {"4499_-15002", "4499_-15000", "4500_-15002", "4500_-15001", "4500_-15000", "4501_-15002", "4501_-15000"}) {
+            java.nio.file.Files.writeString(roadCache.resolve(fillerCellId + ".empty"), "");
+        }
+
+        String responseB = """
+                {"elements":[{"type":"way","id":555029,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Rotation Test Street B"},
+                  "geometry":[{"lat":45.011,"lon":-150.005},{"lat":45.019,"lon":-150.005}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger aAttempts = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            if (approx(minLat, aMinLat) && approx(maxLat, aMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                aAttempts.incrementAndGet();
+                byte[] body = "persistent failure".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(504, body.length); // a real, genuinely dispatched failure -- not "declined as too soon"
+                exchange.getResponseBody().write(body);
+            } else if (approx(minLat, bMinLat) && approx(maxLat, bMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                byte[] body = responseB.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            } else {
+                byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            }
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofSeconds(5)); // the real production-order interval
+            java.time.Instant clockTime = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Consume this instance's eligibility on an unrelated cell first (request #1), same as
+            // the cooldown-retention test, so the first real lookahead attempt below is genuinely
+            // eligible once the clock is advanced past it.
+            tileSource.waysForCell(0.005, 0.005);
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // First dequeue: A, dispatched, fails with a real 504. Must rotate to the BACK, not the
+            // front, and must NOT be marked confirmed-empty.
+            tileSource.enqueueLookahead(pLat, pLon);
+            assertEquals(1, aAttempts.get(), "Expected A to be genuinely dispatched once");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(aRepLat, aRepLon),
+                    "Expected A to stay genuinely pending after a real failure -- never falsely confirmed-empty");
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Second dequeue, from a DIFFERENT non-overlapping point: with A rotated to the back, B
+            // (not A again) must be at the front now -- proving A's failure didn't let it
+            // monopolize the next slot and starve B.
+            tileSource.enqueueLookahead(100.005, -160.005);
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(bRepLat, bRepLon),
+                    "Expected B to become ready on this turn -- A's failure must not have starved it");
+            assertEquals(1, aAttempts.get(), "Expected no additional A attempt while B was being drained");
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Third dequeue, another non-overlapping point: B is resolved and gone, so A (still the
+            // only remaining queued entry) comes up again -- its second genuine failure.
+            tileSource.enqueueLookahead(110.005, -170.005);
+            assertEquals(2, aAttempts.get(), "Expected A's second genuine dispatch and failure");
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(aRepLat, aRepLon),
+                    "Expected A to still be pending (not confirmed-empty) after failing twice");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55470: aaea04b's refactor called {@code attemptFetch} directly on the
+     * dequeued cell, dropping the "already resolved by some other path?" double-check {@code
+     * waysForCell} always did. A queued cell that gets resolved by its own point's ORDINARY fetch
+     * (the realistic case: the player's own position later lands exactly in that neighbor cell)
+     * before its stale queue entry is ever dequeued would otherwise be fetched a second,
+     * unnecessary time -- wasting a scarce provider slot and, worse, overwriting the already-
+     * correct cached geometry with whatever that redundant fetch happens to return. This proves the
+     * fix: queued, then resolved via an ordinary (non-lookahead) {@code waysForCell} call, then
+     * drained -- no second POST for that same cell's key.
+     */
+    @Test
+    void aQueuedCellResolvedByItsOwnFetchIsNotDispatchedAgainOnDrain(@TempDir Path roadCache) throws IOException {
+        double pLat = 55.005, pLon = -170.005; // own cell 5500_-17001
+        // T = 5501_-17001 (seventh-enqueued Moore neighbor, same position as "B" in earlier tests).
+        double tMinLat = 55.01, tMaxLat = 55.02, cellMinLon = -170.01, cellMaxLon = -170.00;
+        double tRepLat = 55.015, tRepLon = -170.005;
+
+        java.nio.file.Files.createDirectories(roadCache);
+        // Every Moore neighbor except the first-enqueued (N1, a harmless decoy) and T is pre-seeded
+        // confirmed-empty, along with the own cell itself -- so the queue only ever holds N1 and T,
+        // keeping this directly observable.
+        for (String fillerCellId : new String[] {"5499_-17001", "5499_-17000", "5500_-17002", "5500_-17001", "5500_-17000", "5501_-17002", "5501_-17000"}) {
+            java.nio.file.Files.writeString(roadCache.resolve(fillerCellId + ".empty"), "");
+        }
+
+        String responseT = """
+                {"elements":[{"type":"way","id":555030,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Resolved-Before-Drain Street"},
+                  "geometry":[{"lat":55.011,"lon":-170.005},{"lat":55.019,"lon":-170.005}]}]}
+                """;
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger tRequests = new AtomicInteger();
+        var bboxPattern = java.util.regex.Pattern.compile("\\((-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*),(-?\\d+\\.?\\d*)\\);");
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String query = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            var matcher = bboxPattern.matcher(query);
+            double minLat = 0, minLon = 0, maxLat = 0, maxLon = 0;
+            if (matcher.find()) {
+                minLat = Double.parseDouble(matcher.group(1));
+                minLon = Double.parseDouble(matcher.group(2));
+                maxLat = Double.parseDouble(matcher.group(3));
+                maxLon = Double.parseDouble(matcher.group(4));
+            }
+            byte[] body;
+            if (approx(minLat, tMinLat) && approx(maxLat, tMaxLat) && approx(minLon, cellMinLon) && approx(maxLon, cellMaxLon)) {
+                tRequests.incrementAndGet();
+                body = responseT.getBytes(StandardCharsets.UTF_8);
+            } else {
+                body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8); // N1 (the decoy) and anything else: a genuinely empty result
+            }
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(5),
+                    null, Duration.ofSeconds(5));
+            java.time.Instant clockTime = java.time.Instant.parse("2020-01-01T00:00:00Z");
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            tileSource.waysForCell(0.005, 0.005); // consumes initial eligibility (request #1)
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Enqueues N1 and T; dequeues and resolves N1 (confirmed-empty) -- T stays queued,
+            // never yet dequeued.
+            tileSource.enqueueLookahead(pLat, pLon);
+            assertEquals(2, requests.get(), "Expected N1's own resolution, not T's -- T must still be queued");
+            assertEquals(0, tRequests.get());
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // T is resolved by its OWN ordinary fetch now -- exactly like a player's position
+            // later landing directly in that neighbor cell -- while its stale entry still sits in
+            // the lookahead queue, untouched.
+            tileSource.waysForCell(tRepLat, tRepLon);
+            assertEquals(1, tRequests.get(), "Expected T's own fetch to dispatch exactly once");
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(tRepLat, tRepLon));
+
+            clockTime = clockTime.plusSeconds(6);
+            tileSource.setClockForTests(java.time.Clock.fixed(clockTime, java.time.ZoneOffset.UTC));
+
+            // Drain via a totally different, non-overlapping point -- dequeues T's stale entry.
+            // With the fix, this must detect T is already resolved and pop the job WITHOUT
+            // dispatching a second request for it.
+            tileSource.enqueueLookahead(20.005, -60.005);
+            assertEquals(1, tRequests.get(), "Expected NO second dispatch for T's key once it was already resolved before the drain");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55486/55487: reproduces, on a real {@code EarthGenerator}, the exact
+     * staleness bug John independently confirmed on a real server -- {@code lowestGround} (which
+     * {@code ColumnSurvey}/{@code ServerCubeWorld.plan} calls every tick, well before this column's
+     * road data need be ready) permanently memoizes this column's whole {@code Surface} decision in
+     * {@code SurfaceGenerator}'s own private cache; a LATER, genuinely fresh {@code generate()} call
+     * for the exact same column -- even after the road data becomes ready -- hits that same stale
+     * entry and never re-evaluates. Then proves {@code RoadPrefetch.evictStaleSurfaceDecision} (the
+     * fix {@code ServerCubeWorldRoadPrefetchMixin} now calls unconditionally before every
+     * {@code generate()}) actually fixes it: the SAME generator instance, after the targeted evict,
+     * correctly re-evaluates and paints the real road.
+     */
+    @Test
+    void evictingTheStaleSurfaceDecisionFixesARealReproductionOfTheCachingBug(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 43.0005, lon = -108.0005; // a fresh, never-used cell: 4300_-10800, PENDING (no marker file yet)
+
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int[] block = generator.block(lat, lon);
+        int columnX = block[0] >> 4, columnZ = block[1] >> 4;
+
+        // Step 1: a height-only query, exactly like ColumnSurvey's own every-tick lowestGround
+        // call, while this column's road data is still genuinely PENDING (no marker file at all).
+        // This is the real call that (per Earth Platform's own SurfaceGenerator.column, confirmed
+        // by reading its bytecode) permanently caches this column's whole Surface[] decision.
+        generator.lowestGround(columnX, columnZ);
+
+        // Step 2: the tile actually becomes READY -- written directly to disk, no network needed
+        // (allowNetwork=false here; cellState/cachedWaysForCellOrEmpty read the disk file directly
+        // regardless). A real way whose centerline passes right through the probe point.
+        java.nio.file.Files.writeString(roadCache.resolve("4300_-10800.json"), """
+                {"schema_version":1,"region_id":"staleness-repro","ways":[{"way_id":555040,
+                  "way_tags":{"highway":"secondary","name":"Staleness Repro Street"},
+                  "centerline":[{"lat":43.0003,"lon":-108.0007},{"lat":43.0007,"lon":-108.0003}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeY = ground >> 4;
+
+        // Step 3: reproduce the bug -- generate() right now, WITHOUT evicting, must still show
+        // the stale (natural, non-road) decision cached back in step 1, even though the tile is
+        // now genuinely ready.
+        var staleState = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+        assertTrue(!isAnyRoadSurfaceMaterial(staleState),
+                "Expected to reproduce the real bug: the stale cached decision must still be natural terrain, got " + staleState);
+
+        // Step 4: the actual fix -- evict just this one column's stale cache entry.
+        RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+
+        // Step 5: the SAME generator instance, same column, now correctly re-evaluates and paints
+        // the real road -- the exact "fresh generator instance" behavior John's own reproduction
+        // showed only a NEW instance previously had, now true of this SAME instance too.
+        var fixedState = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+        assertTrue(isAnyRoadSurfaceMaterial(fixedState),
+                "Expected the eviction to fix it: the same generator instance must now paint the real road, got " + fixedState);
+    }
+
+    /** Any of this mod's three road-surface materials (MINECRAFT-566 comment 55484), full-block or layered. */
+    private static boolean isAnyRoadSurfaceMaterial(net.minecraft.world.level.block.state.BlockState state) {
+        return state.is(net.minecraft.world.level.block.Blocks.POLISHED_BLACKSTONE)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get())
+                || state.is(net.minecraft.world.level.block.Blocks.YELLOW_TERRACOTTA)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get())
+                || state.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                || state.is(io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat.LAYERED_GRAVEL.get());
+    }
+
+    /**
+     * MINECRAFT-566 comment 55492, John's own suggested methodology: "hold a loopback response,
+     * trigger lowestGround on the same cold column after worker dispatch, then release READY
+     * before timeout and assert actual paint". Reproduces the exact race the first version of the
+     * eviction fix missed (evicting BEFORE the bounded wait, not after): drives the REAL dispatch
+     * sequence {@code ServerCubeWorldRoadPrefetchMixin} now uses -- {@code forColumnBounded}
+     * (dispatch+wait) FIRST, {@code evictStaleSurfaceDecision} LAST -- against a real
+     * {@code EarthGenerator}, with a {@code lowestGround} survey call deliberately landing in the
+     * MIDDLE of the wait (while the loopback response is held back), exactly modelling a
+     * concurrent {@code ColumnSurvey} tick racing the in-flight fetch.
+     */
+    @Test
+    void evictingAfterTheBoundedWaitSurvivesALowestGroundSurveyRacingInTheMiddleOfIt(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 44.0005, lon = -109.0005; // a fresh, never-used cell: 4400_-10900
+
+        var responseHeld = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555050,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Race Repro Street"},
+                  "geometry":[{"lat":44.0003,"lon":-109.0007},{"lat":44.0007,"lon":-109.0003}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            try {
+                responseHeld.await(); // held back until the test deliberately releases it
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            int[] block = generator.block(lat, lon);
+            int columnX = block[0] >> 4, columnZ = block[1] >> 4;
+
+            // Exactly ServerCubeWorldRoadPrefetchMixin's own sequence: dispatch+wait FIRST, on a
+            // background thread (modelling the real generation-worker thread), with a bound long
+            // enough to outlast this test's own deliberate delay below.
+            Duration bound = Duration.ofSeconds(5);
+            var waitThread = new Thread(() -> RoadPrefetch.forColumnBounded(generator, block[0], block[1], bound));
+            waitThread.start();
+
+            // Wait for the real request to actually be dispatched and holding (not just
+            // "started the thread") before racing lowestGround into the middle of it.
+            for (int i = 0; i < 100 && requests.get() == 0; i++) Thread.sleep(20);
+            assertEquals(1, requests.get(), "Sanity: the request must already be dispatched and holding before the race below");
+
+            // While that fetch is still in flight (response held back), a lowestGround survey for
+            // the SAME column lands in the middle of the wait -- modelling ColumnSurvey's own
+            // every-tick call racing the in-flight fetch, on what would be the server thread.
+            generator.lowestGround(columnX, columnZ);
+
+            // Now release the held response -- READY arrives comfortably before the bound expires.
+            responseHeld.countDown();
+            waitThread.join(bound.toMillis() + 2000);
+            assertTrue(!waitThread.isAlive(), "Expected the bounded wait to have actually returned");
+
+            // Exactly ServerCubeWorldRoadPrefetchMixin's own sequence: eviction LAST, after the wait.
+            RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+
+            int ground = generator.surfaceY(block[0], block[1]);
+            int cubeY = ground >> 4;
+            var state = generator.generate(columnX, cubeY, columnZ).getBlockState(block[0] & 15, ground & 15, block[1] & 15);
+            assertTrue(isAnyRoadSurfaceMaterial(state),
+                    "Expected the real road to paint despite the lowestGround survey racing in the middle of the wait, got " + state);
+        } finally {
+            responseHeld.countDown(); // in case of an early assertion failure, never leave the stub thread blocked
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55496/55499: {@code RoadPrefetch.sectionLooksStale} is what
+     * {@code ServerCubeWorldRoadPrefetchMixin}'s bounded verify-and-retry actually checks before
+     * deciding to re-evict and regenerate. Proves it directly, deterministically: a correctly
+     * generated section (road data already ready) is never flagged; the exact same section with
+     * ONLY the road column's own block swapped to a natural material (modelling what a won stale
+     * race would actually leave behind) IS flagged.
+     */
+    @Test
+    void sectionLooksStaleDetectsAMismatchAgainstFreshRoadDataAndClearsOnceFixed(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        double lat = 45.0005, lon = -110.0005; // a fresh, never-used cell: 4500_-11000, READY from the start
+
+        java.nio.file.Files.writeString(roadCache.resolve("4500_-11000.json"), """
+                {"schema_version":1,"region_id":"stale-detection","ways":[{"way_id":555060,
+                  "way_tags":{"highway":"secondary","name":"Stale Detection Street"},
+                  "centerline":[{"lat":45.0003,"lon":-110.0007},{"lat":45.0007,"lon":-110.0003}],
+                  "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int[] block = generator.block(lat, lon);
+        int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeY = ground >> 4;
+        int lx = block[0] & 15, ly = ground & 15, lz = block[1] & 15;
+
+        var correctSection = generator.generate(cubeX, cubeY, cubeZ);
+        assertTrue(isAnyRoadSurfaceMaterial(correctSection.getBlockState(lx, ly, lz)),
+                "Sanity: this column must actually be real road surface to begin with, got " + correctSection.getBlockState(lx, ly, lz));
+        assertTrue(!RoadPrefetch.sectionLooksStale(generator, cubeX, cubeY, cubeZ, correctSection),
+                "Expected a correctly generated section to never be flagged stale");
+
+        var staleSection = new net.minecraft.world.level.chunk.LevelChunkSection(correctSection.getStates().copy(), correctSection.getBiomes());
+        staleSection.setBlockState(lx, ly, lz, net.minecraft.world.level.block.Blocks.GRASS_BLOCK.defaultBlockState());
+        assertTrue(RoadPrefetch.sectionLooksStale(generator, cubeX, cubeY, cubeZ, staleSection),
+                "Expected a section whose road column was overwritten with a natural material to be flagged stale");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55522/55526: {@code RoadPrefetch.isPendingForColumn} is the direct,
+     * reliable detector {@code ServerCubeWorldRoadPrefetchMixin}'s new "defer/retry while the
+     * covering tile is genuinely PENDING" mechanism checks -- deliberately NOT the indirect
+     * "compare decorated output against fresh geometry" approach {@code sectionLooksStale} uses
+     * (that one was found to have real false positives). Proves the three real
+     * {@code RoadTileSource.CellState}s directly: a cell with no cache marker at all is PENDING
+     * (true); a cell with a {@code .json} ready marker is NOT pending (false); a cell with an
+     * {@code .empty} confirmed-empty marker is also NOT pending (false) -- only a genuinely
+     * unresolved cell counts.
+     */
+    @Test
+    void isPendingForColumnReflectsTheRealCacheStateDirectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        RoadTileSource tileSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(tileSource);
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+
+        // A cell never touched at all: genuinely pending.
+        double pendingLat = 46.0005, pendingLon = -111.0005;
+        int[] pendingBlock = generator.block(pendingLat, pendingLon);
+        assertTrue(RoadPrefetch.isPendingForColumn(generator, pendingBlock[0], pendingBlock[1]),
+                "Expected a never-touched cell to be genuinely pending");
+
+        // A cell with a real ready marker: not pending.
+        double readyLat = 47.0005, readyLon = -112.0005;
+        long readyCellLat = (long) Math.floor(readyLat / RoadNetwork.CELL_DEGREES);
+        long readyCellLon = (long) Math.floor(readyLon / RoadNetwork.CELL_DEGREES);
+        java.nio.file.Files.writeString(roadCache.resolve(readyCellLat + "_" + readyCellLon + ".json"), """
+                {"schema_version":1,"region_id":"pending-detector-ready","ways":[]}
+                """);
+        int[] readyBlock = generator.block(readyLat, readyLon);
+        assertTrue(!RoadPrefetch.isPendingForColumn(generator, readyBlock[0], readyBlock[1]),
+                "Expected a cell with a real ready marker to NOT be pending");
+
+        // A cell with a confirmed-empty marker: also not pending.
+        double emptyLat = 48.0005, emptyLon = -113.0005;
+        long emptyCellLat = (long) Math.floor(emptyLat / RoadNetwork.CELL_DEGREES);
+        long emptyCellLon = (long) Math.floor(emptyLon / RoadNetwork.CELL_DEGREES);
+        java.nio.file.Files.writeString(roadCache.resolve(emptyCellLat + "_" + emptyCellLon + ".empty"), "");
+        int[] emptyBlock = generator.block(emptyLat, emptyLon);
+        assertTrue(!RoadPrefetch.isPendingForColumn(generator, emptyBlock[0], emptyBlock[1]),
+                "Expected a cell with a confirmed-empty marker to NOT be pending");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55532: {@code hasLiveTileSource} must reflect whether a live source is
+     * actually configured, and {@code cubeContainsNaturalSurface} must correctly tell apart a cube
+     * that actually contains natural ground height (somewhere in its own footprint) from one that
+     * does not -- the explicit "live-fetch capability" and "actual surface relevance (Y filter)"
+     * gates John's own review asked for on the pending-surface-cube defer.
+     *
+     * <p><b>Comment 55539, a real bug in the 55537 version of this test:</b> that version required a
+     * pre-warmed mapped-road fixture file on disk before {@code cubeContainsNaturalSurface} would
+     * ever report a cube relevant at all -- but John's native checks found the real production code
+     * had the exact same bug: requiring mapped geometry to exist is circular for a genuinely cold,
+     * never-fetched (PENDING) tile, which by definition has no mapped geometry yet. Fixed (in
+     * {@code RoadPrefetch} itself) to be geometry-independent; this test is rewritten to match --
+     * an ENTIRELY cold boot, no road fixture, no cache file, no HTTP stub, source genuinely PENDING
+     * throughout, proving the gate works with nothing but natural terrain.
+     */
+    @Test
+    void hasLiveTileSourceAndCubeContainsNaturalSurfaceGateCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        // Deliberately no assertion on the "before configuring" state here: RoadNetwork.tileSource()
+        // falls back to a lazily-built, process-lifetime-cached default RoadTileSource once any test
+        // anywhere in this run has triggered it, so "no override set yet" does not imply "no live
+        // source at all" -- the only reliably-testable property is the post-configuration state below.
+        java.nio.file.Files.createDirectories(roadCache);
+        // MINECRAFT-566 comment 55534: a cache-only source (allowNetwork=false) is a real, non-null
+        // RoadTileSource that must NOT be reported as live -- hasLiveTileSource now checks actual
+        // live-fetch capability (RoadTileSource.canFetchLive), not mere non-null existence.
+        RoadTileSource cacheOnlySource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(cacheOnlySource);
+        assertTrue(!RoadPrefetch.hasLiveTileSource(), "Expected a cache-only (allowNetwork=false) tile source to NOT be reported as live");
+
+        // MINECRAFT-566 comment 55539: a live-capable source that has NEVER been fetched from at
+        // all -- genuinely PENDING, no cache file, no mapped geometry whatsoever, matching the exact
+        // "entirely-cold positive case" John's own native checks found broken.
+        RoadTileSource liveSource = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, true, Duration.ofSeconds(5));
+        RoadNetwork.setTileSourceForTests(liveSource);
+        assertTrue(RoadPrefetch.hasLiveTileSource(), "Expected a configured, live-capable tile source to be reported as live");
+
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        double lat = 46.0035, lon = -116.0050; // fictional, never one of John's own real test locations
+        int[] block = generator.block(lat, lon);
+        assertEquals(RoadTileSource.CellState.PENDING, liveSource.cellState(lat, lon),
+                "Expected this cell to be genuinely PENDING -- never fetched, no cache file, matching an entirely cold boot");
+        assertTrue(RoadNetwork.segmentCoveringColumn(generator.grid(), block[0], block[1]) == null,
+                "Expected no mapped geometry to exist at all for this never-fetched cell -- the exact precondition 55539 found broken");
+
+        int ground = generator.surfaceY(block[0], block[1]);
+        int cubeXContaining = block[0] >> 4, cubeZContaining = block[1] >> 4;
+        int cubeYContainingSurface = ground >> 4;
+
+        assertTrue(RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface, cubeZContaining),
+                "Expected the cube whose own Y-range actually contains this footprint's natural ground height to be reported as containing it, with NO mapped geometry involved at all");
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface + 50, cubeZContaining),
+                "Expected a cube far ABOVE the natural ground height to NOT be reported as containing it");
+        assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cubeXContaining, cubeYContainingSurface - 50, cubeZContaining),
+                "Expected a cube far BELOW the natural ground height to NOT be reported as containing it");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55545, John's own direction change superseding every bounded-fail-open
+     * design: {@code RoadPrefetch.isAnyRelevantCellPending}/{@code dispatchRelevantCellFetches} are
+     * what {@code ServerCubeWorldRoadPrefetchMixin} now uses, INSTEAD of ever calling {@code
+     * generate()}, to decide whether to throw {@code RoadDataNotReadyException} rather than accept
+     * bare terrain. Entirely cold boot (no cache file, no HTTP stub response yet), proving: (1) a
+     * relevant, never-fetched cube is reported pending; (2) dispatching actually sends a real
+     * request; (3) once that request resolves, the SAME cube is no longer reported pending.
+     */
+    @Test
+    void isAnyRelevantCellPendingAndDispatchRelevantCellFetchesWorkCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555088,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Pending Cell Test Road"},
+                  "geometry":[{"lat":47.0010,"lon":-117.0050},{"lat":47.0060,"lon":-117.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 47.0035, lon = -117.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int cubeX = block[0] >> 4, cubeZ = block[1] >> 4;
+            int cubeY = generator.surfaceY(block[0], block[1]) >> 4;
+
+            assertTrue(RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY, cubeZ),
+                    "Expected the cube containing this never-fetched cell's own natural surface to be reported pending");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY + 50, cubeZ),
+                    "Expected a cube far ABOVE the natural ground height to NOT be reported pending regardless of cell state");
+
+            RoadPrefetch.dispatchRelevantCellFetches(generator, cubeX, cubeY, cubeZ); // fire-and-forget: must not block this thread
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchRelevantCellFetches to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPending(generator, cubeX, cubeY, cubeZ),
+                    "Expected the SAME cube to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55551: {@code CubicEventsArrivalRoadGateMixin} needs the SAME
+     * pending/dispatch questions {@code isAnyRelevantCellPending}/{@code dispatchRelevantCellFetches}
+     * answer, but around a real BLOCK position (an arrival's own landing column) rather than a cube
+     * index -- John's own source confirmation (comment 55552): {@code readyAround}/{@code
+     * loadAround} both traverse the identical 3x3x3 cube neighborhood around that position. Entirely
+     * cold boot, mirroring the cube-level test: no fixture, no cache file, real HTTP stub.
+     */
+    @Test
+    void isAnyRelevantCellPendingNearBlockAndItsDispatchCounterpartWorkCorrectly(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        java.nio.file.Files.createDirectories(roadCache);
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555099,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Arrival Test Road"},
+                  "geometry":[{"lat":48.0010,"lon":-118.0050},{"lat":48.0060,"lon":-118.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 48.0035, lon = -118.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int ground = generator.surfaceY(block[0], block[1]);
+
+            assertTrue(RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
+                    "Expected the 3x3x3 cube neighborhood around this never-fetched landing column to be reported pending");
+            // MINECRAFT-566 comment 55554: "avoid scanning procedural terrain for every cell every
+            // tick" -- this check is now geometry-of-CELLS-based, not natural-height-based (which
+            // real map cell a point falls in is purely a function of latitude/longitude, never Y),
+            // so a position far ABOVE/BELOW the same lat/lon is still reported pending (the real
+            // ServerCubeWorld.readyAround/loadAround's own 3x3x3 Y-span already encodes whatever Y
+            // relevance matters here -- this check does not need a second, narrower one on top).
+            assertTrue(RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground + 500, block[1]),
+                    "Expected a landing position far ABOVE natural ground but at the SAME lat/lon to still be reported pending");
+
+            RoadPrefetch.dispatchRelevantCellFetchesNearBlock(generator, block[0], ground, block[1]); // fire-and-forget: must not block this thread
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchRelevantCellFetchesNearBlock to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyRelevantCellPendingNearBlock(generator, block[0], ground, block[1]),
+                    "Expected the SAME landing position to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560: a minimal, real {@code CubeWorld} subclass -- just enough to
+     * drive {@link RoadPrefetch#isAnyMissingRelevantCellPendingNearBlock}/
+     * {@code dispatchMissingRelevantCellFetchesNearBlock}'s own {@code cube(long)} check without a
+     * full {@code ServerCubeWorld}/{@code ServerLevel} (the same disclosed test gap every other
+     * mixin in this class already has -- see {@code CubicEventsArrivalRoadGateMixin}'s own class
+     * doc). {@code CubeWorld.cube(long)} never touches the {@code Level} passed to its constructor,
+     * so {@code null} is safe here; only the inherited, protected {@code cubes} map is actually
+     * exercised, via {@link #markLoaded}.
+     */
+    private static final class TestCubeWorld extends CubeWorld {
+        TestCubeWorld() {
+            super(null);
+        }
+
+        @Override
+        protected int baselineTop(int x, int z) {
+            return Integer.MIN_VALUE;
+        }
+
+        @Override
+        public void blockChanged(BlockPos pos) {
+        }
+
+        void markLoaded(int cubeX, int cubeY, int cubeZ, LevelChunkSection section) {
+            this.cubes.put(CubeKey.pack(cubeX, cubeY, cubeZ), new Cube(cubeX, cubeY, cubeZ, section));
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560's "positive control": the ordinary, fully-cold-boot case (no
+     * cube loaded at all) must still report the new, per-cube {@code isAnyMissingRelevantCellPendingNearBlock}/
+     * {@code dispatchMissingRelevantCellFetchesNearBlock} pair exactly as pending/dispatchable as
+     * the prior, whole-neighborhood-only check did -- proving the missing/loaded narrowing added
+     * for his own "upper cube" repro did not regress the common real case (nothing loaded yet).
+     */
+    @Test
+    void isAnyMissingRelevantCellPendingNearBlockReportsPendingWhenNothingIsLoadedAtAll(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        String response = """
+                {"elements":[{"type":"way","id":555100,"nodes":[1,2],
+                  "tags":{"highway":"residential","name":"Missing Relevant Test Road"},
+                  "geometry":[{"lat":49.0010,"lon":-119.0050},{"lat":49.0060,"lon":-119.0050}]}]}
+                """;
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 49.0035, lon = -119.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int ground = generator.surfaceY(block[0], block[1]);
+
+            TestCubeWorld cubes = new TestCubeWorld(); // nothing loaded at all: every one of the 27 cubes is missing
+
+            assertTrue(RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], ground, block[1]),
+                    "Expected the 3x3x3 cube neighborhood around this never-fetched landing column to be reported pending");
+
+            RoadPrefetch.dispatchMissingRelevantCellFetchesNearBlock(cubes, generator, block[0], ground, block[1]);
+            for (int i = 0; i < 20 && tileSource.cellState(lat, lon) == RoadTileSource.CellState.PENDING; i++) {
+                Thread.sleep(50);
+            }
+            assertEquals(RoadTileSource.CellState.READY, tileSource.cellState(lat, lon),
+                    "Expected the dispatched fetch to actually resolve this cell");
+            assertTrue(requests.get() >= 1, "Expected dispatchMissingRelevantCellFetchesNearBlock to have sent a real request");
+            assertTrue(!RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], ground, block[1]),
+                    "Expected the SAME landing position to no longer be reported pending once its cell has resolved");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-566 comment 55560's own real repro, the actual release blocker this whole round
+     * fixes: with every OTHER cube in the 3x3x3 neighborhood already loaded, a single remaining
+     * missing cube that genuinely has no natural surface anywhere in its own 16x16 footprint (his
+     * own "upper cube" case) must create NO map demand at all -- not pending, and not dispatched --
+     * even though the tile cache for this whole area is stone cold. Under the PRIOR, whole-
+     * neighborhood-bounding-box check this would have falsely stayed pending and issued one
+     * unnecessary POST purely because it shared the neighborhood with the relevant, loaded center
+     * cube; that is exactly the bug his own native verification of commit 653e870 found.
+     */
+    @Test
+    void aMissingButNaturallyIrrelevantUpperCubeCreatesNoMapDemandEvenWithAColdCache(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "{\"elements\":[]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            RoadTileSource tileSource = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"), roadCache, true, Duration.ofSeconds(10));
+            RoadNetwork.setTileSourceForTests(tileSource);
+
+            EarthGenerator generator = bootAndBuildGenerator(demCache);
+            double lat = 48.0035, lon = -118.0050; // fictional, never one of John's own real test locations
+            int[] block = generator.block(lat, lon);
+            assertEquals(RoadTileSource.CellState.PENDING, tileSource.cellState(lat, lon),
+                    "Expected this cell to be genuinely PENDING -- never fetched, matching an entirely cold boot");
+            int groundY = generator.surfaceY(block[0], block[1]);
+            int cx = block[0] >> 4, cy = groundY >> 4, cz = block[1] >> 4; // center the cube grid on the real ground-containing cube
+
+            // Sanity precondition, not a production-logic assertion: the cube directly ABOVE the
+            // ground-containing cube must genuinely have no natural surface anywhere in its own
+            // 16x16 footprint at this real terrain location -- if that ever stops holding here, this
+            // test needs a different landing location, not a change to the logic it checks.
+            assertTrue(!RoadPrefetch.cubeContainsNaturalSurface(generator, cx, cy + 1, cz),
+                    "Sanity: expected the cube directly above ground to have no natural surface at this location");
+
+            TestCubeWorld cubes = new TestCubeWorld();
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 1 && dz == 0) continue; // leave exactly this one (naturally irrelevant) cube missing
+                        LevelChunkSection section = generator.generate(cx + dx, cy + dy, cz + dz);
+                        cubes.markLoaded(cx + dx, cy + dy, cz + dz, section);
+                    }
+                }
+            }
+
+            assertTrue(!RoadPrefetch.isAnyMissingRelevantCellPendingNearBlock(cubes, generator, block[0], groundY, block[1]),
+                    "Expected the one missing-but-naturally-irrelevant upper cube to create no pending demand at all, with everything else already loaded");
+
+            RoadPrefetch.dispatchMissingRelevantCellFetchesNearBlock(cubes, generator, block[0], groundY, block[1]);
+            assertEquals(0, requests.get(),
+                    "Expected zero dispatch for a missing cube with no natural surface, even against a stone-cold tile cache");
+        } finally {
+            stub.stop(0);
+        }
+    }
+}
