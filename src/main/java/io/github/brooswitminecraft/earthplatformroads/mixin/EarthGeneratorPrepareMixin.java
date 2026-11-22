@@ -1,0 +1,93 @@
+package io.github.brooswitminecraft.earthplatformroads.mixin;
+
+import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+/**
+ * The seam that makes road coverage actually automatic "wherever he travels" (MINECRAFT-566's
+ * milestone update), not merely data a player or operator must find and install first: Earth
+ * Platform's own {@code EarthGenerator.prepare}/{@code .prepareNear} are its documented "fetching
+ * data ahead of generation" entry points (see {@code EarthGenerator}'s own "Reading this file"
+ * section) -- called off-thread (e.g. the {@code /earth travel} command wraps its call in {@code
+ * CompletableFuture.supplyAsync}, and {@code ChunkyCompat} calls {@code prepare} once per
+ * pre-generation cell) specifically so that later, synchronous generation calls never wait on the
+ * network themselves.
+ *
+ * <p>This mixin does the same thing for road data: after Earth Platform's own prepare work for a
+ * point runs, it also blocks (here, off the main generation thread, in exactly the contexts Earth
+ * Platform itself already uses for this) on {@code RoadTileSource.waysForCell} for that point's
+ * tile. {@code EarthGeneratorRoadMixin}'s own {@code surface()} hook never fetches -- it only ever
+ * reads whatever this already cached (see {@code RoadTileSource.cachedWaysForCellOrEmpty}) -- so
+ * the hot generation path, including Earth Platform's {@code loadNow} (explicitly synchronous on
+ * whatever thread calls it, which may be the main server thread), never blocks on HTTP regardless
+ * of whether this mixin has run for that area yet.
+ *
+ * <h2>Boundary gap, found live (MINECRAFT-566 comment 55454), fixed on the read side (55456)</h2>
+ * A mapped way whose geometry crosses from an already-fetched cell into an adjacent, still-pending
+ * one was silently omitted at exactly that boundary: not a missing OSM way, not a designed bridge/
+ * tunnel omission, just a cell that genuinely had not been fetched yet. Observed live on Zippy (a
+ * road abruptly ending on bare ground at a tile seam) and reproduced synthetically in {@code
+ * RoadTilePrefetchMixinTest#aCrossingRoadIsSilentlyOmittedAtAnUnfetchedNeighborsBoundary}.
+ *
+ * <p>The first fix attempt (55454) widened THIS mixin to issue up to 9 sequential {@code
+ * waysForCell} calls (the point's cell plus its 8 Moore neighbors) per prepare call. Comment 55456
+ * found that broken under the Overpass.ch preview provider's own realistic rate limit: with a
+ * multi-second {@code previewMinRequestIntervalMs}, only the first of those 9 calls could actually
+ * succeed before {@code RoadTileSource}'s next-eligible deadline rejected the rest -- a problem the
+ * original regression test missed entirely by using the zero-interval constructor, never
+ * exercising that deadline. The real fix for a SINGLE way crossing a boundary is on the READ side
+ * instead: {@code RoadNetwork.candidatesNear} also checks the Moore neighborhood's cached data
+ * (read-only, no fetch) when evaluating a column, since a live provider's bbox response for one
+ * cell already carries the FULL geometry of any way merely touching that cell -- including the
+ * portion extending into a neighbor.
+ *
+ * <h2>A second way, sharing only a node, is a genuinely different case (55460)</h2>
+ * A road continuing as a SECOND, different OSM way ID (common in real OSM data -- a street
+ * changing classification or just split for editing reasons) whose own geometry lies entirely in a
+ * neighbor cell cannot be carried by the read-side trick: that neighbor's data was never returned
+ * by any query, because the first cell's bbox never touched the second way's geometry at all. That
+ * neighbor genuinely has to be fetched. So this mixin now ALSO calls {@code
+ * RoadTileSource#enqueueLookahead} after its own synchronous point-cell fetch: a bounded,
+ * deduplicated queue of the point's Moore neighborhood, drained at AT MOST one additional fetch per
+ * prepare call (never a burst, never blocking beyond one ordinary fetch attempt, subject to the
+ * exact same one-in-flight guarantee and rate-limit deadline as every other fetch). Over several
+ * prepare calls as a player moves normally, this catches up nearby cells -- including a second
+ * way's own cell -- without ever exceeding the provider's rate limit. See {@code
+ * RoadTileSource#lookaheadQueue}'s own field doc for the full design, and {@code
+ * RoadTilePrefetchMixinTest#aSuccessorWayInANeverDirectlyFetchedCellIsFoundAfterSeveralPrepareCalls}
+ * for the regression (two different way IDs sharing a node, the second's own cell reached only
+ * through the lookahead queue, over several simulated prepare calls).
+ *
+ * <h2>This mixin's own hooks are unreachable during ordinary gameplay movement (55474)</h2>
+ * {@code prepare}/{@code prepareNear} are Earth Platform's documented "fetch ahead" entry points,
+ * but ordinary streamed generation (a player simply walking/driving) never calls either one: the
+ * real path is {@code ServerCubeWorld.requestAround} (the server tick) dispatching to a background
+ * worker that calls {@code produce}, which on a storage miss calls {@code generator.generate(...)}
+ * directly -- confirmed by reading {@code ServerCubeWorld} itself (the {@code combined-73} build
+ * this mod targets). So every fix above only ever helped {@code /earth travel} teleport and Chunky
+ * pre-generation, never a normal walk into fresh terrain. {@code ServerCubeWorldRoadPrefetchMixin}
+ * (same package) adds the missing hook for that real path, reusing this class's own {@link
+ * RoadPrefetch#forColumn} dispatch rather than a second copy of it -- see that mixin's own doc for
+ * why it is safe to add there (off the server tick thread; never for Earth Platform's synchronous
+ * {@code loadNow} arrival path) and for its own regression test driving the real worker path.
+ */
+@Mixin(EarthGenerator.class)
+public abstract class EarthGeneratorPrepareMixin {
+    @Inject(method = "prepare(II)V", at = @At("TAIL"))
+    private void earthplatformroads$prefetchRoadTile(int x, int z, CallbackInfo ci) {
+        prefetch(x, z);
+    }
+
+    @Inject(method = "prepareNear(II)V", at = @At("TAIL"))
+    private void earthplatformroads$prefetchRoadTileNear(int x, int z, CallbackInfo ci) {
+        prefetch(x, z);
+    }
+
+    private void prefetch(int x, int z) {
+        RoadPrefetch.forColumn((EarthGenerator) (Object) this, x, z);
+    }
+}
