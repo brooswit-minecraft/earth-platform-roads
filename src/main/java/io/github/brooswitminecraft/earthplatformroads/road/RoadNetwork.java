@@ -207,6 +207,38 @@ public final class RoadNetwork {
                 return new RoadTileSource(tileEndpointOverride, cacheRoot, true, TILE_FETCH_TIMEOUT);
             }
 
+            // MINECRAFT-567 (John comments 55588/55593): a SEPARATE, opt-in, credential-free
+            // loopback-proxy mode, checked strictly BEFORE the ordinary direct-Overpass.ch opt-in
+            // chain below so that chain's own code path stays byte-for-byte unchanged whenever this
+            // switch is off (the ordinary, unmodified state of a real install: both
+            // Boolean.getBoolean and System.getProperty below return false/null with nothing set).
+            // Not a save-file/world setting -- gated on a JVM -D system property only, exactly like
+            // the existing previewProvider/previewEndpoint switches it sits beside.
+            boolean loopbackProxyEnabled = Boolean.getBoolean("earthplatformroads.loopbackProxyEnabled");
+            if (loopbackProxyEnabled) {
+                String loopbackEndpointProperty = System.getProperty("earthplatformroads.loopbackProxyEndpoint");
+                if (loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()) {
+                    // Enabled but not configured: a network-disabled source, exactly like the
+                    // ordinary "opted in but under-provisioned" case below -- never a silent fallback
+                    // to the real Overpass.ch direct endpoint.
+                    return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
+                }
+                long loopbackMinIntervalMs = Long.getLong("earthplatformroads.loopbackProxyMinRequestIntervalMs", 0L);
+                boolean telemetryReportingEnabledForLoopback = Boolean.getBoolean("earthplatformroads.fetchTelemetryReportingEnabled");
+                long telemetryReportIntervalSecondsForLoopback = Long.getLong(
+                        "earthplatformroads.fetchTelemetryReportIntervalSeconds", DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS);
+                // Credential-free by design (John comment 55588: "do not send keys to the proxy from
+                // Roads"): apiKey is always null here, regardless of whether
+                // EARTHPLATFORMROADS_PREVIEW_API_KEY happens to be set for direct mode. This is also
+                // structurally enforced one layer down -- RoadTileSource.shouldSendApiKeyTo only ever
+                // attaches a key when the configured endpoint exactly equals the Overpass.ch
+                // CREDENTIAL_BOUND_ENDPOINT, which a loopback URL never does -- but passing null here
+                // too means the key is never even held by a loopback-mode RoadTileSource instance.
+                return new RoadTileSource(URI.create(loopbackEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
+                        null, Duration.ofMillis(loopbackMinIntervalMs),
+                        telemetryReportingEnabledForLoopback, Duration.ofSeconds(telemetryReportIntervalSecondsForLoopback));
+            }
+
             boolean optedIntoPreview = "overpass-ch".equals(System.getProperty("earthplatformroads.previewProvider"));
             String previewEndpointProperty = System.getProperty("earthplatformroads.previewEndpoint");
             // Env-var only, deliberately: see this field's own javadoc on RoadTileSource.apiKey for
