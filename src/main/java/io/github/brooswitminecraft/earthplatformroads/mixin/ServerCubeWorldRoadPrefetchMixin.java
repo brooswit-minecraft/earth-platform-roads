@@ -1,6 +1,12 @@
 package io.github.brooswitminecraft.earthplatformroads.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import com.llamalad7.mixinextras.sugar.Share;
+import com.llamalad7.mixinextras.sugar.ref.LocalBooleanRef;
+import io.earthplatform.minecraft.cubic.ServerCubeWorld;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
+import io.github.brooswitminecraft.earthplatformroads.road.LevelRoadPreview;
 import io.earthplatform.minecraft.cubic.gen.CubeGenerator;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadDataNotReadyException;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadPrefetch;
@@ -13,7 +19,6 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
@@ -331,13 +336,14 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         SynchronousLoadGuard.exit();
     }
 
-    @Redirect(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
+    @WrapOperation(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
             at = @At(value = "INVOKE",
                     target = "Lio/earthplatform/minecraft/cubic/gen/CubeGenerator;generate(IIILjava/util/List;Ljava/util/List;)Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
     private LevelChunkSection earthplatformroads$generateWithStaleRetry(
-            CubeGenerator cubeGenerator, int cubeX, int cubeY, int cubeZ, List<CompoundTag> blockEntities, List<CompoundTag> entities) {
+            CubeGenerator cubeGenerator, int cubeX, int cubeY, int cubeZ, List<CompoundTag> blockEntities, List<CompoundTag> entities,
+            Operation<LevelChunkSection> operation, @Share("levelRoadTouched") LocalBooleanRef touched) {
         if (!(cubeGenerator instanceof EarthGenerator earthGenerator)) {
-            return cubeGenerator.generate(cubeX, cubeY, cubeZ, blockEntities, entities);
+            return operation.call(cubeGenerator, cubeX, cubeY, cubeZ, blockEntities, entities);
         }
         // MINECRAFT-566 comment 55545, superseding every earlier bounded-fail-open version of this
         // check (comments 55522 through 55544 -- see this class's own "direction change" doc
@@ -396,7 +402,7 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
         // isolation `produce()` itself already relies on by always passing fresh empty lists in.
         List<CompoundTag> attemptBlockEntities = new ArrayList<>();
         List<CompoundTag> attemptEntities = new ArrayList<>();
-        LevelChunkSection section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+        LevelChunkSection section = operation.call(cubeGenerator, cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
         // MINECRAFT-566 comment 55496, a real, independently-reproduced residual race (see this
         // class's own "known, disclosed residual race" doc section): a DIFFERENT, already-in-flight
         // concurrent column() computation, started before the eviction above ran, can still publish
@@ -412,10 +418,22 @@ public abstract class ServerCubeWorldRoadPrefetchMixin {
             RoadPrefetch.evictStaleSurfaceDecision(earthGenerator, cubeX, cubeZ);
             attemptBlockEntities = new ArrayList<>(); // discard the abandoned attempt's own additions entirely
             attemptEntities = new ArrayList<>();
-            section = cubeGenerator.generate(cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+            section = operation.call(cubeGenerator, cubeX, cubeY, cubeZ, attemptBlockEntities, attemptEntities);
+        }
+        if (!SynchronousLoadGuard.isActive()) {
+            touched.set(LevelRoadPreview.apply(earthGenerator, cubeX, cubeY, cubeZ, section));
         }
         blockEntities.addAll(attemptBlockEntities);
         entities.addAll(attemptEntities);
         return section;
+    }
+
+    @WrapOperation(method = "produce(JIII)Lio/earthplatform/minecraft/cubic/ServerCubeWorld$Ready;",
+            at = @At(value = "INVOKE", target = "Lio/earthplatform/minecraft/cubic/ServerCubeWorld;surfaceBand(II)[I"))
+    private int[] earthplatformroads$keepTouchedSlice(ServerCubeWorld world,
+            int x, int z, Operation<int[]> operation, long key, int originalX, int y, int originalZ,
+            @Share("levelRoadTouched") LocalBooleanRef touched) {
+        int[] band = operation.call(world, x, z);
+        return touched.get() && y > band[1] ? new int[] {band[0], y} : band;
     }
 }

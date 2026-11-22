@@ -1,0 +1,53 @@
+name: Level Road QA
+
+on:
+  # MINECRAFT-567: widened (in this copy only) so this workflow also fires for the combined
+  # deck+loopback preview PR (stacked on minecraft-567-road-fetch-telemetry, not main) -- same
+  # rationale as roads-build.yml's own widened branch filter. No job logic changed.
+  pull_request:
+    branches: [main, minecraft-567-combined-deck-loopback-preview]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-placement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch and verify public build dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p libs
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --output libs/earthplatform-0.1.0-alpha.73.jar \
+            https://github.com/pirut/earth-platform/releases/download/combined-73/earthplatform-combined-73.jar
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --output libs/layeredslopes-0.2.0.jar \
+            https://github.com/brooswit-minecraft/layered-slopes/releases/download/v0.2.0/layeredslopes-0.2.0.jar
+          sha256sum --check --strict <<'SHA256'
+          e921b0284f0f94e77af43307dfa4bebcf3659c5889eebfb37d39a45966022a41  libs/earthplatform-0.1.0-alpha.73.jar
+          0d6ef73152d99e9de1278f272fe1f40fec039a2b1d31d32bd38af7e0f79b2878  libs/layeredslopes-0.2.0.jar
+          SHA256
+      - name: Check level-road placement in real NeoForge
+        env:
+          JAVA_TOOL_OPTIONS: -Dearthplatformroads.levelRoadPreview=true
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain test --tests '*LevelRoadPreviewOfflineTest'
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          matches = glob.glob('build/test-results/test/TEST-*LevelRoadPreviewOfflineTest.xml')
+          if len(matches) != 1:
+              raise SystemExit('Expected exactly one level-road fixture test report')
+          result = ET.parse(matches[0]).getroot()
+          if any(result.get(k) != v for k,v in {'tests':'1','skipped':'0','failures':'0','errors':'0'}.items()):
+              raise SystemExit('Level-road fixture did not execute successfully')
+          PY

@@ -1,18 +1,19 @@
 name: Build Roads
 
 on:
-  # MINECRAFT-567 (Wroosbit comment 55600): this branch's own PR (#8) is stacked on PR #7
+  # MINECRAFT-567 (Wroosbit comment 55600, extended for the combined deck+loopback preview
+  # per John 55616 / Wroosbit 55617): this branch's own PR is stacked on PR #7
   # (minecraft-567-road-fetch-telemetry), not main -- main's own copy of this workflow only
   # triggers for a main-based pull_request/push, so a plain unmodified copy of it (added here
   # verbatim first, confirmed via commit 030504c's own zero check-runs) never actually fires for
-  # this stacked PR regardless of the file being present. Both feature branch names are added
-  # here, in THIS COPY ONLY (main's own workflow file is untouched), purely so the existing build
-  # job actually runs for this exact stacked head -- no job logic changed, no new release
+  # this stacked PR regardless of the file being present. Feature branch names are added here,
+  # in THIS COPY ONLY (main's own workflow file is untouched), purely so the existing build job
+  # actually runs for each exact stacked/combined head -- no job logic changed, no new release
   # automation invented, no merge-to-main authorized.
   pull_request:
-    branches: [main, minecraft-567-road-fetch-telemetry]
+    branches: [main, minecraft-567-road-fetch-telemetry, minecraft-567-combined-deck-loopback-preview]
   push:
-    branches: [main, minecraft-567-road-fetch-telemetry, minecraft-567-loopback-proxy-client]
+    branches: [main, minecraft-567-road-fetch-telemetry, minecraft-567-loopback-proxy-client, minecraft-567-combined-deck-loopback-preview]
     tags: ['v*']
 
 permissions:
