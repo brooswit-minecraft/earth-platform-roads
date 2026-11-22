@@ -4,7 +4,12 @@
   "package": "io.github.brooswitminecraft.earthplatformroads.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "EarthGeneratorRoadMixin"
+    "EarthGeneratorRoadMixin",
+    "EarthGeneratorPrepareMixin",
+    "ServerCubeWorldRoadPrefetchMixin",
+    "SurfaceGeneratorColumnCacheAccessor",
+    "SurfaceGeneratorColumnLeaseMixin",
+    "SurfaceGeneratorRoadClearanceMixin"
   ],
   "injectors": {
     "defaultRequire": 1
