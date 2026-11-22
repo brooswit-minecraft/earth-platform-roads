@@ -72,6 +72,44 @@ final class RoadStationProfile {
         return new Cap(quantize(topY));
     }
 
+    /** Least no-cut envelope with adjacent station differences bounded in sixteenths. */
+    static int[] noCutGrade(int[] floors, int maxStep) {
+        if (maxStep <= 0) throw new IllegalArgumentException("positive grade limit required");
+        int[] top = floors.clone();
+        for (int i = 1; i < top.length; i++) top[i] = (int) Math.max(top[i], (long) top[i - 1] - maxStep);
+        for (int i = top.length - 2; i >= 0; i--) top[i] = (int) Math.max(top[i], (long) top[i + 1] - maxStep);
+        return top;
+    }
+
+    /** The same envelope, also bounding directly adjacent paved pixels at a bend. */
+    static int[] noCutGrade(int[] floors, int maxStep, List<? extends java.util.Set<Integer>> neighbors) {
+        if (neighbors.size() != floors.length) throw new IllegalArgumentException("station adjacency size");
+        int[] top = noCutGrade(floors, maxStep);
+        record Candidate(int station, int height) {}
+        var pending = new java.util.PriorityQueue<Candidate>(
+                java.util.Comparator.comparingInt(Candidate::height).reversed());
+        for (int i = 0; i < top.length; i++) pending.add(new Candidate(i, top[i]));
+        while (!pending.isEmpty()) {
+            Candidate next = pending.remove();
+            int i = next.station();
+            if (next.height() != top[i]) continue;
+            long minimum = (long) next.height() - maxStep;
+            if (i > 0 && minimum > top[i - 1]) {
+                top[i - 1] = (int) minimum;
+                pending.add(new Candidate(i - 1, top[i - 1]));
+            }
+            if (i + 1 < top.length && minimum > top[i + 1]) {
+                top[i + 1] = (int) minimum;
+                pending.add(new Candidate(i + 1, top[i + 1]));
+            }
+            for (int other : neighbors.get(i)) if (minimum > top[other]) {
+                top[other] = (int) minimum;
+                pending.add(new Candidate(other, top[other]));
+            }
+        }
+        return top;
+    }
+
     private static int quantize(double y) {
         double scaled = y * LAYERS_PER_BLOCK;
         if (!Double.isFinite(scaled) || scaled < Integer.MIN_VALUE || scaled > Integer.MAX_VALUE) {
