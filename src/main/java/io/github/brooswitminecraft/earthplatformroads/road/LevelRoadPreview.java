@@ -135,7 +135,7 @@ public final class LevelRoadPreview {
                 if (Math.abs(across) > width || Math.floor(leg.along(x + .5, z + .5)) != at.number()) continue;
                 if (!at.equals(locate(earth, road, x, z))) continue;
                 RoadSegment winner = RoadNetwork.segmentCoveringColumn(grid, x, z);
-                if (!road.isSameRoadAs(winner)) return Integer.MIN_VALUE;
+                if (winner == null || winner.wayId() != road.wayId()) return Integer.MIN_VALUE;
                 var zone = road.crossSectionAt(grid, x, z);
                 if (zone != RoadSegment.CrossSection.PAVED && zone != RoadSegment.CrossSection.CENTERLINE) continue;
                 int y = earth.surfaceY(x, z);
