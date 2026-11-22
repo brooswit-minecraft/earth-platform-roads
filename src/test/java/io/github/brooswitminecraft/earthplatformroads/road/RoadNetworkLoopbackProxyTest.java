@@ -345,4 +345,50 @@ class RoadNetworkLoopbackProxyTest {
             RoadNetwork.setDefaultTileSourceInputsForTests(null, null);
         }
     }
+
+    /**
+     * MINECRAFT-567 (DNS-rebinding follow-up, GitHub comment 7085974767): validating a hostname's
+     * current DNS answer is not enough if the original hostname URI is what actually gets handed to
+     * {@code HttpClient} -- it would resolve the hostname AGAIN at connection time, and a hostname
+     * that only resolved to loopback during validation (rebinding, or a resolver/hosts change in
+     * between) could then connect off-box. This proves {@code RoadNetwork.pinnedLoopbackHttpEndpoint}
+     * rewrites the URI to the validated literal loopback address itself, preserving scheme/port/path,
+     * so there is no hostname left for a second resolution to redirect.
+     */
+    @Test
+    void pinnedLoopbackEndpointRewritesHostnameToLiteralLoopbackAddress() {
+        URI pinned = RoadNetwork.pinnedLoopbackHttpEndpoint("http://localhost:54321/overpass?x=1");
+        assertTrue(pinned != null, "Expected localhost to resolve to a usable loopback endpoint");
+        assertTrue(pinned.getHost().equals("127.0.0.1") || pinned.getHost().equals("[::1]"),
+                "Expected the pinned URI's host to be a literal loopback address, not the original hostname 'localhost'; got " + pinned.getHost());
+        assertEquals(54321, pinned.getPort());
+        assertEquals("/overpass", pinned.getPath());
+        assertEquals("x=1", pinned.getQuery());
+        assertEquals("http", pinned.getScheme());
+    }
+
+    /**
+     * End-to-end companion to the unit test above: the configured endpoint uses the hostname
+     * {@code localhost} (not a literal IP), and the real production wiring still reaches the fake
+     * proxy exactly once -- proving the rewrite doesn't just pass validation, it still produces a
+     * working client.
+     */
+    @Test
+    void hostnameLoopbackEndpointStillReachesFakeProxyThroughThePinnedLiteralAddress(@TempDir Path cacheRoot) throws IOException {
+        FakeWarmProxyFixture fixture = new FakeWarmProxyFixture();
+        server = fixture.start();
+        System.setProperty("earthplatformroads.loopbackProxyEnabled", "true");
+        System.setProperty("earthplatformroads.loopbackProxyEndpoint", "http://localhost:" + server.getAddress().getPort() + "/");
+        try {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, cacheRoot);
+            var tileSource = RoadNetwork.liveTileSourceForPrefetch();
+            assertTrue(tileSource != null, "Expected a live tile source once the loopback switch is on with a hostname endpoint");
+
+            var ways = tileSource.waysForCell(41.0005, -96.0005);
+            assertFalse(ways.isEmpty(), "Expected the production wiring to still resolve via the fake proxy through the pinned literal address");
+            assertEquals(1, fixture.localProxyHits.get(), "Expected the real production wiring to reach the configured fake proxy exactly once");
+        } finally {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, null);
+        }
+    }
 }

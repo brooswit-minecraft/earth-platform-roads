@@ -200,34 +200,45 @@ public final class RoadNetwork {
      * {@code EarthGenerator} (which does not expose one), not attempted here.
      */
     /**
-     * MINECRAFT-567 (butchr review 55604): the loopback-proxy slice's whole safety story depends on
-     * this switch only ever sending requests to the local machine. {@code URI.create} alone accepts
-     * any well-formed URI, including a real remote host, so this validates scheme (HTTP(S) only, no
-     * credentials leak via other schemes) and resolves the host to confirm it is actually a loopback
-     * address (covers both a literal {@code 127.0.0.1}/{@code [::1]} and a hostname like
-     * {@code localhost} that resolves to one) before the configured endpoint is ever handed to
-     * {@link RoadTileSource}. Any failure here (bad syntax, non-HTTP(S) scheme, missing host, DNS
-     * failure, or a host that resolves off-box) is treated as "not a usable loopback endpoint" --
-     * the caller then falls through to the same network-disabled {@code about:blank} source as an
-     * unconfigured switch, never to the real direct-provider endpoint.
+     * MINECRAFT-567 (butchr reviews 55604, and the follow-up DNS-rebinding finding on GitHub comment
+     * 7085974767): the loopback-proxy slice's whole safety story depends on this switch only ever
+     * sending requests to the local machine. {@code URI.create} alone accepts any well-formed URI,
+     * including a real remote host, so this validates scheme (HTTP(S) only, no credentials leak via
+     * other schemes) and resolves the configured host to confirm it is actually a loopback address.
+     *
+     * <p>Resolving the hostname here is not enough by itself: if the returned URI still carried the
+     * original hostname, {@code HttpClient} would resolve it AGAIN at connection time, and a hostname
+     * that happened to answer loopback during this check (DNS rebinding, or a resolver/hosts change
+     * in between) could then connect off-box after validation -- a classic check-then-use gap. So
+     * this returns a rewritten URI whose host is the validated literal loopback address itself
+     * (scheme/port/path/query preserved); {@code HttpClient} connects to that literal address
+     * directly, with no second hostname resolution able to redirect it anywhere else.
+     *
+     * <p>Returns {@code null} for anything not usable as a loopback endpoint (bad syntax, non-HTTP(S)
+     * scheme, missing host, DNS failure, or a host that resolves off-box) -- the caller then falls
+     * through to the same network-disabled {@code about:blank} source as an unconfigured switch,
+     * never to the real direct-provider endpoint.
      */
-    private static boolean isLoopbackHttpEndpoint(String endpointProperty) {
+    static URI pinnedLoopbackHttpEndpoint(String endpointProperty) {
         try {
             URI uri = URI.create(endpointProperty);
             String scheme = uri.getScheme();
             if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
-                return false;
+                return null;
             }
             String host = uri.getHost();
-            if (host == null || host.isEmpty()) return false;
+            if (host == null || host.isEmpty()) return null;
             InetAddress[] resolved = InetAddress.getAllByName(host);
-            if (resolved.length == 0) return false;
+            if (resolved.length == 0) return null;
             for (InetAddress address : resolved) {
-                if (!address.isLoopbackAddress()) return false;
+                if (!address.isLoopbackAddress()) return null;
             }
-            return true;
-        } catch (IllegalArgumentException | UnknownHostException e) {
-            return false;
+            String literalHost = resolved[0].getHostAddress();
+            if (resolved[0] instanceof java.net.Inet6Address) literalHost = "[" + literalHost + "]";
+            return new URI(uri.getScheme(), uri.getUserInfo(), literalHost, uri.getPort(), uri.getPath(),
+                    uri.getQuery(), uri.getFragment());
+        } catch (IllegalArgumentException | UnknownHostException | java.net.URISyntaxException e) {
+            return null;
         }
     }
 
@@ -251,13 +262,15 @@ public final class RoadNetwork {
             boolean loopbackProxyEnabled = Boolean.getBoolean("earthplatformroads.loopbackProxyEnabled");
             if (loopbackProxyEnabled) {
                 String loopbackEndpointProperty = System.getProperty("earthplatformroads.loopbackProxyEndpoint");
-                if (loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()
-                        || !isLoopbackHttpEndpoint(loopbackEndpointProperty)) {
+                URI pinnedLoopbackEndpoint = loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()
+                        ? null : pinnedLoopbackHttpEndpoint(loopbackEndpointProperty);
+                if (pinnedLoopbackEndpoint == null) {
                     // Enabled but not configured, or configured with a non-HTTP(S)/non-loopback
                     // target: a network-disabled source, exactly like the ordinary "opted in but
                     // under-provisioned" case below -- never a silent fallback to the real
                     // Overpass.ch direct endpoint, and never a send to a destination outside this
-                    // slice's loopback-only safety boundary (butchr review 55604).
+                    // slice's loopback-only safety boundary (butchr reviews 55604 and the
+                    // DNS-rebinding follow-up on GitHub comment 7085974767).
                     return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
                 }
                 long loopbackMinIntervalMs = Long.getLong("earthplatformroads.loopbackProxyMinRequestIntervalMs", 0L);
@@ -271,7 +284,10 @@ public final class RoadNetwork {
                 // attaches a key when the configured endpoint exactly equals the Overpass.ch
                 // CREDENTIAL_BOUND_ENDPOINT, which a loopback URL never does -- but passing null here
                 // too means the key is never even held by a loopback-mode RoadTileSource instance.
-                return new RoadTileSource(URI.create(loopbackEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
+                // pinnedLoopbackEndpoint's host is the validated literal loopback address itself
+                // (never the original hostname), so HttpClient has no hostname left to resolve a
+                // second time -- it connects to that literal address directly.
+                return new RoadTileSource(pinnedLoopbackEndpoint, cacheRoot, true, TILE_FETCH_TIMEOUT,
                         null, Duration.ofMillis(loopbackMinIntervalMs),
                         telemetryReportingEnabledForLoopback, Duration.ofSeconds(telemetryReportIntervalSecondsForLoopback));
             }
