@@ -98,6 +98,18 @@ dependencies {
     }
     implementation files(earthPlatformJar)
 
+    // Layered Slopes is a required runtime dependency (declared in neoforge.mods.toml), providing
+    // the LayeredBlock family used for sub-block road-surface height. Not published to any Maven
+    // repository either, but it does publish a built jar as a GitHub release asset, so
+    // scripts/fetch_layered_slopes_dependency.sh pins a checksum-verified download instead of a
+    // from-source build (see docs/earth-platform-dependency.md's equivalent note on Earth Platform).
+    def layeredSlopesJar = layout.projectDirectory.file('libs/layeredslopes-0.2.0.jar')
+    if (!layeredSlopesJar.asFile.isFile()) {
+        throw new GradleException(
+                "Missing ${layeredSlopesJar.asFile}: run scripts/fetch_layered_slopes_dependency.sh first.")
+    }
+    implementation files(layeredSlopesJar)
+
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"

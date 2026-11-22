@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "region_id": "yosemite_valley",
+  "source": "OpenStreetMap",
+  "license": "ODbL 1.0 (https://www.openstreetmap.org/copyright)",
+  "attribution": "© OpenStreetMap contributors",
+  "bbox": {"min_lat": 37.70, "max_lat": 37.76, "min_lon": -119.65, "max_lon": -119.55},
+  "ways": [
+    {
+      "way_id": 10432929,
+      "way_tags": {
+        "highway": "secondary",
+        "lanes": "2",
+        "maxspeed": "35 mph",
+        "name": "Southside Drive",
+        "oneway": "yes",
+        "source:maxspeed": "survey",
+        "surface": "asphalt"
+      },
+      "bridge": false,
+      "tunnel": false,
+      "layer": 0,
+      "query": {
+        "api": "https://overpass-api.de/api/interpreter",
+        "ql": "[out:json][timeout:60];\nway[\"name\"~\"Southside Drive\",i](37.70,-119.65,37.76,-119.55);\nout geom;",
+        "retrieved_at": "2026-11-19T17:40:26Z"
+      },
+      "node_ids": [
+        2922658960,
+        2922658959,
+        89280251,
+        89280253,
+        89280254,
+        89280256,
+        2922658958,
+        89280258,
+        89280259
+      ],
+      "segment_index_range": [60, 68],
+      "length_metres_approx": 189.7,
+      "centerline": [
+        {"lat": 37.7208051, "lon": -119.6379748},
+        {"lat": 37.7207893, "lon": -119.637778},
+        {"lat": 37.7207776, "lon": -119.6376106},
+        {"lat": 37.7207331, "lon": -119.6373175},
+        {"lat": 37.7206749, "lon": -119.6369935},
+        {"lat": 37.7206145, "lon": -119.6367003},
+        {"lat": 37.7205732, "lon": -119.6365517},
+        {"lat": 37.7204335, "lon": -119.6361675},
+        {"lat": 37.7203371, "lon": -119.6359185}
+      ]
+    }
+  ]
+}
