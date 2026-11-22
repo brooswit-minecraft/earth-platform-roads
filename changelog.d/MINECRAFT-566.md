@@ -597,6 +597,32 @@ bump: minor
   `@Inject` through to both `@WrapOperation`s in one real invocation, is NOT independently verified
   here. John's own native infrastructure is what will confirm that.
 
+### Fixed (comment 55571, two real races in the lease mechanism itself, found by exact source review of d876282)
+- **Bug 1, a TOCTOU gap between check and publish:** the first version's
+  `publishIfLeaseStillMatches` checked the lease, RELEASED its own lock, and returned a plain
+  `boolean` -- the Mixin then called the real `putIfAbsent` AFTER that lock was already released,
+  leaving a window for a concurrent eviction to rotate the lease between the check succeeding and
+  the actual publish running. Fixed: `publishOnlyIfLeaseStillMatches` now takes the real publish
+  action and a rejected fallback as callbacks and runs the check PLUS whichever applies as ONE
+  indivisible critical section under the same lock `evictStaleSurfaceDecision` already uses -- no
+  window left for anything to interleave.
+- **Bug 2, the same gap between the real clear and the epoch bump:** the first version called the
+  real `columns.clear()` outside any lock, then bumped the epoch as a separate, also-unlocked step
+  -- a concurrent publish could see the still-old epoch and publish into the just-cleared map,
+  surviving the clear. Fixed: `bumpEpochAroundFullClear` now takes the real clear as a callback and
+  runs clear-then-bump atomically under the same lock.
+- Also bounded `perColumnRotations`'s previously-unbounded growth (John's own explicit ask), per
+  the lower-risk option he offered: cleared in the same critical section the epoch bump runs in --
+  safe with no ABA risk, since the epoch component alone already invalidates every lease captured
+  under the old epoch regardless of its own rotation value.
+- New adversarial test (John's own explicit ask -- "add an adversarial latch BETWEEN current check
+  and actual insertion"), `aConcurrentEvictionCanNeverInterleaveBetweenTheLeaseCheckAndTheActualPublish`:
+  real threads and real `CountDownLatch`es force the exact interleaving the first version was
+  vulnerable to, asserting the concurrent eviction provably blocks while a publish's own critical
+  section is still running. The three existing lease tests were updated for the new callback-based
+  API (a small `publishMatched` test helper keeps their boolean-style assertions). 104/104 tests
+  pass.
+
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
   theoretical (comments 55547/55549):** John's own native control for this exact case -- a same-cube

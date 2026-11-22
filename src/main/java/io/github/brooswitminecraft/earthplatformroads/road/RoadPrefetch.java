@@ -390,33 +390,71 @@ public final class RoadPrefetch {
     }
 
     /**
-     * MINECRAFT-566 comment 55568: whether {@code capturedLease} is STILL the current lease for
-     * this exact column -- {@code false} means an eviction (targeted, or a bulk {@code
-     * columns.clear()}) ran at some point between the capture and this check, so publishing the
-     * invocation that captured it would be publishing a now-possibly-stale result. Called from
-     * {@code SurfaceGeneratorColumnLeaseMixin}'s own {@code @WrapOperation} on {@code
-     * ConcurrentHashMap.putIfAbsent}, immediately before deciding whether to let that real call
-     * through at all.
+     * MINECRAFT-566 comment 55571, a real TOCTOU bug John's own exact source review of commit
+     * d876282 found in the FIRST version of this method: it checked the lease and RELEASED
+     * {@code state.lock} before returning a plain {@code boolean}, and the Mixin's own
+     * {@code @WrapOperation} then called the real {@code putIfAbsent} AFTER that lock had already
+     * been released -- a window in which a concurrent eviction could rotate/remove the column
+     * between the check succeeding and the actual publish running, letting a now-stale result
+     * publish anyway. This is EXACTLY the race this whole mechanism exists to close, just moved one
+     * level deeper rather than eliminated. "Move lease validation AND actual putIfAbsent inside one
+     * {@code state.lock} critical section" (his own words): fixed by taking the real publish action
+     * (and a fallback for when it's rejected) as callbacks, and running the check PLUS whichever
+     * callback applies -- never both, always exactly one -- all under the SAME single lock
+     * acquisition, so there is no window between "lease matches" and "publish happens" for
+     * anything else touching this generator's lease state to slip into at all; a concurrent
+     * {@link #evictStaleSurfaceDecision} (which also takes {@code state.lock}) must now either
+     * complete entirely before this check runs, or wait until this whole check-and-publish finishes
+     * -- never interleave with it. Proven by a real, multi-threaded adversarial test
+     * ({@code aConcurrentEvictionCanNeverInterleaveBetweenTheLeaseCheckAndTheActualPublish}) using
+     * real latches to force exactly the interleaving the first version was vulnerable to.
+     *
+     * <p>Called from {@code SurfaceGeneratorColumnLeaseMixin}'s own {@code @WrapOperation} on
+     * {@code ConcurrentHashMap.putIfAbsent}: {@code onMatch} is {@code () -> operation.call(columns,
+     * key, made)} (the real publish); {@code onStale} is {@code () -> columns.get(key)} (mimicking
+     * {@code putIfAbsent}'s own "already present" return contract on a rejected publish, rather
+     * than fabricating a different answer).
      */
-    public static boolean publishIfLeaseStillMatches(EarthGenerator generator, long columnKey, ColumnLease capturedLease) {
+    public static Object publishOnlyIfLeaseStillMatches(
+            EarthGenerator generator, long columnKey, ColumnLease capturedLease,
+            java.util.function.Supplier<Object> onMatch, java.util.function.Supplier<Object> onStale) {
         GeneratorLeaseState state = leaseState(generator);
         synchronized (state.lock) {
-            return new ColumnLease(state.epoch, state.perColumnRotations.getOrDefault(columnKey, 0L)).equals(capturedLease);
+            ColumnLease current = new ColumnLease(state.epoch, state.perColumnRotations.getOrDefault(columnKey, 0L));
+            return current.equals(capturedLease) ? onMatch.get() : onStale.get();
         }
     }
 
     /**
-     * MINECRAFT-566 comment 55568, "coordinate the existing {@code columns.clear}": called from
-     * {@code SurfaceGeneratorColumnLeaseMixin}'s own {@code @WrapOperation} wrapping the real bulk
-     * {@code columns.clear()} call inside {@code column()} itself (confirmed real: it fires once
-     * {@code columns.size() > 8192}) -- bumps the WHOLE generator's own epoch, invalidating every
-     * column's own previously-captured lease at once, matching the real clear's own "every column"
-     * scope exactly.
+     * MINECRAFT-566 comment 55571, a second real bug John's own review found alongside the TOCTOU
+     * one above: the first version called the real {@code columns.clear()} OUTSIDE any lock, THEN
+     * bumped the epoch separately (also outside the lock relative to the clear itself) -- a window
+     * in which a concurrent publish could see the OLD, not-yet-bumped epoch still match its own
+     * captured lease and successfully publish into the just-cleared map, surviving the clear
+     * entirely. "Clear AND epoch bump must also share that lock with publish/invalidation" (his own
+     * words): fixed by taking the real {@code clear()} call as a callback and running it, THEN the
+     * epoch bump, all under the exact SAME {@code state.lock} {@link #publishOnlyIfLeaseStillMatches}
+     * and {@link #evictStaleSurfaceDecision} already use -- a concurrent publish attempt now either
+     * completes entirely before this runs, or blocks until this whole clear-and-bump finishes and
+     * then correctly sees the new epoch.
+     *
+     * <p>Also answers comment 55571's "bound {@code perColumnRotations} as traveled X/Z grows"
+     * concern, via the lower-risk option he himself offered ("clear it when globally bumping"):
+     * every per-column rotation counter is dropped in the SAME critical section the epoch bump
+     * runs in. This is safe with no ABA risk, because the epoch component ALONE already
+     * invalidates every lease captured under the old epoch regardless of its own rotation value --
+     * once the epoch has moved past a captured lease, that lease's own rotation count becomes
+     * irrelevant to any future comparison, so resetting the whole rotation map to empty (every key
+     * implicitly back to 0) changes no comparison's outcome. This bounds the map's own growth to
+     * "at most as many columns as were touched since the last real bulk clear" rather than growing
+     * forever across an entire play session.
      */
-    public static void bumpGeneratorEpochForFullClear(EarthGenerator generator) {
+    public static void bumpEpochAroundFullClear(EarthGenerator generator, Runnable realClear) {
         GeneratorLeaseState state = leaseState(generator);
         synchronized (state.lock) {
+            realClear.run();
             state.epoch++;
+            state.perColumnRotations.clear();
         }
     }
 

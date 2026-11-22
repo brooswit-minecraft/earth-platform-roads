@@ -1609,6 +1609,49 @@ environment in this harness) -- whether this Mixin actually weaves and fires as 
 whether `@Share` correctly threads the captured lease across both `@WrapOperation`s in one real
 invocation, is not independently verified here.
 
+## MINECRAFT-566: two real bugs in the lease mechanism itself, found by John's exact source review of d876282 (comment 55571)
+
+John called the live ordinary-movement slowdown urgent/unplayable while doing an exact source
+review of the lease commit above, and found two real races IN THE LEASE MECHANISM ITSELF -- not
+new bugs in `column()`, but bugs in how this mod's own fix coordinated its own locking.
+
+**Bug 1 -- a TOCTOU gap between check and publish.** The first version's
+`publishIfLeaseStillMatches` acquired `state.lock`, checked whether the captured lease still
+matched, and RELEASED the lock before returning a plain `boolean` -- the Mixin's own
+`@WrapOperation` then called the real `putIfAbsent` AFTER that lock was already released. This left
+a window in which a concurrent eviction could rotate or remove the column between the check
+succeeding and the actual publish running, letting a now-stale result through anyway -- exactly
+the race this whole mechanism exists to close, just moved one level deeper rather than eliminated.
+
+**Bug 2 -- the same gap between the real clear and the epoch bump.** The first version's
+`clear()`-wrapping injector called the real `columns.clear()` outside any lock, then bumped the
+epoch as a second, separately-unlocked step. A concurrent publish could see the still-old epoch
+and successfully publish into the just-cleared map, surviving the clear entirely.
+
+**The fix:** `publishOnlyIfLeaseStillMatches` and `bumpEpochAroundFullClear` now each take the real
+action (and, for publish, a rejected fallback) as callbacks, and run the ENTIRE check-plus-action
+as one indivisible critical section under `state.lock` -- never "check, release, then act"
+separately. A concurrent `evictStaleSurfaceDecision` (which uses the exact same lock) must now
+either complete entirely before a publish's check runs, or block until that whole check-and-publish
+finishes -- there is no window left for anything to interleave into.
+
+**Also fixed, per John's own explicit ask:** `perColumnRotations` previously grew forever as a
+player travels across more X/Z -- unbounded. Fixed by clearing it in the same critical section the
+epoch bump runs in (the lower-risk option John himself offered: "clear it when globally bumping").
+Safe with no ABA risk: the epoch component alone already invalidates every lease captured under the
+old epoch regardless of its own rotation value, so resetting the rotation map changes no future
+comparison's outcome.
+
+**Proven by a real, multi-threaded adversarial test** per his own explicit ask ("add an adversarial
+latch BETWEEN current check and actual insertion"): a publisher's own callback deliberately pauses
+mid-flight, inside the critical section, while a second thread attempts a concurrent eviction for
+the same column. The test asserts the eviction provably BLOCKS (does not complete) while the
+publisher still holds the lock, and only proceeds once the publisher releases it -- directly
+reproducing the shape of the exact gap the first version had, and proving the fixed version closes
+it structurally rather than merely narrowing it. 104/104 tests pass (the suite's new total: three
+previously existing lease tests were updated for the new callback-based API, one entirely new
+adversarial test added).
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

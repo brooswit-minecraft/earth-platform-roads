@@ -1475,20 +1475,34 @@ class RoadTilePrefetchMixinTest {
         long columnKey = RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ);
 
         var capturedBeforeEviction = RoadPrefetch.captureColumnLease(generator, columnKey);
-        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedBeforeEviction),
+        assertTrue(publishMatched(generator, columnKey, capturedBeforeEviction),
                 "Expected a lease checked with nothing resolved in between to still match -- 'publication before invalidation is removed,' the ordinary non-racing case");
 
         RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
 
-        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedBeforeEviction),
+        assertTrue(!publishMatched(generator, columnKey, capturedBeforeEviction),
                 "Expected the SAME, now-stale captured lease to be rejected once an eviction has rotated it -- 'publication after invalidation is rejected,' the real property this mechanism adds");
 
         // A FRESH capture, taken AFTER the eviction, must be the new current lease -- proving the
         // rotation is real (not merely "never matches anything again") and the next genuine
         // invocation can still publish normally.
         var capturedAfterEviction = RoadPrefetch.captureColumnLease(generator, columnKey);
-        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnKey, capturedAfterEviction),
+        assertTrue(publishMatched(generator, columnKey, capturedAfterEviction),
                 "Expected a freshly-captured lease, taken after the eviction, to be the new current lease");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55571: {@code publishOnlyIfLeaseStillMatches} now takes the real
+     * publish action and a rejected fallback as callbacks, running the check PLUS whichever
+     * callback applies atomically under one lock -- see its own doc for the real TOCTOU bug this
+     * fixes. This tiny helper lets the simpler before/after assertion style the rest of this test
+     * class already uses keep working, by using boolean-sentinel callbacks instead of real
+     * putIfAbsent/get calls (this test suite is driving the real {@link RoadPrefetch} API directly,
+     * never the Mixin itself -- there's no real {@code ConcurrentHashMap} publish to perform here).
+     */
+    private static boolean publishMatched(EarthGenerator generator, long columnKey, RoadPrefetch.ColumnLease capturedLease) {
+        return (Boolean) RoadPrefetch.publishOnlyIfLeaseStillMatches(generator, columnKey, capturedLease,
+                () -> Boolean.TRUE, () -> Boolean.FALSE);
     }
 
     /**
@@ -1508,9 +1522,9 @@ class RoadTilePrefetchMixinTest {
 
         RoadPrefetch.evictStaleSurfaceDecision(generator, 72, -234); // evicts column A only
 
-        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnAKey, leaseA),
+        assertTrue(!publishMatched(generator, columnAKey, leaseA),
                 "Expected column A's own lease to be rejected after its own eviction");
-        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generator, columnBKey, leaseB),
+        assertTrue(publishMatched(generator, columnBKey, leaseB),
                 "Expected column B's own lease to be UNAFFECTED by column A's own eviction");
     }
 
@@ -1530,9 +1544,9 @@ class RoadTilePrefetchMixinTest {
 
         RoadPrefetch.evictStaleSurfaceDecision(generatorA, columnX, columnZ); // evicts generator A's own column only
 
-        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generatorA, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseA),
+        assertTrue(!publishMatched(generatorA, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseA),
                 "Expected generator A's own lease to be rejected after its own eviction");
-        assertTrue(RoadPrefetch.publishIfLeaseStillMatches(generatorB, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseB),
+        assertTrue(publishMatched(generatorB, RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ), leaseB),
                 "Expected generator B's own lease, at the IDENTICAL column coordinates, to be entirely unaffected by generator A's own eviction");
     }
 
@@ -1555,11 +1569,87 @@ class RoadTilePrefetchMixinTest {
         var leaseA = RoadPrefetch.captureColumnLease(generator, columnAKey);
         var leaseB = RoadPrefetch.captureColumnLease(generator, columnBKey);
 
-        RoadPrefetch.bumpGeneratorEpochForFullClear(generator);
+        RoadPrefetch.bumpEpochAroundFullClear(generator, () -> {});
 
-        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnAKey, leaseA),
+        assertTrue(!publishMatched(generator, columnAKey, leaseA),
                 "Expected column A's own previously-captured lease to be rejected after a bulk clear-equivalent epoch bump");
-        assertTrue(!RoadPrefetch.publishIfLeaseStillMatches(generator, columnBKey, leaseB),
+        assertTrue(!publishMatched(generator, columnBKey, leaseB),
                 "Expected column B's own previously-captured lease to ALSO be rejected -- a bulk clear invalidates every column at once, not just one");
+    }
+
+    /**
+     * MINECRAFT-566 comment 55571, John's own explicit ask: "add an adversarial latch BETWEEN
+     * current check and actual insertion; existing test paused before check can pass this still-
+     * racy code." Uses real threads and real {@code CountDownLatch}es to force exactly the
+     * interleaving the FIRST version of this mechanism (commit d876282) was vulnerable to: a
+     * publisher's own "real putIfAbsent" callback deliberately pauses mid-flight, inside
+     * {@code publishOnlyIfLeaseStillMatches}'s own critical section, while a concurrent eviction
+     * for the SAME column is attempted from a second thread. With the fix (check-and-publish now a
+     * single, indivisible critical section under one lock), the eviction MUST block until the
+     * publisher's own callback finishes and the lock is released -- it can never slip in between
+     * the lease check and the actual publish the way the first, TOCTOU-vulnerable version allowed.
+     * Proves both the blocking itself (the eviction provably has not completed while the publisher
+     * still holds the lock) and the resulting state (the publish that was already in flight when
+     * captured succeeds; a LATER attempt using the SAME now-stale captured lease is correctly
+     * rejected once the eviction that was waiting finally runs).
+     */
+    @Test
+    void aConcurrentEvictionCanNeverInterleaveBetweenTheLeaseCheckAndTheActualPublish(@TempDir Path demCache) throws Exception {
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        int columnX = 80, columnZ = -242; // arbitrary, never touched by anything else in this test
+        long columnKey = RoadPrefetch.surfaceGeneratorColumnKey(columnX, columnZ);
+
+        var captured = RoadPrefetch.captureColumnLease(generator, columnKey);
+
+        java.util.concurrent.CountDownLatch publisherEnteredCriticalSection = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch letPublisherFinish = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean published = new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicBoolean rejectedInsteadOfPublished = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        Thread publisher = new Thread(() -> RoadPrefetch.publishOnlyIfLeaseStillMatches(generator, columnKey, captured,
+                () -> { // stands in for the real putIfAbsent call -- deliberately slow, while HOLDING the lock
+                    publisherEnteredCriticalSection.countDown();
+                    try {
+                        assertTrue(letPublisherFinish.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                                "Test setup error: never told to finish");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    published.set(true);
+                    return null;
+                },
+                () -> {
+                    rejectedInsteadOfPublished.set(true);
+                    return null;
+                }));
+        publisher.start();
+        assertTrue(publisherEnteredCriticalSection.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                "Expected the publisher to have entered its own critical section");
+
+        java.util.concurrent.CountDownLatch evictionCompleted = new java.util.concurrent.CountDownLatch(1);
+        Thread evictor = new Thread(() -> {
+            RoadPrefetch.evictStaleSurfaceDecision(generator, columnX, columnZ);
+            evictionCompleted.countDown();
+        });
+        evictor.start();
+
+        assertTrue(!evictionCompleted.await(300, java.util.concurrent.TimeUnit.MILLISECONDS),
+                "Expected the concurrent eviction to BLOCK while the publisher's own critical section is still running -- "
+                        + "the first, TOCTOU-vulnerable version let these interleave instead of mutually excluding each other");
+
+        letPublisherFinish.countDown();
+        publisher.join(2000);
+        evictor.join(2000);
+
+        assertTrue(published.get(), "Expected the in-flight publish (captured before any eviction) to have actually succeeded");
+        assertTrue(!rejectedInsteadOfPublished.get(), "Expected the in-flight publish to never have been rejected -- nothing had rotated its lease yet when it entered its own critical section");
+        assertTrue(evictionCompleted.await(0, java.util.concurrent.TimeUnit.MILLISECONDS),
+                "Expected the eviction to have completed once the publisher released the lock");
+
+        // The SAME, now-stale captured lease, checked again after the eviction that was forced to
+        // wait has finally run, must now be rejected -- proving the eviction's own rotation was
+        // real and took effect, not merely that it eventually returned.
+        assertTrue(!publishMatched(generator, columnKey, captured),
+                "Expected the same captured lease to be rejected once the previously-blocked eviction has actually run");
     }
 }

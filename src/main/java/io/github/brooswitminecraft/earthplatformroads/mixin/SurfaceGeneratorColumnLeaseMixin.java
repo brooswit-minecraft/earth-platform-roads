@@ -57,23 +57,44 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  *       value, never a global/static field -- comment 55556's own "global hold flag leaks" finding
  *       on a different mixin in this same ticket, not repeated here).</li>
  *   <li>{@link #earthplatformroads$bumpEpochAroundFullClear}, a {@code @WrapOperation} on the real
- *       {@code columns.clear()} call: calls the real clear through unconditionally, THEN bumps this
- *       whole generator's own epoch ({@link RoadPrefetch#bumpGeneratorEpochForFullClear}) --
- *       invalidating every column's own previously-captured lease at once, matching the real
- *       clear's own "every column" scope exactly.</li>
+ *       {@code columns.clear()} call: runs the real clear AND the epoch bump that invalidates every
+ *       column's own previously-captured lease, together, atomically, under ONE lock
+ *       ({@link RoadPrefetch#bumpEpochAroundFullClear}) -- see comment 55571, below, for why the
+ *       first version's "clear, then separately bump" was itself a real race.</li>
  *   <li>{@link #earthplatformroads$publishOnlyIfLeaseStillMatches}, a {@code @WrapOperation} on the
- *       real {@code columns.putIfAbsent(key, made)} call: re-checks, immediately before publishing,
- *       whether the lease captured at entry is STILL the current one
- *       ({@link RoadPrefetch#publishIfLeaseStillMatches}). If it still matches, the real publish
- *       runs exactly as before. If it does NOT (an eviction -- targeted, or a bulk clear -- ran
- *       between this invocation's own entry and this exact moment), the real publish is SKIPPED
- *       entirely -- "publication after invalidation is rejected" -- returning whatever is already
- *       in the map for this key (or {@code null} if absent), mimicking {@code putIfAbsent}'s own
- *       real "already present, nothing changed" contract rather than fabricating a different
- *       answer. "Publication before invalidation is removed" needs no new mechanism here: a publish
- *       that lands BEFORE an eviction is simply cleaned up by that eviction's own
- *       {@code columns.remove(key)}, exactly as it always has been.</li>
+ *       real {@code columns.putIfAbsent(key, made)} call: checks whether the lease captured at
+ *       entry is STILL the current one, AND conditionally runs the real publish (or a rejected
+ *       fallback), together, atomically, under the SAME ONE lock
+ *       ({@link RoadPrefetch#publishOnlyIfLeaseStillMatches}). If it still matches, the real
+ *       publish runs. If it does NOT (an eviction -- targeted, or a bulk clear -- ran between this
+ *       invocation's own entry and this exact moment), the real publish is SKIPPED entirely --
+ *       "publication after invalidation is rejected" -- returning whatever is already in the map
+ *       for this key (or {@code null} if absent), mimicking {@code putIfAbsent}'s own real "already
+ *       present, nothing changed" contract rather than fabricating a different answer. "Publication
+ *       before invalidation is removed" needs no new mechanism here: a publish that lands BEFORE an
+ *       eviction is simply cleaned up by that eviction's own {@code columns.remove(key)}, exactly
+ *       as it always has been.</li>
  * </ul>
+ *
+ * <h2>MINECRAFT-566 comment 55571: two real bugs John's own exact source review found in the FIRST
+ * version of this mechanism (commit d876282), both now fixed</h2>
+ * The first version checked the lease and RELEASED its own lock before returning a plain
+ * {@code boolean}, with the real publish happening AFTER that lock was already released -- a
+ * window in which a concurrent eviction could rotate the lease between the check succeeding and
+ * the actual publish running, letting a stale result through anyway. Separately, the first
+ * version's {@code clear()}-wrapping injector called the real clear OUTSIDE any lock, then bumped
+ * the epoch as a SECOND, separately-unlocked step -- a window in which a concurrent publish could
+ * see the still-old epoch and successfully publish into the just-cleared map. Both are now fixed
+ * by making "check, then publish-or-reject" and "clear, then bump" each a single, indivisible
+ * critical section under the SAME lock {@link RoadPrefetch#evictStaleSurfaceDecision} already
+ * uses -- see {@link RoadPrefetch#publishOnlyIfLeaseStillMatches}/
+ * {@link RoadPrefetch#bumpEpochAroundFullClear}'s own doc for the full reasoning, and
+ * {@code RoadTilePrefetchMixinTest}'s own
+ * {@code aConcurrentEvictionCanNeverInterleaveBetweenTheLeaseCheckAndTheActualPublish} for a real,
+ * multi-threaded adversarial test proving the fixed version cannot be interleaved the way the first
+ * version could. The lock is still never held around {@code column()}'s own terrain sampling, any
+ * HTTP, or any wait -- the real {@code clear()}/{@code putIfAbsent} calls it now wraps are
+ * themselves cheap, bounded {@code ConcurrentHashMap} operations.
  *
  * <p>The actual lease bookkeeping (capture, rotation, the per-generator epoch, and the SHORT shared
  * lock guarding only that bookkeeping -- NEVER held around this method's own terrain sampling, any
@@ -111,10 +132,15 @@ public abstract class SurfaceGeneratorColumnLeaseMixin {
     @WrapOperation(method = "column(II)Lio/earthplatform/minecraft/cubic/gen/SurfaceGenerator$Column;",
             at = @At(value = "INVOKE", target = "Ljava/util/concurrent/ConcurrentHashMap;clear()V"))
     private void earthplatformroads$bumpEpochAroundFullClear(ConcurrentHashMap<Long, Object> columns, Operation<Void> operation) {
-        operation.call(columns);
+        // MINECRAFT-566 comment 55571: the real clear() and the epoch bump that invalidates every
+        // outstanding lease must run under ONE lock, atomically -- see
+        // RoadPrefetch.bumpEpochAroundFullClear's own doc for the real race this closes (the first
+        // version ran them as two separate, unlocked steps).
         Object self = this;
         if (self instanceof EarthGenerator generator) {
-            RoadPrefetch.bumpGeneratorEpochForFullClear(generator);
+            RoadPrefetch.bumpEpochAroundFullClear(generator, () -> operation.call(columns));
+        } else {
+            operation.call(columns); // defensive fallback only; never expected in this mod's own usage
         }
     }
 
@@ -127,9 +153,12 @@ public abstract class SurfaceGeneratorColumnLeaseMixin {
         if (!(self instanceof EarthGenerator generator) || lease.get() == null) {
             return operation.call(columns, key, made); // defensive fallback only; never expected in this mod's own usage
         }
-        if (RoadPrefetch.publishIfLeaseStillMatches(generator, (Long) key, lease.get())) {
-            return operation.call(columns, key, made);
-        }
-        return columns.get(key); // publish rejected -- mimic putIfAbsent's own "already present" return contract
+        // MINECRAFT-566 comment 55571: the lease check and the real publish must run under ONE
+        // lock, atomically -- see RoadPrefetch.publishOnlyIfLeaseStillMatches's own doc for the
+        // real TOCTOU race this closes (the first version checked, released the lock, THEN
+        // published -- leaving a window for a concurrent eviction to slip in between).
+        return RoadPrefetch.publishOnlyIfLeaseStillMatches(generator, (Long) key, lease.get(),
+                () -> operation.call(columns, key, made),
+                () -> columns.get(key)); // publish rejected -- mimic putIfAbsent's own "already present" return contract
     }
 }
