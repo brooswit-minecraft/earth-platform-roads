@@ -1,11 +1,13 @@
 name: Level Road QA
 
 on:
-  # MINECRAFT-567: widened (in this copy only) so this workflow also fires for the combined
-  # deck+loopback preview PR (stacked on minecraft-567-road-fetch-telemetry, not main) -- same
-  # rationale as roads-build.yml's own widened branch filter. No job logic changed.
+  # MINECRAFT-567 (John's CI-preflight comment): a pull_request `branches` filter matches the PR's
+  # BASE branch, not its head/source branch -- the same lesson PR #7/#8 already hit on
+  # roads-build.yml. This combined-preview PR's base is minecraft-567-road-fetch-telemetry (per
+  # `gh pr create --base`), NOT this branch's own name, so that is the entry that actually needs to
+  # be here (in this copy only) for the workflow to fire. No job logic changed.
   pull_request:
-    branches: [main, minecraft-567-combined-deck-loopback-preview]
+    branches: [main, minecraft-567-road-fetch-telemetry]
 
 permissions:
   contents: read
