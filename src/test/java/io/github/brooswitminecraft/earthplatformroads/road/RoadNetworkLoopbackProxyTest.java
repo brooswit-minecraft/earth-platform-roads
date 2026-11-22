@@ -302,4 +302,47 @@ class RoadNetworkLoopbackProxyTest {
             RoadNetwork.setDefaultTileSourceInputsForTests(null, null);
         }
     }
+
+    /**
+     * MINECRAFT-567 (butchr review 55604): the loopback switch's whole safety story depends on it
+     * only ever reaching the local machine. A non-loopback endpoint (a real host, even one that
+     * never actually answers in this offline test) must never be handed to the real HTTP client --
+     * it must be treated exactly like "enabled but not configured": a network-disabled source, with
+     * zero sends and no fallback to the real direct-provider endpoint.
+     */
+    @Test
+    void loopbackEndpointPointingOffBoxNeverSendsAnything(@TempDir Path cacheRoot) throws IOException {
+        System.setProperty("earthplatformroads.loopbackProxyEnabled", "true");
+        System.setProperty("earthplatformroads.loopbackProxyEndpoint", "https://example.invalid/overpass");
+        try {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, cacheRoot);
+            var tileSource = RoadNetwork.liveTileSourceForPrefetch();
+            assertTrue(tileSource != null, "Expected a non-null (but network-disabled) tile source for a rejected endpoint");
+
+            var ways = tileSource.waysForCell(41.0005, -96.0005);
+            assertTrue(ways.isEmpty(), "Expected no road data from a rejected non-loopback endpoint (no real send was ever made)");
+        } finally {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, null);
+        }
+    }
+
+    /**
+     * Same rejection, for a non-HTTP(S) scheme -- e.g. a {@code file:} URI, which would otherwise
+     * bypass the host-resolution check entirely since it has no network host to resolve.
+     */
+    @Test
+    void loopbackEndpointWithNonHttpSchemeNeverSendsAnything(@TempDir Path cacheRoot) throws IOException {
+        System.setProperty("earthplatformroads.loopbackProxyEnabled", "true");
+        System.setProperty("earthplatformroads.loopbackProxyEndpoint", "file:///etc/passwd");
+        try {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, cacheRoot);
+            var tileSource = RoadNetwork.liveTileSourceForPrefetch();
+            assertTrue(tileSource != null, "Expected a non-null (but network-disabled) tile source for a rejected endpoint");
+
+            var ways = tileSource.waysForCell(41.0005, -96.0005);
+            assertTrue(ways.isEmpty(), "Expected no road data from a rejected non-HTTP(S) endpoint");
+        } finally {
+            RoadNetwork.setDefaultTileSourceInputsForTests(null, null);
+        }
+    }
 }

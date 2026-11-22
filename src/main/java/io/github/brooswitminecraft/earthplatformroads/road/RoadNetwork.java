@@ -9,7 +9,9 @@ import io.earthplatform.geography.globe.MercatorGrid;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -197,6 +199,38 @@ public final class RoadNetwork {
      * this per-save would mean resolving the active save's own directory from inside a mixin on
      * {@code EarthGenerator} (which does not expose one), not attempted here.
      */
+    /**
+     * MINECRAFT-567 (butchr review 55604): the loopback-proxy slice's whole safety story depends on
+     * this switch only ever sending requests to the local machine. {@code URI.create} alone accepts
+     * any well-formed URI, including a real remote host, so this validates scheme (HTTP(S) only, no
+     * credentials leak via other schemes) and resolves the host to confirm it is actually a loopback
+     * address (covers both a literal {@code 127.0.0.1}/{@code [::1]} and a hostname like
+     * {@code localhost} that resolves to one) before the configured endpoint is ever handed to
+     * {@link RoadTileSource}. Any failure here (bad syntax, non-HTTP(S) scheme, missing host, DNS
+     * failure, or a host that resolves off-box) is treated as "not a usable loopback endpoint" --
+     * the caller then falls through to the same network-disabled {@code about:blank} source as an
+     * unconfigured switch, never to the real direct-provider endpoint.
+     */
+    private static boolean isLoopbackHttpEndpoint(String endpointProperty) {
+        try {
+            URI uri = URI.create(endpointProperty);
+            String scheme = uri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+                return false;
+            }
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return false;
+            InetAddress[] resolved = InetAddress.getAllByName(host);
+            if (resolved.length == 0) return false;
+            for (InetAddress address : resolved) {
+                if (!address.isLoopbackAddress()) return false;
+            }
+            return true;
+        } catch (IllegalArgumentException | UnknownHostException e) {
+            return false;
+        }
+    }
+
     private static RoadTileSource buildDefaultTileSource() {
         try {
             Path cacheRoot = tileCacheRootOverride != null
@@ -217,10 +251,13 @@ public final class RoadNetwork {
             boolean loopbackProxyEnabled = Boolean.getBoolean("earthplatformroads.loopbackProxyEnabled");
             if (loopbackProxyEnabled) {
                 String loopbackEndpointProperty = System.getProperty("earthplatformroads.loopbackProxyEndpoint");
-                if (loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()) {
-                    // Enabled but not configured: a network-disabled source, exactly like the
-                    // ordinary "opted in but under-provisioned" case below -- never a silent fallback
-                    // to the real Overpass.ch direct endpoint.
+                if (loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()
+                        || !isLoopbackHttpEndpoint(loopbackEndpointProperty)) {
+                    // Enabled but not configured, or configured with a non-HTTP(S)/non-loopback
+                    // target: a network-disabled source, exactly like the ordinary "opted in but
+                    // under-provisioned" case below -- never a silent fallback to the real
+                    // Overpass.ch direct endpoint, and never a send to a destination outside this
+                    // slice's loopback-only safety boundary (butchr review 55604).
                     return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
                 }
                 long loopbackMinIntervalMs = Long.getLong("earthplatformroads.loopbackProxyMinRequestIntervalMs", 0L);
