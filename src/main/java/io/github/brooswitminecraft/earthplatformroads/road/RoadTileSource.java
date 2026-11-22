@@ -840,8 +840,13 @@ public final class RoadTileSource {
     private boolean isValidEmptyMarker(Path emptyFile) throws IOException {
         if (Files.size(emptyFile) == 0) return true;
         try {
-            readCachedCell(emptyFile);
-            return true;
+            // MINECRAFT-566 comment 55572: parsing successfully is not, on its own, proof this is
+            // genuinely a CONFIRMED-EMPTY marker -- a non-empty ways array under a ".empty" name
+            // (a writer bug, a misnamed file, a real road's own data sitting under the wrong
+            // extension) would otherwise be silently trusted and its real ways DISCARDED (the
+            // caller always returns List.of() for a ".empty" hit, regardless of what was actually
+            // parsed). Require the parsed ways list to actually BE empty, not merely parseable.
+            return readCachedCell(emptyFile).isEmpty();
         } catch (IOException | RuntimeException malformed) {
             return false;
         }

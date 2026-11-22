@@ -1652,6 +1652,23 @@ it structurally rather than merely narrowing it. 104/104 tests pass (the suite's
 previously existing lease tests were updated for the new callback-based API, one entirely new
 adversarial test added).
 
+**Independently confirmed native (comment 55572):** John's own scratch patch applying this exact
+atomic-lock approach, built and tested independently of this PR's own head, compiled and WOVE
+against a real NeoForge + `combined-73` environment -- a real paused publisher was correctly
+rejected once an eviction invalidated it while held, both the ordinary and the deliberately-raced
+paths painted and survived reopen correctly, with exactly the expected single loopback request.
+This is the first Mixin added across this whole ticket to have its actual weaving and firing
+independently confirmed native, closing that specific disclosed gap for this one mechanism.
+
+## MINECRAFT-566: a zero-way `.empty` marker validation gap (comment 55572)
+
+`isValidEmptyMarker` accepted any marker that merely PARSED as valid JSON, without checking that
+its own `ways` array was actually empty. A marker named `.empty` whose content happened to carry a
+non-empty `ways` list (a writer bug, a misnamed file, real road data under the wrong extension)
+would have been accepted as "valid," and the caller (which always returns `List.of()` for any
+`.empty` hit, regardless of what was actually parsed) would silently discard that real data. Fixed
+by requiring the parsed result to actually be empty, not merely parseable. 105/105 tests pass.
+
 ## Compile/test-time-only dependency, not a fork
 
 Earth Platform's source is never copied, patched, or vendored into this

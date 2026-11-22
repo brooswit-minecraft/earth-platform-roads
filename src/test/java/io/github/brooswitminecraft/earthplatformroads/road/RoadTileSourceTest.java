@@ -892,4 +892,30 @@ class RoadTileSourceTest {
         assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellState(genuinelyEmptyLat, genuinelyEmptyLon),
                 "Expected the genuinely empty (0-byte) marker -- this suite's own long-standing convention -- to still be accepted");
     }
+
+    /**
+     * MINECRAFT-566 comment 55572, a follow-up gap: a {@code .empty} marker that parses as
+     * perfectly valid JSON, but whose {@code ways} array is NOT actually empty (a writer bug, a
+     * misnamed file, real road data sitting under the wrong extension) was previously accepted as
+     * "valid" by {@code isValidEmptyMarker} just because it parsed -- the caller then DISCARDED the
+     * real ways and reported CONFIRMED_EMPTY regardless, silently losing real data. Fixed to require
+     * the parsed result to actually BE empty, not merely parseable.
+     */
+    @Test
+    void anEmptyMarkerThatParsesButActuallyContainsAWayIsNeverTrustedAsConfirmedEmpty(@TempDir Path cacheRoot) throws IOException {
+        double lat = 65.0005, lon = -175.0005; // cell 6500_-17501
+        java.nio.file.Files.createDirectories(cacheRoot);
+        String validJsonButNonEmptyWays = """
+                {"schema_version":1,"region_id":"tile_65.0_-175.01","fetched_at":"2026-01-01T00:00:00Z",
+                 "bbox":{"min_lat":65.0,"min_lon":-175.01,"max_lat":65.01,"max_lon":-175.0},
+                 "ways":[{"way_id":555300,"way_tags":{"highway":"secondary","name":"Misnamed Street"},
+                 "centerline":[{"lat":65.004,"lon":-175.005},{"lat":65.006,"lon":-175.005}],
+                 "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """;
+        java.nio.file.Files.writeString(cacheRoot.resolve("6500_-17501.empty"), validJsonButNonEmptyWays);
+
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellState(lat, lon),
+                "Expected a parseable-but-non-empty .empty marker to be rejected (treated as PENDING), never trusted as a real confirmation");
+    }
 }

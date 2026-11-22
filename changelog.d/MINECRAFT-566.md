@@ -622,6 +622,22 @@ bump: minor
   section is still running. The three existing lease tests were updated for the new callback-based
   API (a small `publishMatched` test helper keeps their boolean-style assertions). 104/104 tests
   pass.
+- **Independently confirmed native**, per comment 55572: John's own scratch patch applying this
+  exact atomic-lock approach (built and tested independently of this PR's own head) compiled and
+  WOVE against a real NeoForge + `combined-73` environment -- a real paused publisher was correctly
+  rejected once an eviction invalidated it while held, both the ordinary and the deliberately-raced
+  paths painted and survived reopen correctly, and exactly the expected single loopback request was
+  made. This is the first time any Mixin added across this whole ticket has had its actual weaving
+  and firing independently confirmed native, closing that specific disclosed gap for this one.
+
+### Fixed (comment 55572, a zero-way `.empty` marker validation gap)
+- A `.empty` marker that parses as perfectly valid JSON but whose own `ways` array is NOT actually
+  empty (a writer bug, a misnamed file, real road data sitting under the wrong extension) was
+  previously accepted by `isValidEmptyMarker` just because it parsed -- the caller then unconditionally
+  returns `List.of()` for any `.empty` hit regardless of what was actually parsed, silently
+  discarding real way data. Fixed: `isValidEmptyMarker` now requires the parsed result to actually
+  BE empty, not merely parseable. New test,
+  `anEmptyMarkerThatParsesButActuallyContainsAWayIsNeverTrustedAsConfirmedEmpty`. 105/105 tests pass.
 
 ### Known gaps
 - **`loadNow`'s own forced-arrival contract, now independently confirmed native, not just
