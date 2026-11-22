@@ -101,6 +101,8 @@ public final class RoadNetwork {
      */
     private static final Duration TILE_FETCH_TIMEOUT = Duration.ofSeconds(20);
     private static final long DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS = 5000;
+    /** MINECRAFT-567: default cadence for the opt-in, off-by-default low-frequency fetch-telemetry report log line. */
+    private static final long DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS = 300;
 
     private static volatile RoadNetwork instance;
 
@@ -219,8 +221,16 @@ public final class RoadNetwork {
                 return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
             }
             long minIntervalMs = Long.getLong("earthplatformroads.previewMinRequestIntervalMs", DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS);
+            // MINECRAFT-567: "optional low-frequency local reporting ... opt-in flag, off by
+            // default." Neither property below enables a network fetch on its own -- they only
+            // ever take effect once the live preview provider above is already fully
+            // provisioned; see RoadFetchTelemetry's own doc for exactly what the log line (never
+            // more than once per telemetryReportIntervalSeconds) contains.
+            boolean telemetryReportingEnabled = Boolean.getBoolean("earthplatformroads.fetchTelemetryReportingEnabled");
+            long telemetryReportIntervalSeconds = Long.getLong(
+                    "earthplatformroads.fetchTelemetryReportIntervalSeconds", DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS);
             return new RoadTileSource(URI.create(previewEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
-                    apiKey, Duration.ofMillis(minIntervalMs));
+                    apiKey, Duration.ofMillis(minIntervalMs), telemetryReportingEnabled, Duration.ofSeconds(telemetryReportIntervalSeconds));
         } catch (RuntimeException e) {
             return null;
         }
