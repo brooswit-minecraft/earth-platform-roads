@@ -73,6 +73,22 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./gradlew --no-daemon --console=plain "-Pmod_version=$VERSION" jar
+      - name: Check level-road placement in real NeoForge
+        if: ${{ hashFiles('src/test/java/io/github/brooswitminecraft/earthplatformroads/road/LevelRoadPreviewOfflineTest.java') != '' }}
+        env:
+          JAVA_TOOL_OPTIONS: -Dearthplatformroads.levelRoadPreview=true
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain test --tests '*LevelRoadPreviewOfflineTest'
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          matches = glob.glob('build/test-results/test/TEST-*LevelRoadPreviewOfflineTest.xml')
+          if len(matches) != 1:
+              raise SystemExit('Expected exactly one level-road fixture test report')
+          result = ET.parse(matches[0]).getroot()
+          if any(result.get(k) != v for k,v in {'tests':'1','skipped':'0','failures':'0','errors':'0'}.items()):
+              raise SystemExit('Level-road fixture did not execute successfully')
+          PY
       - name: Verify and stage only the Roads jar
         id: package
         env:
