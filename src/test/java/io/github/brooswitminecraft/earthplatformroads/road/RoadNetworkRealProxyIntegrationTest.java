@@ -139,7 +139,9 @@ class RoadNetworkRealProxyIntegrationTest {
         assertNotNull(coldTileSource, "Expected a live tile source once pointed at the real running proxy");
 
         JsonObject before = fetchProxyStats(proxyBase);
+        RoadFetchTelemetry.Snapshot coldTelemetryBefore = coldTileSource.telemetry().snapshot();
         List<RoadSegment> coldWays = coldTileSource.waysForCell(41.0005, -96.0005);
+        RoadFetchTelemetry.Snapshot coldTelemetryDelta = coldTileSource.telemetry().snapshot().minus(coldTelemetryBefore);
         JsonObject afterCold = fetchProxyStats(proxyBase);
 
         assertEquals(1, upstreamHits.get(), "Expected exactly 1 real fake-upstream hit for the cold run");
@@ -147,6 +149,11 @@ class RoadNetworkRealProxyIntegrationTest {
                 "Expected +1 real proxy-side upstream send for the cold run");
         assertEquals(0, afterCold.get("local_hits").getAsInt() - before.get("local_hits").getAsInt(),
                 "Expected +0 proxy-side local hits for the cold run");
+        // MINECRAFT-566 comment 55663: measure the actual Roads-side send
+        // directly from RoadFetchTelemetry (the same snapshot()/minus()/
+        // httpSends() accessor RoadNetworkLoopbackProxyTest already uses),
+        // not inferred from the proxy's own counters.
+        assertEquals(1, coldTelemetryDelta.httpSends(), "Expected exactly 1 real Roads-side HTTP send for the cold run");
         assertFalse(coldWays.isEmpty(), "Expected the real proxy's forwarded response to actually decode into RoadSegments");
         assertEquals(1, coldWays.size(), "Expected exactly the one way the fake upstream's fixture carries");
         RoadSegment decoded = coldWays.get(0);
@@ -162,7 +169,9 @@ class RoadNetworkRealProxyIntegrationTest {
         assertNotNull(warmTileSource);
         assertNotEquals(coldTileSource, warmTileSource, "Expected setDefaultTileSourceInputsForTests to build a genuinely fresh RoadTileSource");
 
+        RoadFetchTelemetry.Snapshot warmTelemetryBefore = warmTileSource.telemetry().snapshot();
         List<RoadSegment> warmWays = warmTileSource.waysForCell(41.0005, -96.0005); // one real Roads HTTP send to the proxy
+        RoadFetchTelemetry.Snapshot warmTelemetryDelta = warmTileSource.telemetry().snapshot().minus(warmTelemetryBefore);
         JsonObject afterWarm = fetchProxyStats(proxyBase);
 
         assertEquals(1, upstreamHits.get(), "Expected +0 further fake-upstream hits against the warm proxy cache");
@@ -170,15 +179,23 @@ class RoadNetworkRealProxyIntegrationTest {
                 "Expected +0 further proxy-side upstream sends for the warm run");
         assertEquals(1, afterWarm.get("local_hits").getAsInt() - afterCold.get("local_hits").getAsInt(),
                 "Expected +1 proxy-side SQLite (local) hit for the warm run");
+        // The actual Roads-side send still happens on warm -- Roads itself
+        // has no way to know its request will be served from the proxy's
+        // SQLite cache rather than a real upstream fetch; it always sends
+        // once per call. Measured the same way as the cold run above, via
+        // RoadFetchTelemetry, not inferred from the proxy's local-hit count.
+        assertEquals(1, warmTelemetryDelta.httpSends(), "Expected exactly 1 real Roads-side HTTP send for the warm run too");
         assertFalse(warmWays.isEmpty());
         assertEquals(coldWays.size(), warmWays.size());
         assertEquals(decoded.wayId(), warmWays.get(0).wayId());
 
-        System.out.println("MINECRAFT-566 real two-process pair acceptance -- cold: upstream_hits=" + upstreamHits.get()
+        System.out.println("MINECRAFT-566 real two-process pair acceptance -- cold: roadsHttpSends=" + coldTelemetryDelta.httpSends()
+                + " upstream_hits=" + upstreamHits.get()
                 + " proxy upstream_sends delta=" + (afterCold.get("upstream_sends").getAsInt() - before.get("upstream_sends").getAsInt())
                 + " proxy local_hits delta=" + (afterCold.get("local_hits").getAsInt() - before.get("local_hits").getAsInt())
                 + " decodedWays=" + coldWays.size()
-                + " | warm: upstream_hits=" + upstreamHits.get()
+                + " | warm: roadsHttpSends=" + warmTelemetryDelta.httpSends()
+                + " upstream_hits=" + upstreamHits.get()
                 + " proxy upstream_sends delta=" + (afterWarm.get("upstream_sends").getAsInt() - afterCold.get("upstream_sends").getAsInt())
                 + " proxy local_hits delta=" + (afterWarm.get("local_hits").getAsInt() - afterCold.get("local_hits").getAsInt())
                 + " decodedWays=" + warmWays.size());
