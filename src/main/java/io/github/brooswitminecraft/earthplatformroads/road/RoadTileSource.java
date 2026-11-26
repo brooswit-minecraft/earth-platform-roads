@@ -82,6 +82,20 @@ public final class RoadTileSource {
      * Deliberately coarse (instance-wide, not per-cell): correctness only requires never UNDER-
      * reporting a resolution, so a caller that sees any change at all is free to simply treat its
      * whole snapshot as invalidated, which is exactly what {@code ScopedLookupCache} does.
+     *
+     * <p><b>Ordering invariant (MINECRAFT-586 round 4, a real finding against an earlier version of
+     * this field): every publish site below increments this counter BEFORE writing into
+     * {@link #memory}, never after.</b> An earlier version did {@code memory.put} first and the
+     * increment second -- a reader snapshotting this counter could then observe an UNCHANGED value
+     * across a window during which the real data had already become visible in {@link #memory} (the
+     * increment just hadn't landed yet), making "versionBefore == versionAfter" a false proof. With
+     * the counter bumped first, that asymmetry is impossible: on any single publishing thread, the
+     * increment strictly precedes the {@code put} in program order, so a reader that does not yet
+     * observe the incremented value (two reads of this {@code AtomicLong} returning the same number)
+     * cannot have observed the {@code put} either -- {@code AtomicLong} is sequentially consistent,
+     * and nothing can observe an effect from a program-order-LATER write without first observing the
+     * program-order-EARLIER one on the same thread. This is what actually makes {@code
+     * ScopedLookupCache}'s optimistic-read/validate loop a proof rather than a narrow window.
      */
     private final AtomicLong resolutionVersion = new AtomicLong();
 
@@ -739,8 +753,10 @@ public final class RoadTileSource {
         } catch (IOException e) {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
-        memory.put(key, fetched);
+        // MINECRAFT-586 round 4: increment BEFORE publishing into memory, not after -- see
+        // resolutionVersion's own doc for why this exact order matters.
         resolutionVersion.incrementAndGet();
+        memory.put(key, fetched);
         consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
     }
@@ -871,13 +887,14 @@ public final class RoadTileSource {
             if (Files.isRegularFile(readyFile)) {
                 telemetry.recordJsonPayloadRead(); // MINECRAFT-567: the actual .json payload read, not merely the isRegularFile metadata check above
                 List<RoadSegment> ways = readCachedCell(readyFile);
-                memory.put(key, ways);
+                // MINECRAFT-586 round 4: increment BEFORE publishing into memory, not after.
                 resolutionVersion.incrementAndGet();
+                memory.put(key, ways);
                 return ways;
             }
             if (Files.isRegularFile(emptyFile) && isValidEmptyMarker(emptyFile)) {
-                memory.put(key, List.of());
                 resolutionVersion.incrementAndGet();
+                memory.put(key, List.of());
                 return List.of();
             }
         } catch (IOException e) {
