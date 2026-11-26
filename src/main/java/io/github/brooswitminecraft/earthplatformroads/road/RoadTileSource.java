@@ -753,12 +753,32 @@ public final class RoadTileSource {
         } catch (IOException e) {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
+        if (afterAtomicMoveBeforeVersionBumpHookForTests != null) afterAtomicMoveBeforeVersionBumpHookForTests.run();
         // MINECRAFT-586 round 4: increment BEFORE publishing into memory, not after -- see
         // resolutionVersion's own doc for why this exact order matters.
         resolutionVersion.incrementAndGet();
+        if (afterVersionBumpBeforeMemoryPutHookForTests != null) afterVersionBumpBeforeMemoryPutHookForTests.run();
         memory.put(key, fetched);
         consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
+    }
+
+    /**
+     * MINECRAFT-586 (Tayne's tie-break, comment 56050): test-only hooks letting a test pause the
+     * REAL production publication sequence at exactly the two boundaries review asked about --
+     * immediately after the atomic disk move but before {@link #resolutionVersion} bumps, and
+     * immediately after that bump but before {@link #memory} is updated -- rather than inferring
+     * correctness from timing races alone. {@code null} (the default) means no pause; production
+     * code never sets these. Package-private: {@code RoadNetworkScopedLookupCacheTest} is the only
+     * intended caller.
+     */
+    private volatile Runnable afterAtomicMoveBeforeVersionBumpHookForTests;
+    private volatile Runnable afterVersionBumpBeforeMemoryPutHookForTests;
+
+    /** Test-only: install (or clear, with {@code null} args) the two pause hooks documented above. */
+    void setPublicationHooksForTests(Runnable afterAtomicMoveBeforeVersionBump, Runnable afterVersionBumpBeforeMemoryPut) {
+        this.afterAtomicMoveBeforeVersionBumpHookForTests = afterAtomicMoveBeforeVersionBump;
+        this.afterVersionBumpBeforeMemoryPutHookForTests = afterVersionBumpBeforeMemoryPut;
     }
 
     /**

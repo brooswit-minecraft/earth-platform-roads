@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -323,6 +324,134 @@ class RoadNetworkScopedLookupCacheTest {
                     RoadNetwork.segmentCoveringColumn(grid, x + ddx, z + ddz, cache);
                 }
             }
+        }
+    }
+
+    /**
+     * MINECRAFT-586: Tayne's tie-break (Jira comment 56050) on the round-5 dispute -- the
+     * production publication sequence IS correct (disk write, then version bump, then {@code
+     * memory.put}), but the earlier stress test only raced it non-deterministically. This test
+     * pauses the REAL {@code attemptFetch} production path at the two exact boundaries review named,
+     * using {@link RoadTileSource#setPublicationHooksForTests}, rather than inferring correctness
+     * from timing:
+     * <ol>
+     *   <li>Prime a genuinely-PENDING entry into ONE {@link RoadNetwork.ScopedLookupCache}, reused
+     *       for every check below ("the same scope").</li>
+     *   <li>Start a real fetch on a background thread; pause it immediately after the atomic disk
+     *       move but before {@code resolutionVersion} bumps. At this pause, the SAME scoped cache
+     *       (deterministically, since the version has not moved) still reports no segment -- this is
+     *       the documented, bounded within-pass staleness window, not a bug. A DIRECT, uncached check
+     *       at this exact pause (bypassing the scoped cache) already finds {@link
+     *       RoadTileSource#cellState} reporting {@code READY}, confirming the real invariant: the
+     *       disk write always precedes the version bump, so the version counter never runs AHEAD of
+     *       the real data -- only the scoped cache's own primed, not-yet-invalidated copy is behind,
+     *       and only until the version it's gated on actually moves.</li>
+     *   <li>Release; pause again immediately after the version bump but before {@code memory.put}.
+     *       At THIS pause, the same scoped cache must already see the real, resolved way -- the
+     *       version change forces a fresh read, which falls through to a direct disk check (the
+     *       atomic move already happened) rather than waiting on {@code memory.put}.</li>
+     *   <li>Release; after the fetch fully completes, the lookup must still see the resolved way.</li>
+     * </ol>
+     */
+    @Test
+    void latchDrivenProductionPathRegressionPendingDuringMoveWindowReadyAfterBumpWindow(@TempDir Path tmp) throws Exception {
+        MercatorGrid grid = new MercatorGrid(1);
+        int x = 750_000, z = 750_000;
+        var here = grid.geographic(x + 0.5, z + 0.5);
+        long wayId = 850_000_111L;
+
+        String response = """
+                {"elements":[{"type":"way","id":%d,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Latch Pause Street"},
+                  "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
+                """.formatted(wayId, here.latitude() - 0.0005, here.longitude(), here.latitude() + 0.0005, here.longitude());
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            Path regions = Files.createDirectories(tmp.resolve("regions"));
+            RoadNetwork.resetForTests(regions);
+            var tiles = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
+                    tmp.resolve("road-cache"), true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tiles);
+
+            CountDownLatch atFirstPause = new CountDownLatch(1);
+            CountDownLatch releaseFirstPause = new CountDownLatch(1);
+            CountDownLatch atSecondPause = new CountDownLatch(1);
+            CountDownLatch releaseSecondPause = new CountDownLatch(1);
+            tiles.setPublicationHooksForTests(
+                    () -> { atFirstPause.countDown(); awaitUninterruptibly(releaseFirstPause); },
+                    () -> { atSecondPause.countDown(); awaitUninterruptibly(releaseSecondPause); });
+
+            // Prime a genuinely-pending entry in ONE scoped cache, reused for every check below.
+            RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+            assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
+                    "Priming read: cell must be genuinely PENDING before any fetch starts");
+
+            Thread resolver = new Thread(() -> tiles.waysForCell(here.latitude(), here.longitude()));
+            resolver.setDaemon(true);
+            resolver.start();
+
+            // First pause: the atomic disk move has happened; resolutionVersion has NOT bumped yet.
+            assertTrue(atFirstPause.await(5, TimeUnit.SECONDS), "Resolver never reached the first pause");
+            assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
+                    "Before the version bump, the PRIMED scoped cache is expected to still report no "
+                            + "segment -- the documented, bounded within-pass staleness window, not a bug. "
+                            + "Critically this must never be a FINAL answer, proven by the direct cellState "
+                            + "check below (a fresh, uncached read) and by the post-bump/post-completion "
+                            + "checks that follow.");
+            // A DIRECT, uncached check (bypassing the scoped cache entirely) already sees READY here --
+            // the atomic disk move happened before this pause, and RoadTileSource's own cellState/
+            // cachedWaysForCellOrEmpty always do a fresh disk check on a memory miss, never gated by
+            // resolutionVersion. This is the real invariant the whole design leans on: the version
+            // counter is a conservative change-detection signal that never runs AHEAD of the real data,
+            // so it is safe for a cache to treat "version unchanged" as "nothing changed" -- the exact
+            // opposite order (version ahead of data) is what would be unsafe, and is not what happens.
+            assertEquals(RoadTileSource.CellState.READY, tiles.cellState(here.latitude(), here.longitude()),
+                    "A direct, uncached cellState check must already see READY here -- the disk write "
+                            + "happened before this pause -- confirming the real data is never behind the "
+                            + "version signal, only the scoped cache's OWN stale copy (primed earlier) is");
+            releaseFirstPause.countDown();
+
+            // Second pause: resolutionVersion HAS bumped; memory.put has NOT happened yet.
+            assertTrue(atSecondPause.await(5, TimeUnit.SECONDS), "Resolver never reached the second pause");
+            var atSecondPauseResult = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
+            assertEquals(wayId, atSecondPauseResult == null ? -1 : atSecondPauseResult.wayId(),
+                    "The instant the version bump is observable -- even though memory.put has not run "
+                            + "yet -- the SAME scoped cache must already see the real, now-written data "
+                            + "(it falls through to a fresh disk read on the memory miss), never a masked "
+                            + "PENDING/empty answer");
+            releaseSecondPause.countDown();
+
+            resolver.join(5_000);
+
+            var afterComplete = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
+            assertEquals(wayId, afterComplete == null ? -1 : afterComplete.wayId(),
+                    "Immediately after the fetch fully completes, the lookup must see the resolved way");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    latch.await();
+                    return;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 }
