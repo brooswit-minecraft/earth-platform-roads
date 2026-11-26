@@ -3,15 +3,18 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 import com.sun.net.httpserver.HttpServer;
 import io.earthplatform.geography.globe.MercatorGrid;
-import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -162,6 +165,106 @@ class RoadNetworkScopedLookupCacheTest {
             var found = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
             assertEquals(99999999L, found == null ? -1 : found.wayId(),
                     "Repeated lookup #" + i + " through the same scoped cache must still find the already-ready way");
+        }
+    }
+
+    /**
+     * MINECRAFT-586 round 2's own explicit ask ("add a deterministic regression that forces
+     * resolution after validation and before the cached neighbor is read") cannot literally be
+     * satisfied: per {@link RoadNetwork.ScopedLookupCache}'s own updated doc, the remaining gap is
+     * between two adjacent, non-blocking memory reads with no safepoint in between -- there is no
+     * seam in the production code to deterministically land a resolution inside that exact window
+     * without instrumenting internal implementation details purely for a test, which this fix
+     * deliberately avoids doing. What IS achievable, and is exercised here: a best-effort stress
+     * test hammering many distinct cells with one thread doing hundreds of reader lookups through
+     * ONE scoped cache while a second thread concurrently resolves those same cells one at a time,
+     * repeated across many trials -- not proof of zero staleness during the race (that would require
+     * either the deterministic seam above or a real lock, neither of which this fix adds), but
+     * verifies the cache never permanently poisons a result: every cell is correctly resolved by the
+     * time both threads finish, every trial.
+     */
+    @Test
+    void concurrentResolutionStressNeverPermanentlyMasksAnyCell(@TempDir Path tmp) throws Exception {
+        int cellCount = 40;
+        String[] responses = new String[cellCount];
+        MercatorGrid grid = new MercatorGrid(1);
+        int[] xs = new int[cellCount], zs = new int[cellCount];
+        double[] lats = new double[cellCount], lons = new double[cellCount];
+        for (int i = 0; i < cellCount; i++) {
+            xs[i] = 800_000 + i * 2_000; // spaced well apart: distinct cells, no neighborhood overlap between them
+            zs[i] = 800_000 + i * 2_000;
+            var here = grid.geographic(xs[i] + 0.5, zs[i] + 0.5);
+            lats[i] = here.latitude();
+            lons[i] = here.longitude();
+            responses[i] = """
+                    {"elements":[{"type":"way","id":%d,"nodes":[1,2],
+                      "tags":{"highway":"secondary","name":"Stress Street %d"},
+                      "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
+                    """.formatted(900_000_000L + i, i, lats[i] - 0.0005, lons[i], lats[i] + 0.0005, lons[i]);
+        }
+
+        // The resolver thread below calls tiles.waysForCell sequentially, one blocking HTTP round
+        // trip at a time (RoadTileSource.fetchCell serializes every real send under its own
+        // networkLock) -- so requests arrive in exactly index order 0..cellCount-1, making a plain
+        // request counter a reliable (if fixture-specific) way to answer each one correctly.
+        var requestIndex = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            int i = requestIndex.getAndIncrement();
+            byte[] body = (i < cellCount ? responses[i] : "{\"elements\":[]}").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            Path regions = Files.createDirectories(tmp.resolve("regions"));
+            RoadNetwork.resetForTests(regions);
+            var tiles = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
+                    tmp.resolve("road-cache"), true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tiles);
+
+            RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+            AtomicBoolean readerFailed = new AtomicBoolean(false);
+            AtomicBoolean keepReading = new AtomicBoolean(true);
+            CountDownLatch resolverDone = new CountDownLatch(1);
+
+            Thread reader = new Thread(() -> {
+                while (keepReading.get()) {
+                    for (int i = 0; i < cellCount; i++) {
+                        try {
+                            RoadNetwork.segmentCoveringColumn(grid, xs[i], zs[i], cache);
+                        } catch (Throwable t) {
+                            readerFailed.set(true);
+                        }
+                    }
+                }
+            });
+            Thread resolver = new Thread(() -> {
+                for (int i = 0; i < cellCount; i++) {
+                    tiles.waysForCell(lats[i], lons[i]);
+                }
+                resolverDone.countDown();
+            });
+
+            reader.start();
+            resolver.start();
+            resolverDone.await();
+            resolver.join();
+            // Give the reader a little more time hammering the now-fully-resolved cells, then stop it.
+            Thread.sleep(50);
+            keepReading.set(false);
+            reader.join(5_000);
+
+            assertTrue(!readerFailed.get(), "Reader thread must never throw while racing the resolver");
+            for (int i = 0; i < cellCount; i++) {
+                var found = RoadNetwork.segmentCoveringColumn(grid, xs[i], zs[i], cache);
+                assertEquals(900_000_000L + i, found == null ? -1 : found.wayId(),
+                        "Cell " + i + " must be resolved (never permanently masked) once the resolver has finished");
+            }
+        } finally {
+            stub.stop(0);
         }
     }
 }

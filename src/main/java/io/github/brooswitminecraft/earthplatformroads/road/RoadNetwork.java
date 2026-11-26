@@ -364,15 +364,32 @@ public final class RoadNetwork {
      * though the window is ordinarily microseconds wide.
      *
      * <p><b>The fix: snapshot {@link RoadTileSource#resolutionVersion()}, and self-invalidate.</b>
-     * {@link #candidatesNear} checks that counter on every use of this cache: if it has moved at all
-     * since this cache's entries were written -- meaning SOMETHING, anywhere in that tile source, has
-     * newly resolved since -- every cached entry is dropped and re-read fresh (cheap: one
+     * {@link #candidatesNear} checks that counter immediately before EVERY individual cached read --
+     * not once before the whole 3x3 loop (a round-2 review finding against an earlier version of
+     * this fix: checking once up front still left every read after the first one in that same loop
+     * trusting a snapshot that could have gone stale partway through). If the counter has moved at
+     * all since this cache's entries were written -- meaning SOMETHING, anywhere in that tile source,
+     * has newly resolved since -- every cached entry is dropped and re-read fresh (cheap: one
      * {@code AtomicLong.get()} and a map clear, not a disk touch) rather than ever trusting a
      * possibly-stale answer. This check is coarse (instance-wide, not per-cell) deliberately:
-     * correctness only needs to never UNDER-detect a resolution, and the ordinary case -- nothing
-     * resolves during one column's microsecond-scale scan -- pays the full dedupe benefit with the
-     * counter check costing nothing, while the rare case where something genuinely did resolve
-     * mid-pass is self-correcting instead of silently wrong.
+     * correctness only needs to never UNDER-detect a resolution.
+     *
+     * <p><b>What this does not claim.</b> This is a lock-free, snapshot-and-compare check, not a
+     * lock -- so the two operations ({@code tiles.resolutionVersion()}, then the map read/write it
+     * gates) are adjacent, not atomic together. A resolution landing in that specific gap (two
+     * sequential, non-blocking memory reads, no I/O, no safepoint) is not impossible in the most
+     * literal sense, only vanishingly narrow -- orders of magnitude narrower than the gap this fix
+     * closes (an entire 9-read loop body, previously covered by a single check, where a cache MISS
+     * inside that loop could cost a real disk read taking far longer than two memory reads). Closing
+     * that remaining gap completely would require a real lock around every cached read here, which
+     * this file's own prior architecture (the {@link RoadTileSource#cellLocks} doc, MINECRAFT-566
+     * comment 55450) deliberately rejected for this exact hot path, for the same reason: an
+     * already-cached, no-network-needed read must never be made to wait behind anything else. The
+     * alternative that WOULD be fully race-free -- never caching a PENDING result at all -- is also
+     * available (pass {@code null} instead of a cache) but gives up the entire measured benefit, since
+     * {@link RoadTileSource}'s own {@code memory} map already permanently and safely caches every
+     * READY/CONFIRMED_EMPTY result on its own; only PENDING cells (MINECRAFT-584's actual measured
+     * bottleneck) are the ones this class exists to help with.
      *
      * <p>Still never a persistent, CROSS-pass cache: created fresh per generation pass by
      * {@link #freshScopedLookupCache()} and discarded once that pass returns. Passing {@code null}
@@ -525,7 +542,6 @@ public final class RoadNetwork {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
-        if (cache != null) cache.invalidateIfAnythingResolvedSince(tiles); // never trust a snapshot across a resolution
 
         List<RoadSegment> fromTiles = new ArrayList<>();
         for (int dLat = -1; dLat <= 1; dLat++) {
@@ -534,6 +550,13 @@ public final class RoadNetwork {
                 if (cache == null) {
                     fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon));
                 } else {
+                    // MINECRAFT-586 round 2: re-validate immediately before EACH individual cached
+                    // read, not once for the whole 3x3 loop (the gap a second self-review found --
+                    // checking once before the loop left every read after the first one in the loop
+                    // trusting a snapshot that could be an iteration or more stale). See
+                    // ScopedLookupCache's own doc for why this is still not a fully atomic guarantee,
+                    // and why this codebase deliberately does not take a lock here.
+                    cache.invalidateIfAnythingResolvedSince(tiles);
                     // Keyed by the neighbor cell itself (not the center lat/lon) so overlapping
                     // Moore neighborhoods from DIFFERENT centers -- the common case across a ring
                     // scan or a section's columns -- actually share hits, not just repeats of the
