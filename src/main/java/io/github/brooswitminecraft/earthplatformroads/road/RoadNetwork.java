@@ -343,196 +343,77 @@ public final class RoadNetwork {
 
     /**
      * MINECRAFT-586: a short-lived, caller-owned cache of {@link #candidatesNear}'s per-neighbor-cell
-     * {@link RoadTileSource#cachedWaysForCellOrEmpty} reads, scoped to ONE generation pass over many
-     * columns that repeatedly re-derive the same cell -- e.g. {@code EarthGeneratorRoadMixin}'s
-     * {@code nearestLowerSameRoadDistance} (up to 120 {@link #segmentCoveringColumn} calls for one
-     * column, heavily overlapping Moore neighborhoods between adjacent ring positions) and
-     * {@link LevelRoadPreview#apply}'s 256-column section loop (every column in one 16x16 section
-     * typically falls in the same {@value #CELL_DEGREES}-degree cell, so 256 calls would otherwise
-     * repeat the exact same disk-cache reads). MINECRAFT-584 measured this as the hottest leaf cost
-     * ({@code RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case)
-     * -- see that ticket's JFR findings.
+     * {@link RoadTileSource#cellRead} reads, scoped to ONE generation pass over many columns that
+     * repeatedly re-derive the same cell -- e.g. {@code EarthGeneratorRoadMixin}'s {@code
+     * nearestLowerSameRoadDistance} (up to 120 {@link #segmentCoveringColumn} calls for one column,
+     * heavily overlapping Moore neighborhoods between adjacent ring positions) and {@link
+     * LevelRoadPreview#apply}'s 256-column section loop (every column in one 16x16 section typically
+     * falls in the same {@value #CELL_DEGREES}-degree cell, so 256 calls would otherwise repeat the
+     * exact same disk-cache reads). MINECRAFT-584 measured this as the hottest leaf cost ({@code
+     * RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case) -- see
+     * that ticket's JFR findings.
      *
-     * <p><b>Why this is not simply a persistent, pass-long memo of every answer including PENDING
-     * ones.</b> An earlier version of this cache did exactly that, and review (MINECRAFT-586)
-     * correctly rejected it: {@link RoadTileSource#cachedWaysForCellOrEmpty} returns the identical
-     * empty list for both a genuinely confirmed-empty cell and a merely-PENDING one, so naively
-     * memoizing that return value for the rest of one pass would let a cell that resolves DURING that
-     * pass (e.g. a concurrent background prefetch dispatched by {@code EarthGeneratorPrepareMixin}
-     * for the same cell, finishing mid-scan) stay invisible to the remaining calls in that same pass
-     * -- a real "stale paint after data completes" violation, not merely a theoretical one, even
-     * though the window is ordinarily microseconds wide.
+     * <p><b>Only ever caches a DEFINITIVE answer (John Winstead's ruling, MINECRAFT-586 comment
+     * 56072, superseding every earlier round's own version-counter/in-flight-flag machinery):</b> a
+     * cell is cached here if and only if {@link RoadTileSource#cellRead} reports it as {@code READY}
+     * or {@code CONFIRMED_EMPTY} -- never {@code PENDING}. Those two states are stable facts about
+     * this cell for the rest of this {@link RoadTileSource} instance's life (see {@link
+     * RoadTileSource.CellState}'s own doc and the long-standing invariants {@code RoadTileSourceTest}
+     * already proves: a confirmed-empty or ready result, once validated from disk, never reverts),
+     * so once cached here it can never go stale within this one generation pass either, with no
+     * invalidation logic of any kind needed. A still-PENDING cell is never written into this cache at
+     * all -- every access to it reads straight through to {@link RoadTileSource#cellRead} again, every
+     * time, exactly like the no-cache path below.
      *
-     * <p><b>Round 1 (checking {@link RoadTileSource#resolutionVersion()} once before the whole 3x3
-     * loop) and round 2 (checking it again before each individual read) each narrowed, but review
-     * correctly kept finding, the same underlying gap: ANY snapshot-then-use sequence that is not
-     * atomic with the real publish can be invalidated by a resolution landing in its own gap, no
-     * matter how short that gap is made.</b> The actual fix is not to make the gap narrower; it is to
-     * stop trusting any single-point-in-time snapshot taken DURING this whole Moore-neighborhood read
-     * at all, and instead verify, AFTER finishing the read, that nothing could have resolved during
-     * the ENTIRE read -- the same optimistic-read/validate pattern {@link java.util.concurrent.locks.StampedLock}'s
-     * {@code tryOptimisticRead} offers, applied by hand against {@link RoadTileSource#resolutionVersion()}:
-     * <ol>
-     *   <li>Record {@code versionBefore = tiles.resolutionVersion()}.</li>
-     *   <li>Read (from cache where already known this pass, from disk otherwise) all 9 Moore-neighbor
-     *       cells, exactly as before.</li>
-     *   <li>Record {@code versionAfter = tiles.resolutionVersion()}.</li>
-     *   <li>If {@code versionBefore == versionAfter}: by definition NOTHING resolved, anywhere in
-     *       this tile source, during the entire window this read spanned -- every value read or
-     *       reused during that window is therefore provably consistent with the real state as of
-     *       {@code versionAfter}, not merely "probably still fine." Keep the cache as updated.</li>
-     *   <li>If they differ: something resolved during this exact read -- discard every entry this
-     *       cache holds (including ones read just now) and retry the whole read from scratch. Bounded
-     *       to {@value #MAX_OPTIMISTIC_RETRIES} attempts so a (never actually observed, since real
-     *       fetches are individually rate-limited) pathological non-stop-resolving stream cannot spin
-     *       forever; after that many retries this falls open to the last result rather than hanging.</li>
-     * </ol>
-     * This is airtight, not merely narrowed: {@code versionBefore == versionAfter} is a PROOF that no
-     * resolution happened during the read, not a probabilistic argument about how short the checked
-     * window is -- the exact "atomic/linearizable" property review asked for, achieved without taking
-     * any lock on this hot path (this file's own prior architecture, {@link RoadTileSource#cellLocks}'s
-     * doc / MINECRAFT-566 comment 55450, deliberately rejected a lock here, for the same reason: an
-     * already-cached, no-network-needed read must never be made to wait behind anything else). In the
-     * overwhelmingly common case -- nothing resolves during one column's microsecond-scale scan -- this
-     * costs exactly one retry-loop iteration and two extra {@code AtomicLong.get()} calls, preserving
-     * the full dedupe benefit; only a genuine concurrent resolution ever pays for a retry.
-     *
-     * <p>Still never a persistent, CROSS-pass cache: created fresh per generation pass by
-     * {@link #freshScopedLookupCache()} and discarded once that pass returns. Passing {@code null}
-     * anywhere this is accepted below disables the cache entirely and reads through to
-     * {@link RoadTileSource} exactly as before -- used by every caller not on this measured hot path.
+     * <p>Several earlier rounds (version counters, optimistic-read/validate retry loops, a ref-counted
+     * publication-in-flight tracker, checked at ever-narrower points around each cache access) each
+     * patched one race only for review to find the next-narrower one hiding in the gap it left behind
+     * -- all of them were trying to make it safe to reuse a PENDING-derived answer across a window a
+     * real resolution could land in. 56072's ruling cuts that off at the root instead: don't reuse (or
+     * even store) a PENDING-derived answer at all, so there is no window to close, because there is no
+     * stored answer to call unsafe. The tradeoff, explicitly accepted by that ruling ("do not chase
+     * 1089->9 on pending cells at the expense of correctness"): a cell that stays genuinely pending
+     * for an entire pass gets NO dedupe benefit at all here (same disk cost as before this whole fix
+     * existed -- every access reads straight through). A cell that resolves to READY or
+     * CONFIRMED_EMPTY -- the common case once a region has actually been fetched, e.g. "most of the
+     * world has no roads" (MINECRAFT-566 comment 55562) -- is cached here too, but {@link
+     * RoadTileSource}'s own PRE-EXISTING {@code memory} layer (also MINECRAFT-566, predating this
+     * ticket entirely) already memoizes that exact same answer with zero disk I/O after its first
+     * validating read, with or without this cache -- so there is no disk-read reduction left for
+     * THIS cache to additionally claim credit for on that side. What this cache still buys for a
+     * resolved cell is avoiding a repeat call into {@link RoadTileSource} at all (one {@code HashMap}
+     * lookup here instead of one {@code ConcurrentHashMap} lookup plus the cell-key arithmetic
+     * there) -- real, but a CPU micro-saving, not a disk one.
      */
     public static final class ScopedLookupCache {
-        private static final int MAX_OPTIMISTIC_RETRIES = 1000; // never realistically hit; see class doc
-
         private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
-        /** The {@code tiles}/{@code resolutionVersion()} this cache's entries are known valid as of; see {@link #readMooreNeighborhood}. */
-        private RoadTileSource validAtTiles;
-        private long validAtVersion = -1;
 
         /**
          * The Moore-neighborhood (3x3, including {@code lat,lon}'s own cell) read {@link #candidatesNear}
-         * needs, reusing this pass's own cache where already known and otherwise reading fresh --
-         * see this class's own doc for the optimistic-read/validate loop that makes this provably safe
-         * against a resolution landing anywhere during the read, not merely unlikely to. Also handles
-         * the ACROSS-call case (entries cached by an EARLIER call to this same method, now stale
-         * because something resolved in between): {@code versionBefore} is compared against
-         * {@link #validAtVersion} -- the version this cache's entries were last PROVEN valid as of --
-         * not just against itself, so a resolution that happened between two separate calls (not
-         * during either one's own read) is caught exactly the same way.
-         *
-         * <p><b>MINECRAFT-586 round 6:</b> the version check above closes resolutions that already
-         * fully completed by the time this call checks, but leaves one gap the round's own
-         * deterministic latch test found -- a resolution ACTIVELY IN PROGRESS for one of these 9
-         * cells, where the real disk write already landed but {@link RoadTileSource#resolutionVersion}
-         * has not bumped yet. For exactly that cell, {@link RoadTileSource#isPublicationInFlight}
-         * forces a real, uncached disk read instead of trusting -- or even writing -- any cached
-         * entry; a real disk read has no lag at all relative to the filesystem, so it always sees the
-         * write the instant it lands. Every OTHER cell in the same 3x3 read, not in flight, still
-         * gets the full cache benefit -- this only ever costs a cache miss, never incorrectness, and
-         * only for the brief window a cell is genuinely resolving.
-         *
-         * <p><b>MINECRAFT-586 round 7:</b> checking {@code isPublicationInFlight} once, before
-         * deciding whether to trust/use the cache, is itself a check-then-act gap: the flag can flip
-         * from false to true in the instant between that check and the subsequent cache read, and a
-         * cache HIT (unlike a miss) performs no check of its own at all. {@link #readOneNeighborCell}
-         * closes this by checking the flag AGAIN immediately after consulting the cache, before the
-         * value is used -- if it changed in that exact window, the value just obtained is discarded
-         * and the check repeats (the next iteration sees the flag already true, forcing the
-         * unconditional fresh branch, which cannot itself be stale). If the flag is false both before
-         * and after, nothing could have started publishing at any point across that whole window, so
-         * the cache hit is provably accurate for this cell throughout it.
+         * needs, reusing this pass's own cache where already known (definitive answers only -- see
+         * this class's own doc) and otherwise reading fresh.
          */
         private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
-            for (int attempt = 0; attempt < MAX_OPTIMISTIC_RETRIES; attempt++) {
-                long versionBefore = tiles.resolutionVersion();
-                if (tiles != validAtTiles || versionBefore != validAtVersion) {
-                    perCellTileReads.clear(); // stale relative to the last version this cache was proven valid at -- never trust it
-                }
-                List<RoadSegment> result = new ArrayList<>();
-                for (int dLat = -1; dLat <= 1; dLat++) {
-                    for (int dLon = -1; dLon <= 1; dLon++) {
-                        double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
-                        result.addAll(readOneNeighborCell(tiles, neighborLat, neighborLon));
-                    }
-                }
-                long versionAfter = tiles.resolutionVersion();
-                if (versionAfter == versionBefore) {
-                    // Proof: nothing resolved, anywhere in this tile source, during this entire read
-                    // -- not merely unlikely to have. Every entry just read (or reused) is therefore
-                    // consistent with the real state as of versionAfter; record that so a LATER call
-                    // can trust these same entries without re-reading, until something actually moves.
-                    validAtTiles = tiles;
-                    validAtVersion = versionAfter;
-                    return result;
-                }
-                perCellTileReads.clear(); // something resolved mid-read -- every entry here (including ones just read) is suspect; retry fresh
-            }
-            // Pathological (never observed: real fetches are individually rate-limited): fail open
-            // rather than hang, same no-fabrication spirit RoadTileSource's own fail-open paths use.
-            List<RoadSegment> fallback = new ArrayList<>();
+            List<RoadSegment> result = new ArrayList<>();
             for (int dLat = -1; dLat <= 1; dLat++) {
                 for (int dLon = -1; dLon <= 1; dLon++) {
-                    fallback.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+                    result.addAll(readOneNeighborCell(tiles, lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
                 }
             }
-            return fallback;
-        }
-
-        /**
-         * MINECRAFT-586 round 7: one neighbor cell's own read, with {@link RoadTileSource#isPublicationInFlight}
-         * checked both BEFORE and AFTER consulting/populating {@link #perCellTileReads} -- never just
-         * once beforehand -- so a flag transition landing in the gap between that single check and the
-         * cache read it gated is itself detected and retried, never silently trusted. See {@link
-         * #readMooreNeighborhood}'s own round-7 doc for why a single before-only check is insufficient.
-         */
-        /**
-         * MINECRAFT-586 round 7 (Jira comment 56064): test-only hook fired immediately after the
-         * FIRST {@code isPublicationInFlight} check returns false, before the cache is consulted --
-         * the exact window round 7 found. {@code null} (the default) means no pause; production code
-         * never sets this. Package-private: the deterministic round-7 regression is the only intended
-         * caller.
-         */
-        private volatile java.util.function.BiConsumer<Double, Double> afterFirstInFlightCheckBeforeCacheReadHookForTests;
-
-        /**
-         * Test-only: install (or clear, with {@code null}) the hook documented above. Receives the
-         * exact neighbor cell's own {@code lat,lon} (not the rounded cell key) on every one of the 9
-         * Moore-neighborhood checks per {@code readMooreNeighborhood} call -- a test that only cares
-         * about one specific cell must filter by comparing against it itself.
-         */
-        void setAfterFirstInFlightCheckHookForTests(java.util.function.BiConsumer<Double, Double> hook) {
-            this.afterFirstInFlightCheckBeforeCacheReadHookForTests = hook;
+            return result;
         }
 
         private List<RoadSegment> readOneNeighborCell(RoadTileSource tiles, double neighborLat, double neighborLon) {
             long neighborKey = cellKey(neighborLat, neighborLon);
-            while (true) {
-                if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
-                    // Already in flight: a real, uncached read right now is unconditionally correct --
-                    // there is no caching layer between it and the filesystem, so nothing can make it stale.
-                    return tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon);
-                }
-                if (afterFirstInFlightCheckBeforeCacheReadHookForTests != null) {
-                    afterFirstInFlightCheckBeforeCacheReadHookForTests.accept(neighborLat, neighborLon);
-                }
-                List<RoadSegment> value = perCellTileReads.containsKey(neighborKey)
-                        ? perCellTileReads.get(neighborKey)
-                        : tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon);
-                if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
-                    // Something started publishing for this exact cell in the window between the
-                    // check above and this one -- the value just obtained (cache hit or fresh read
-                    // alike) is suspect; do not cache it, do not use it, loop again. The next
-                    // iteration's own FIRST check above will see the flag still true (publication
-                    // cannot un-start) and take the unconditionally-correct branch.
-                    continue;
-                }
-                // Neither check observed anything in flight: nothing could have started publishing
-                // at any point across the whole window from the first check to this one, so `value`
-                // (whether a cache hit or a read just performed) is provably accurate for this cell.
-                perCellTileReads.put(neighborKey, value);
-                return value;
+            List<RoadSegment> cached = perCellTileReads.get(neighborKey);
+            if (cached != null) return cached;
+            RoadTileSource.CellRead read = tiles.cellRead(neighborLat, neighborLon);
+            if (read.state() != RoadTileSource.CellState.PENDING) {
+                // Definitive (READY or CONFIRMED_EMPTY): a stable fact for the rest of this pass --
+                // see this class's own doc for why that makes this safe with no invalidation at all.
+                perCellTileReads.put(neighborKey, read.ways());
             }
+            return read.ways();
         }
     }
 

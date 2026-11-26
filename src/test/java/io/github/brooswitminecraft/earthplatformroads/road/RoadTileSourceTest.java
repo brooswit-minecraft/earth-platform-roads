@@ -920,151 +920,43 @@ class RoadTileSourceTest {
     }
 
     /**
-     * MINECRAFT-586: the exact invariant {@code RoadNetwork.ScopedLookupCache}'s optimistic-read/
-     * validate loop depends on -- {@code resolutionVersion()} never advances for a cell before that
-     * cell's real disk write (and {@code memory} publish) are already visible -- exercised here
-     * directly against {@link #cachedWaysForCellOrEmpty}, bypassing {@code ScopedLookupCache}
-     * entirely, against the REAL {@code attemptFetch} writer path (a real HTTP fetch, a real disk
-     * write) racing a reader thread that busy-polls {@link #resolutionVersion()} and, the INSTANT it
-     * observes the bump, immediately re-checks the cell -- the tightest rendezvous achievable without
-     * adding a pause seam to production code (round-5 review's own ask, see MINECRAFT-586 comment
-     * history): if a reader could ever observe the new version while the cell is still reported
-     * PENDING, this test would catch it. Repeated across many trials for confidence this isn't luck.
+     * MINECRAFT-586 (John Winstead's ruling, comment 56072): {@code cellRead} is the one shared
+     * validated-load read {@code RoadNetwork.ScopedLookupCache} uses to decide, in a single disk
+     * pass, both the actual ways AND whether this cell's answer is definitive -- so it must agree
+     * exactly with {@code cellState}/{@code cachedWaysForCellOrEmpty} for all three states, on both
+     * a cold (disk) read and a warm (memory) one.
      */
     @Test
-    void resolutionVersionNeverAdvancesBeforeTheRealDataIsAlreadyVisible(@TempDir Path cacheRoot) throws Exception {
-        int trials = 200;
-        for (int trial = 0; trial < trials; trial++) {
-            double lat = 70.0 + trial * 0.02, lon = -140.0 - trial * 0.02; // a fresh, never-touched cell each trial
-            String response = """
-                    {"elements":[{"type":"way","id":%d,"nodes":[1,2],
-                      "tags":{"highway":"secondary","name":"Rendezvous Street %d"},
-                      "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
-                    """.formatted(800_000_000L + trial, trial, lat - 0.0005, lon, lat + 0.0005, lon);
-            HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            stub.createContext("/", exchange -> {
-                byte[] body = response.getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(200, body.length);
-                exchange.getResponseBody().write(body);
-                exchange.close();
-            });
-            stub.start();
-            try {
-                RoadTileSource source = new RoadTileSource(
-                        URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
-                        cacheRoot.resolve("trial" + trial), true, Duration.ofSeconds(5));
+    void cellReadAgreesWithCellStateAndCachedWaysForEveryState(@TempDir Path cacheRoot) throws IOException {
+        double pendingLat = 66.0005, pendingLon = -176.0005; // never touched at all
+        double emptyLat = 66.0005, emptyLon = -175.9905; // adjacent cell, distinct key
+        double readyLat = 66.0205, readyLon = -176.0005; // another distinct cell
+        java.nio.file.Files.createDirectories(cacheRoot);
+        java.nio.file.Files.writeString(cacheRoot.resolve("6600_-17600.empty"), "");
+        java.nio.file.Files.writeString(cacheRoot.resolve("6602_-17601.json"), """
+                {"schema_version":1,"region_id":"cell-read-test","fetched_at":"2026-01-01T00:00:00Z",
+                 "bbox":{"min_lat":66.02,"min_lon":-176.01,"max_lat":66.03,"max_lon":-176.0},
+                 "ways":[{"way_id":555400,"way_tags":{"highway":"secondary","name":"Cell Read Street"},
+                 "centerline":[{"lat":66.024,"lon":-176.005},{"lat":66.026,"lon":-176.005}],
+                 "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
 
-                long versionBefore = source.resolutionVersion();
-                java.util.concurrent.atomic.AtomicReference<List<RoadSegment>> observedAtBump = new java.util.concurrent.atomic.AtomicReference<>();
-                java.util.concurrent.atomic.AtomicBoolean bumpSeen = new java.util.concurrent.atomic.AtomicBoolean(false);
-
-                Thread reader = new Thread(() -> {
-                    while (source.resolutionVersion() == versionBefore) {
-                        // tight busy-poll: no sleep, catch the earliest possible instant the version moves
-                    }
-                    bumpSeen.set(true);
-                    observedAtBump.set(source.cachedWaysForCellOrEmpty(lat, lon));
-                });
-                reader.start();
-
-                List<RoadSegment> fetched = source.waysForCell(lat, lon); // the real attemptFetch path: real HTTP, real disk write, then the version bump
-                reader.join(5_000);
-
-                assertTrue(bumpSeen.get(), "Trial " + trial + ": reader never observed the version bump within the join timeout");
-                assertTrue(!fetched.isEmpty(), "Trial " + trial + ": the real fetch itself must have found the way");
-                List<RoadSegment> atBump = observedAtBump.get();
-                assertTrue(atBump != null && !atBump.isEmpty(),
-                        "Trial " + trial + ": the instant the reader observed resolutionVersion advance, "
-                                + "cachedWaysForCellOrEmpty must already reflect the resolved way, never PENDING/empty");
-            } finally {
-                stub.stop(0);
-            }
-        }
-    }
-
-    /**
-     * MINECRAFT-586 comment 56067, a real bug in the previous {@code cellsCurrentlyPublishing}
-     * ref-count: {@code computeIfAbsent(key, ...).incrementAndGet()} fetches/creates the counter and
-     * increments it as two SEPARATE steps, so a second publication (B) could fetch the same counter
-     * object right before a first publication's (A) {@code endPublication} atomically decremented it
-     * to zero and detached it from the map -- B's later increment then landed on the orphaned object,
-     * leaving the map key absent (reported "not in flight") while B was still genuinely running. This
-     * forces the exact ordering the review named -- B begins while A is still in flight, A ends, and
-     * ONLY THEN does this assert the key is still reported in flight (because of B) -- proving the
-     * fixed atomic {@code compute}-based increment/decrement never loses a registration regardless of
-     * interleaving.
-     */
-    @Test
-    void anOverlappingSecondPublicationStaysRegisteredAcrossTheFirstOnesEnd(@TempDir Path cacheRoot) throws IOException {
         RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
-        double lat = 91.0, lon = 91.0; // unused by any other test in this class
 
-        assertTrue(!source.isPublicationInFlight(lat, lon), "Sanity: nothing published yet");
+        // Cold (first, disk-backed) reads.
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellRead(pendingLat, pendingLon).state());
+        assertTrue(source.cellRead(pendingLat, pendingLon).ways().isEmpty());
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellRead(emptyLat, emptyLon).state());
+        assertTrue(source.cellRead(emptyLat, emptyLon).ways().isEmpty());
+        assertEquals(RoadTileSource.CellState.READY, source.cellRead(readyLat, readyLon).state());
+        assertEquals(555400L, source.cellRead(readyLat, readyLon).ways().get(0).wayId());
 
-        source.beginPublicationForTests(lat, lon); // A begins (count -> 1)
-        assertTrue(source.isPublicationInFlight(lat, lon));
-
-        source.beginPublicationForTests(lat, lon); // B begins while A is still in flight (count -> 2)
-        assertTrue(source.isPublicationInFlight(lat, lon));
-
-        source.endPublicationForTests(lat, lon); // A ends (count -> 1): B is still running
-        assertTrue(source.isPublicationInFlight(lat, lon),
-                "Expected the cell to remain reported in flight after A ends, since B's own publication is still running");
-
-        source.endPublicationForTests(lat, lon); // B ends (count -> 0, key removed)
-        assertTrue(!source.isPublicationInFlight(lat, lon),
-                "Expected the cell to stop being reported in flight only once BOTH overlapping publications have ended");
+        // Warm (memory-backed) re-reads must agree, matching cellState/cachedWaysForCellOrEmpty.
+        assertEquals(source.cellState(emptyLat, emptyLon), source.cellRead(emptyLat, emptyLon).state());
+        assertEquals(source.cachedWaysForCellOrEmpty(emptyLat, emptyLon), source.cellRead(emptyLat, emptyLon).ways());
+        assertEquals(source.cellState(readyLat, readyLon), source.cellRead(readyLat, readyLon).state());
+        assertEquals(source.cachedWaysForCellOrEmpty(readyLat, readyLon), source.cellRead(readyLat, readyLon).ways());
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellRead(pendingLat, pendingLon).state(),
+                "A still-pending cell must keep reporting PENDING on a later call too -- never cached as confirmed-anything");
     }
-
-    /**
-     * The same invariant as {@link #anOverlappingSecondPublicationStaysRegisteredAcrossTheFirstOnesEnd},
-     * but hammered concurrently across many threads and iterations on one shared cell -- a stress-test
-     * companion to that deterministic, exact-ordering regression, confirming the fixed atomic
-     * {@code compute}-based ref-count never under- or over-counts under genuine thread contention
-     * either (the old {@code computeIfAbsent(...).incrementAndGet()} bug was a race, so a single
-     * deterministic ordering proves the specific named scenario but not freedom from every other
-     * possible interleaving).
-     */
-    @Test
-    void concurrentOverlappingPublicationsOnOneCellNeverLoseOrDoubleCountARegistration(@TempDir Path cacheRoot) throws IOException, InterruptedException {
-        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
-        double lat = 92.0, lon = 92.0; // unused by any other test in this class
-
-        int threads = 8;
-        int iterationsPerThread = 500;
-        var ready = new java.util.concurrent.CountDownLatch(threads);
-        var start = new java.util.concurrent.CountDownLatch(1);
-        var stillInFlightAtSomePoint = new java.util.concurrent.atomic.AtomicBoolean(false);
-        var sawFalselyNotInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
-        List<Thread> workers = new java.util.ArrayList<>();
-        for (int i = 0; i < threads; i++) {
-            Thread t = new Thread(() -> {
-                ready.countDown();
-                try {
-                    start.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                for (int iter = 0; iter < iterationsPerThread; iter++) {
-                    source.beginPublicationForTests(lat, lon);
-                    if (source.isPublicationInFlight(lat, lon)) stillInFlightAtSomePoint.set(true);
-                    else sawFalselyNotInFlight.set(true); // can never happen while THIS thread's own registration is up
-                    source.endPublicationForTests(lat, lon);
-                }
-            });
-            workers.add(t);
-            t.start();
-        }
-        ready.await();
-        start.countDown();
-        for (Thread t : workers) t.join(10_000);
-
-        assertTrue(stillInFlightAtSomePoint.get(), "Sanity: expected at least one begin/check/end to observe itself in flight");
-        assertTrue(!sawFalselyNotInFlight.get(),
-                "Expected isPublicationInFlight to NEVER report false for a cell with a registration this same thread just began and has not yet ended");
-        assertTrue(!source.isPublicationInFlight(lat, lon),
-                "Expected the ref-count to settle back to exactly zero (key fully removed) once every thread's begin/end pairs have all completed");
-    }
-
 }
