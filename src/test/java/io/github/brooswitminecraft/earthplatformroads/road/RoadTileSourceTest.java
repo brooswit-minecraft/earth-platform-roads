@@ -981,4 +981,90 @@ class RoadTileSourceTest {
             }
         }
     }
+
+    /**
+     * MINECRAFT-586 comment 56067, a real bug in the previous {@code cellsCurrentlyPublishing}
+     * ref-count: {@code computeIfAbsent(key, ...).incrementAndGet()} fetches/creates the counter and
+     * increments it as two SEPARATE steps, so a second publication (B) could fetch the same counter
+     * object right before a first publication's (A) {@code endPublication} atomically decremented it
+     * to zero and detached it from the map -- B's later increment then landed on the orphaned object,
+     * leaving the map key absent (reported "not in flight") while B was still genuinely running. This
+     * forces the exact ordering the review named -- B begins while A is still in flight, A ends, and
+     * ONLY THEN does this assert the key is still reported in flight (because of B) -- proving the
+     * fixed atomic {@code compute}-based increment/decrement never loses a registration regardless of
+     * interleaving.
+     */
+    @Test
+    void anOverlappingSecondPublicationStaysRegisteredAcrossTheFirstOnesEnd(@TempDir Path cacheRoot) throws IOException {
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        double lat = 91.0, lon = 91.0; // unused by any other test in this class
+
+        assertTrue(!source.isPublicationInFlight(lat, lon), "Sanity: nothing published yet");
+
+        source.beginPublicationForTests(lat, lon); // A begins (count -> 1)
+        assertTrue(source.isPublicationInFlight(lat, lon));
+
+        source.beginPublicationForTests(lat, lon); // B begins while A is still in flight (count -> 2)
+        assertTrue(source.isPublicationInFlight(lat, lon));
+
+        source.endPublicationForTests(lat, lon); // A ends (count -> 1): B is still running
+        assertTrue(source.isPublicationInFlight(lat, lon),
+                "Expected the cell to remain reported in flight after A ends, since B's own publication is still running");
+
+        source.endPublicationForTests(lat, lon); // B ends (count -> 0, key removed)
+        assertTrue(!source.isPublicationInFlight(lat, lon),
+                "Expected the cell to stop being reported in flight only once BOTH overlapping publications have ended");
+    }
+
+    /**
+     * The same invariant as {@link #anOverlappingSecondPublicationStaysRegisteredAcrossTheFirstOnesEnd},
+     * but hammered concurrently across many threads and iterations on one shared cell -- a stress-test
+     * companion to that deterministic, exact-ordering regression, confirming the fixed atomic
+     * {@code compute}-based ref-count never under- or over-counts under genuine thread contention
+     * either (the old {@code computeIfAbsent(...).incrementAndGet()} bug was a race, so a single
+     * deterministic ordering proves the specific named scenario but not freedom from every other
+     * possible interleaving).
+     */
+    @Test
+    void concurrentOverlappingPublicationsOnOneCellNeverLoseOrDoubleCountARegistration(@TempDir Path cacheRoot) throws IOException, InterruptedException {
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+        double lat = 92.0, lon = 92.0; // unused by any other test in this class
+
+        int threads = 8;
+        int iterationsPerThread = 500;
+        var ready = new java.util.concurrent.CountDownLatch(threads);
+        var start = new java.util.concurrent.CountDownLatch(1);
+        var stillInFlightAtSomePoint = new java.util.concurrent.atomic.AtomicBoolean(false);
+        var sawFalselyNotInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
+        List<Thread> workers = new java.util.ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Thread t = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                for (int iter = 0; iter < iterationsPerThread; iter++) {
+                    source.beginPublicationForTests(lat, lon);
+                    if (source.isPublicationInFlight(lat, lon)) stillInFlightAtSomePoint.set(true);
+                    else sawFalselyNotInFlight.set(true); // can never happen while THIS thread's own registration is up
+                    source.endPublicationForTests(lat, lon);
+                }
+            });
+            workers.add(t);
+            t.start();
+        }
+        ready.await();
+        start.countDown();
+        for (Thread t : workers) t.join(10_000);
+
+        assertTrue(stillInFlightAtSomePoint.get(), "Sanity: expected at least one begin/check/end to observe itself in flight");
+        assertTrue(!sawFalselyNotInFlight.get(),
+                "Expected isPublicationInFlight to NEVER report false for a cell with a registration this same thread just began and has not yet ended");
+        assertTrue(!source.isPublicationInFlight(lat, lon),
+                "Expected the ref-count to settle back to exactly zero (key fully removed) once every thread's begin/end pairs have all completed");
+    }
+
 }

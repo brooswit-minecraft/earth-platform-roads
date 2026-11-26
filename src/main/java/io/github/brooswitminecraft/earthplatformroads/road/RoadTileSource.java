@@ -143,25 +143,51 @@ public final class RoadTileSource {
      * for free: {@code increment} on entry, {@code decrement-and-remove-if-zero} on exit, so the key
      * is only ever absent when the TRUE number of in-flight publications for that cell is zero,
      * regardless of how many started and finished, in whatever order, overlapping or not.
+     *
+     * <p>Both {@code beginPublication} and {@code endPublication} do their increment/decrement
+     * entirely INSIDE a single {@code compute} remapping call, never as a separate step after
+     * fetching/creating the counter (review MINECRAFT-586 comment 56067): {@code
+     * computeIfAbsent(key, ...).incrementAndGet()} looks equivalent but is actually two operations --
+     * the atomic map lookup/insert, then a SEPARATE, unsynchronized {@code incrementAndGet} on
+     * whatever {@code AtomicInteger} it returned. A second publication can fetch that same object
+     * right before a first publication's {@code endPublication} decrements it to zero and detaches it
+     * from the map; the second publication then increments the now-orphaned object, leaving the map
+     * key absent while that publication is still running. {@code ConcurrentHashMap.compute} has no
+     * such gap: the whole remapping function for a given key runs under that key's own bin lock, so
+     * the read-modify-write is a single atomic step and the stored value (a plain boxed {@code
+     * Integer}, not a separately-mutable object) can never be observed or changed mid-update.
      */
-    private final ConcurrentHashMap<Long, AtomicInteger> cellsCurrentlyPublishing = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Integer> cellsCurrentlyPublishing = new ConcurrentHashMap<>();
 
     /** Marks this cell as having one more publication in flight; see {@link #cellsCurrentlyPublishing}'s own doc. */
     private void beginPublication(long key) {
-        cellsCurrentlyPublishing.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+        cellsCurrentlyPublishing.compute(key, (k, count) -> count == null ? 1 : count + 1);
     }
 
     /** Marks this cell as having one fewer publication in flight, removing the entry entirely once the count reaches zero. */
     private void endPublication(long key) {
-        cellsCurrentlyPublishing.computeIfPresent(key, (k, count) -> count.decrementAndGet() <= 0 ? null : count);
+        cellsCurrentlyPublishing.compute(key, (k, count) -> (count == null || count <= 1) ? null : count - 1);
+    }
+
+    private static long cellKey(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        return (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
     }
 
     /** Whether the cell covering {@code lat,lon} has one or more publications actively in flight right now; see {@link #cellsCurrentlyPublishing}'s own doc. */
     boolean isPublicationInFlight(double lat, double lon) {
-        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
-        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
-        long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
-        return cellsCurrentlyPublishing.containsKey(key);
+        return cellsCurrentlyPublishing.containsKey(cellKey(lat, lon));
+    }
+
+    /** Test-only direct access to {@link #beginPublication}, by lat/lon rather than the internal cell key. */
+    void beginPublicationForTests(double lat, double lon) {
+        beginPublication(cellKey(lat, lon));
+    }
+
+    /** Test-only direct access to {@link #endPublication}, by lat/lon rather than the internal cell key. */
+    void endPublicationForTests(double lat, double lon) {
+        endPublication(cellKey(lat, lon));
     }
 
     /**
