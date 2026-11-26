@@ -68,12 +68,16 @@ public abstract class EarthGeneratorRoadMixin {
         // mixin paints an at-grade road, not a causeway or ford.
         if (water != SurfaceGenerator.DRY && water >= y) return;
         EarthGenerator self = (EarthGenerator) (Object) this;
-        RoadSegment segment = RoadNetwork.segmentCoveringColumn(self.grid(), x, z);
+        // MINECRAFT-586: one scoped cache for this single column's whole surface() call, including
+        // the up-to-120-lookup ring scan below -- see RoadNetwork.ScopedLookupCache's own doc for why
+        // reusing it only within this one synchronous call carries no staleness risk.
+        RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+        RoadSegment segment = RoadNetwork.segmentCoveringColumn(self.grid(), x, z, cache);
         if (segment == null) return;
         RoadSegment.CrossSection crossSection = segment.crossSectionAt(self.grid(), x, z);
         if (crossSection == RoadSegment.CrossSection.OFF_ROAD) return; // excluded (bridge/tunnel) way's own footprint check already ran in segmentCoveringColumn
         SurfaceGenerator.Surface original = cir.getReturnValue();
-        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y);
+        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y, cache);
         int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(distance);
         BlockState under = underSurfaceFor(crossSection);
         BlockState top = topSurfaceFor(crossSection, layers);
@@ -125,14 +129,15 @@ public abstract class EarthGeneratorRoadMixin {
      * terrain or someone else's road, neither of which this column's own surface should try to
      * match.
      */
-    private static int nearestLowerSameRoadDistance(EarthGenerator self, RoadSegment segment, int x, int z, int y) {
+    private static int nearestLowerSameRoadDistance(
+            EarthGenerator self, RoadSegment segment, int x, int z, int y, RoadNetwork.ScopedLookupCache cache) {
         var grid = self.grid();
         for (int distance = 1; distance <= RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE; distance++) {
             for (int ddx = -distance; ddx <= distance; ddx++) {
                 for (int ddz = -distance; ddz <= distance; ddz++) {
                     if (Math.max(Math.abs(ddx), Math.abs(ddz)) != distance) continue; // only this ring, not the filled square
                     int nx = x + ddx, nz = z + ddz;
-                    RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz);
+                    RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz, cache);
                     if (neighborSegment == null || neighborSegment.wayId() != segment.wayId()) continue;
                     if (self.surfaceY(nx, nz) < y) return distance;
                 }

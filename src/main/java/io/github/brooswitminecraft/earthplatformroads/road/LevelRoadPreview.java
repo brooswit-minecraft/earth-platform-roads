@@ -72,9 +72,15 @@ public final class LevelRoadPreview {
         Map<RoadSegment, Way> sectionGeometry = new IdentityHashMap<>();
         var accepted = plans(earth);
         boolean changed = false;
+        // MINECRAFT-586: one scoped cache for this whole 256-column section loop -- every column in
+        // a 16x16 section ordinarily falls in the exact same RoadNetwork.CELL_DEGREES cell, so without
+        // this the loop would otherwise repeat the identical disk-cache reads up to 256 times. See
+        // RoadNetwork.ScopedLookupCache's own doc for why reusing it only within this one call (never
+        // across sections) carries no staleness risk.
+        RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
         for (int lx = 0; lx < 16; lx++) for (int lz = 0; lz < 16; lz++) {
             int x = x0 + lx, z = z0 + lz;
-            RoadSegment road = RoadNetwork.segmentCoveringColumn(grid, x, z);
+            RoadSegment road = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
             if (road == null || road.wayId() <= 0 || road.bridge() || road.tunnel()
                     || road.pavedHalfWidthBlocks() > 8.0 || road.centerline().length > MAX_NODES) continue;
             var zone = road.crossSectionAt(grid, x, z);

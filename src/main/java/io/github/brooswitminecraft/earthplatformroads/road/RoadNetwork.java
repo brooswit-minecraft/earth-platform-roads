@@ -342,6 +342,41 @@ public final class RoadNetwork {
     }
 
     /**
+     * MINECRAFT-586: a short-lived, caller-owned cache of {@link #candidatesNear}'s per-neighbor-cell
+     * {@link RoadTileSource#cachedWaysForCellOrEmpty} reads, scoped to ONE generation pass over many
+     * columns that repeatedly re-derive the same cell -- e.g. {@code EarthGeneratorRoadMixin}'s
+     * {@code nearestLowerSameRoadDistance} (up to 120 {@link #segmentCoveringColumn} calls for one
+     * column, heavily overlapping Moore neighborhoods between adjacent ring positions) and
+     * {@link LevelRoadPreview#apply}'s 256-column section loop (every column in one 16x16 section
+     * typically falls in the same {@value #CELL_DEGREES}-degree cell, so 256 calls would otherwise
+     * repeat the exact same disk-cache reads). MINECRAFT-584 measured this as the hottest leaf cost
+     * ({@code RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case)
+     * -- see that ticket's JFR findings.
+     *
+     * <p>Deliberately NOT a persistent, cross-call cache (that would risk exactly the
+     * "never treat pending as confirmed empty" / stale-paint hazard {@link RoadTileSource}'s own
+     * {@code pendingIsNeverCachedAndAFreshInstanceStillReadsTheRealDiskStateAfterAnEarlierInstanceSawPending}
+     * test guards against, since a cell can resolve between arbitrary calls). This cache is instead
+     * created fresh per generation pass by {@link #freshScopedLookupCache()} and discarded once that
+     * pass returns -- nothing within a single synchronous pass over this cache's own reads can itself
+     * cause a cell covered by that SAME pass to resolve (none of {@link #candidatesNear}'s calls ever
+     * fetch), so reusing an answer within one pass carries no staleness risk the pass did not already
+     * have reading disk directly; the very next pass (the next column surfaced, the next section
+     * previewed) always calls {@link #freshScopedLookupCache()} again and sees the real, current
+     * state, including anything that resolved meanwhile. Passing {@code null} anywhere this is
+     * accepted below disables the cache entirely and reads through to {@link RoadTileSource} exactly
+     * as before -- used by every caller not on this measured hot path.
+     */
+    public static final class ScopedLookupCache {
+        private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
+    }
+
+    /** A fresh, empty {@link ScopedLookupCache} for one generation pass; see that class's own doc. */
+    public static ScopedLookupCache freshScopedLookupCache() {
+        return new ScopedLookupCache();
+    }
+
+    /**
      * The first mapped at-grade way covering this column, or {@code null} if none does. A mapped
      * bridge or tunnel way never matches here -- this mod cannot yet render a grade-separated
      * crossing correctly, and the ticket is explicit that an unsupported gap must be reported, not
@@ -349,8 +384,13 @@ public final class RoadNetwork {
      * {@link #excludedBridgesAndTunnels()} for the explicit list of what that excludes).
      */
     public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z) {
+        return segmentCoveringColumn(grid, x, z, null);
+    }
+
+    /** {@link #segmentCoveringColumn(MercatorGrid, int, int)}, reusing {@code cache} (see {@link ScopedLookupCache}) across repeated calls within one generation pass; {@code null} behaves exactly like the no-cache overload. */
+    public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z, ScopedLookupCache cache) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), cache)) {
             if (segment.bridge() || segment.tunnel()) continue;
             if (segment.coversColumn(grid, x, z)) return segment;
         }
@@ -388,7 +428,7 @@ public final class RoadNetwork {
     public static ColumnDiagnosis diagnoseColumn(MercatorGrid grid, int x, int z) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
         boolean anyBridgeOrTunnelCovers = false;
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), null)) {
             if (segment.coversColumn(grid, x, z)) {
                 if (segment.bridge() || segment.tunnel()) {
                     anyBridgeOrTunnelCovers = true;
@@ -451,7 +491,7 @@ public final class RoadNetwork {
      * never exercised that deadline. This version needs no additional network calls at all, so it
      * cannot run into that problem.
      */
-    private static List<RoadSegment> candidatesNear(double lat, double lon) {
+    private static List<RoadSegment> candidatesNear(double lat, double lon, ScopedLookupCache cache) {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
@@ -459,7 +499,18 @@ public final class RoadNetwork {
         List<RoadSegment> fromTiles = new ArrayList<>();
         for (int dLat = -1; dLat <= 1; dLat++) {
             for (int dLon = -1; dLon <= 1; dLon++) {
-                fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+                double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
+                if (cache == null) {
+                    fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon));
+                } else {
+                    // Keyed by the neighbor cell itself (not the center lat/lon) so overlapping
+                    // Moore neighborhoods from DIFFERENT centers -- the common case across a ring
+                    // scan or a section's columns -- actually share hits, not just repeats of the
+                    // exact same center.
+                    long neighborKey = cellKey(neighborLat, neighborLon);
+                    fromTiles.addAll(cache.perCellTileReads.computeIfAbsent(neighborKey,
+                            k -> tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon)));
+                }
             }
         }
         if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
