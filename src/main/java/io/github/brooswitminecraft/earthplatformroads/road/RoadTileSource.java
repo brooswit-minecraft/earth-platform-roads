@@ -883,7 +883,22 @@ public final class RoadTileSource {
         } catch (IOException e) {
             throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
         }
+        uncachedPendingReadCount.incrementAndGet();
         return null;
+    }
+
+    /**
+     * MINECRAFT-586: counts every uncached disk check this method performs for a cell that is still
+     * PENDING -- MINECRAFT-584's own measured bottleneck ({@code readDiskCacheUncached} as the
+     * hottest leaf method, via exactly this never-memoized branch). Test-only; lets
+     * {@code RoadNetworkScopedLookupCacheTest} measure, directly and exactly, how many of these this
+     * class's own dedupe fix actually avoids, rather than only inferring it from wall-clock timing.
+     */
+    private final AtomicLong uncachedPendingReadCount = new AtomicLong();
+
+    /** The current value of {@link #uncachedPendingReadCount}; see that field's own doc. */
+    long uncachedPendingReadCountForTests() {
+        return uncachedPendingReadCount.get();
     }
 
     /**

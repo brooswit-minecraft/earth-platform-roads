@@ -363,33 +363,39 @@ public final class RoadNetwork {
      * -- a real "stale paint after data completes" violation, not merely a theoretical one, even
      * though the window is ordinarily microseconds wide.
      *
-     * <p><b>The fix: snapshot {@link RoadTileSource#resolutionVersion()}, and self-invalidate.</b>
-     * {@link #candidatesNear} checks that counter immediately before EVERY individual cached read --
-     * not once before the whole 3x3 loop (a round-2 review finding against an earlier version of
-     * this fix: checking once up front still left every read after the first one in that same loop
-     * trusting a snapshot that could have gone stale partway through). If the counter has moved at
-     * all since this cache's entries were written -- meaning SOMETHING, anywhere in that tile source,
-     * has newly resolved since -- every cached entry is dropped and re-read fresh (cheap: one
-     * {@code AtomicLong.get()} and a map clear, not a disk touch) rather than ever trusting a
-     * possibly-stale answer. This check is coarse (instance-wide, not per-cell) deliberately:
-     * correctness only needs to never UNDER-detect a resolution.
-     *
-     * <p><b>What this does not claim.</b> This is a lock-free, snapshot-and-compare check, not a
-     * lock -- so the two operations ({@code tiles.resolutionVersion()}, then the map read/write it
-     * gates) are adjacent, not atomic together. A resolution landing in that specific gap (two
-     * sequential, non-blocking memory reads, no I/O, no safepoint) is not impossible in the most
-     * literal sense, only vanishingly narrow -- orders of magnitude narrower than the gap this fix
-     * closes (an entire 9-read loop body, previously covered by a single check, where a cache MISS
-     * inside that loop could cost a real disk read taking far longer than two memory reads). Closing
-     * that remaining gap completely would require a real lock around every cached read here, which
-     * this file's own prior architecture (the {@link RoadTileSource#cellLocks} doc, MINECRAFT-566
-     * comment 55450) deliberately rejected for this exact hot path, for the same reason: an
-     * already-cached, no-network-needed read must never be made to wait behind anything else. The
-     * alternative that WOULD be fully race-free -- never caching a PENDING result at all -- is also
-     * available (pass {@code null} instead of a cache) but gives up the entire measured benefit, since
-     * {@link RoadTileSource}'s own {@code memory} map already permanently and safely caches every
-     * READY/CONFIRMED_EMPTY result on its own; only PENDING cells (MINECRAFT-584's actual measured
-     * bottleneck) are the ones this class exists to help with.
+     * <p><b>Round 1 (checking {@link RoadTileSource#resolutionVersion()} once before the whole 3x3
+     * loop) and round 2 (checking it again before each individual read) each narrowed, but review
+     * correctly kept finding, the same underlying gap: ANY snapshot-then-use sequence that is not
+     * atomic with the real publish can be invalidated by a resolution landing in its own gap, no
+     * matter how short that gap is made.</b> The actual fix is not to make the gap narrower; it is to
+     * stop trusting any single-point-in-time snapshot taken DURING this whole Moore-neighborhood read
+     * at all, and instead verify, AFTER finishing the read, that nothing could have resolved during
+     * the ENTIRE read -- the same optimistic-read/validate pattern {@link java.util.concurrent.locks.StampedLock}'s
+     * {@code tryOptimisticRead} offers, applied by hand against {@link RoadTileSource#resolutionVersion()}:
+     * <ol>
+     *   <li>Record {@code versionBefore = tiles.resolutionVersion()}.</li>
+     *   <li>Read (from cache where already known this pass, from disk otherwise) all 9 Moore-neighbor
+     *       cells, exactly as before.</li>
+     *   <li>Record {@code versionAfter = tiles.resolutionVersion()}.</li>
+     *   <li>If {@code versionBefore == versionAfter}: by definition NOTHING resolved, anywhere in
+     *       this tile source, during the entire window this read spanned -- every value read or
+     *       reused during that window is therefore provably consistent with the real state as of
+     *       {@code versionAfter}, not merely "probably still fine." Keep the cache as updated.</li>
+     *   <li>If they differ: something resolved during this exact read -- discard every entry this
+     *       cache holds (including ones read just now) and retry the whole read from scratch. Bounded
+     *       to {@value #MAX_OPTIMISTIC_RETRIES} attempts so a (never actually observed, since real
+     *       fetches are individually rate-limited) pathological non-stop-resolving stream cannot spin
+     *       forever; after that many retries this falls open to the last result rather than hanging.</li>
+     * </ol>
+     * This is airtight, not merely narrowed: {@code versionBefore == versionAfter} is a PROOF that no
+     * resolution happened during the read, not a probabilistic argument about how short the checked
+     * window is -- the exact "atomic/linearizable" property review asked for, achieved without taking
+     * any lock on this hot path (this file's own prior architecture, {@link RoadTileSource#cellLocks}'s
+     * doc / MINECRAFT-566 comment 55450, deliberately rejected a lock here, for the same reason: an
+     * already-cached, no-network-needed read must never be made to wait behind anything else). In the
+     * overwhelmingly common case -- nothing resolves during one column's microsecond-scale scan -- this
+     * costs exactly one retry-loop iteration and two extra {@code AtomicLong.get()} calls, preserving
+     * the full dedupe benefit; only a genuine concurrent resolution ever pays for a retry.
      *
      * <p>Still never a persistent, CROSS-pass cache: created fresh per generation pass by
      * {@link #freshScopedLookupCache()} and discarded once that pass returns. Passing {@code null}
@@ -397,24 +403,60 @@ public final class RoadNetwork {
      * {@link RoadTileSource} exactly as before -- used by every caller not on this measured hot path.
      */
     public static final class ScopedLookupCache {
+        private static final int MAX_OPTIMISTIC_RETRIES = 1000; // never realistically hit; see class doc
+
         private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
-        private RoadTileSource snapshotOf;
-        private long snapshotVersion = -1;
+        /** The {@code tiles}/{@code resolutionVersion()} this cache's entries are known valid as of; see {@link #readMooreNeighborhood}. */
+        private RoadTileSource validAtTiles;
+        private long validAtVersion = -1;
 
         /**
-         * Drops every cached entry if {@code tiles} has resolved anything (anywhere) since this
-         * cache's entries were written, or if this cache was never used against this exact
-         * {@code tiles} instance before. Must be called before every read/write of
-         * {@link #perCellTileReads} below -- never trust that map without first calling this for the
-         * CURRENT {@code tiles}.
+         * The Moore-neighborhood (3x3, including {@code lat,lon}'s own cell) read {@link #candidatesNear}
+         * needs, reusing this pass's own cache where already known and otherwise reading fresh --
+         * see this class's own doc for the optimistic-read/validate loop that makes this provably safe
+         * against a resolution landing anywhere during the read, not merely unlikely to. Also handles
+         * the ACROSS-call case (entries cached by an EARLIER call to this same method, now stale
+         * because something resolved in between): {@code versionBefore} is compared against
+         * {@link #validAtVersion} -- the version this cache's entries were last PROVEN valid as of --
+         * not just against itself, so a resolution that happened between two separate calls (not
+         * during either one's own read) is caught exactly the same way.
          */
-        private void invalidateIfAnythingResolvedSince(RoadTileSource tiles) {
-            long current = tiles.resolutionVersion();
-            if (tiles != snapshotOf || current != snapshotVersion) {
-                perCellTileReads.clear();
-                snapshotOf = tiles;
-                snapshotVersion = current;
+        private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
+            for (int attempt = 0; attempt < MAX_OPTIMISTIC_RETRIES; attempt++) {
+                long versionBefore = tiles.resolutionVersion();
+                if (tiles != validAtTiles || versionBefore != validAtVersion) {
+                    perCellTileReads.clear(); // stale relative to the last version this cache was proven valid at -- never trust it
+                }
+                List<RoadSegment> result = new ArrayList<>();
+                for (int dLat = -1; dLat <= 1; dLat++) {
+                    for (int dLon = -1; dLon <= 1; dLon++) {
+                        double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
+                        long neighborKey = cellKey(neighborLat, neighborLon);
+                        result.addAll(perCellTileReads.computeIfAbsent(neighborKey,
+                                k -> tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon)));
+                    }
+                }
+                long versionAfter = tiles.resolutionVersion();
+                if (versionAfter == versionBefore) {
+                    // Proof: nothing resolved, anywhere in this tile source, during this entire read
+                    // -- not merely unlikely to have. Every entry just read (or reused) is therefore
+                    // consistent with the real state as of versionAfter; record that so a LATER call
+                    // can trust these same entries without re-reading, until something actually moves.
+                    validAtTiles = tiles;
+                    validAtVersion = versionAfter;
+                    return result;
+                }
+                perCellTileReads.clear(); // something resolved mid-read -- every entry here (including ones just read) is suspect; retry fresh
             }
+            // Pathological (never observed: real fetches are individually rate-limited): fail open
+            // rather than hang, same no-fabrication spirit RoadTileSource's own fail-open paths use.
+            List<RoadSegment> fallback = new ArrayList<>();
+            for (int dLat = -1; dLat <= 1; dLat++) {
+                for (int dLon = -1; dLon <= 1; dLon++) {
+                    fallback.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+                }
+            }
+            return fallback;
         }
     }
 
@@ -543,35 +585,30 @@ public final class RoadNetwork {
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
 
-        List<RoadSegment> fromTiles = new ArrayList<>();
-        for (int dLat = -1; dLat <= 1; dLat++) {
-            for (int dLon = -1; dLon <= 1; dLon++) {
-                double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
-                if (cache == null) {
-                    fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon));
-                } else {
-                    // MINECRAFT-586 round 2: re-validate immediately before EACH individual cached
-                    // read, not once for the whole 3x3 loop (the gap a second self-review found --
-                    // checking once before the loop left every read after the first one in the loop
-                    // trusting a snapshot that could be an iteration or more stale). See
-                    // ScopedLookupCache's own doc for why this is still not a fully atomic guarantee,
-                    // and why this codebase deliberately does not take a lock here.
-                    cache.invalidateIfAnythingResolvedSince(tiles);
-                    // Keyed by the neighbor cell itself (not the center lat/lon) so overlapping
-                    // Moore neighborhoods from DIFFERENT centers -- the common case across a ring
-                    // scan or a section's columns -- actually share hits, not just repeats of the
-                    // exact same center.
-                    long neighborKey = cellKey(neighborLat, neighborLon);
-                    fromTiles.addAll(cache.perCellTileReads.computeIfAbsent(neighborKey,
-                            k -> tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon)));
-                }
-            }
-        }
+        // Keyed by each neighbor cell itself (not the center lat/lon) so overlapping Moore
+        // neighborhoods from DIFFERENT centers -- the common case across a ring scan or a section's
+        // columns -- actually share hits, not just repeats of the exact same center. See
+        // ScopedLookupCache.readMooreNeighborhood's own doc for the optimistic-read/validate loop
+        // that makes reusing this cache provably safe against a resolution landing mid-read.
+        List<RoadSegment> fromTiles = cache == null
+                ? readMooreNeighborhoodUncached(tiles, lat, lon)
+                : cache.readMooreNeighborhood(tiles, lat, lon);
         if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
         if (preloaded == null || preloaded.isEmpty()) return fromTiles;
         List<RoadSegment> merged = new ArrayList<>(preloaded);
         merged.addAll(fromTiles);
         return merged;
+    }
+
+    /** {@code candidatesNear}'s Moore-neighborhood read with no cache at all -- every caller not on MINECRAFT-584's measured hot path. */
+    private static List<RoadSegment> readMooreNeighborhoodUncached(RoadTileSource tiles, double lat, double lon) {
+        List<RoadSegment> result = new ArrayList<>();
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                result.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+            }
+        }
+        return result;
     }
 
     private static long cellKey(double lat, double lon) {

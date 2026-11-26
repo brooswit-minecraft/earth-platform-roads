@@ -28,13 +28,17 @@ import org.junit.jupiter.api.io.TempDir;
  * RoadNetwork#segmentCoveringColumn(MercatorGrid, int, int, RoadNetwork.ScopedLookupCache)} calls
  * within ONE generation pass -- never across passes.
  *
- * <p>An earlier version of this cache memoized a PENDING miss unconditionally, which a review
- * (self-review finding on PR #11) correctly rejected: it could mask a cell that resolves DURING the
- * same pass (a concurrent background prefetch, e.g. {@code EarthGeneratorPrepareMixin}'s own
- * fetch-ahead-of-generation path, completing mid-scan), violating the ticket's explicit "no stale
- * paint after data completes" / "never treat pending as confirmed empty" constraints. The fix
- * snapshots {@link RoadTileSource#resolutionVersion()} and self-invalidates the whole cache the
- * moment that counter moves -- see {@link RoadNetwork.ScopedLookupCache}'s own doc.
+ * <p>Two earlier versions were rejected by review for the same underlying reason -- any
+ * snapshot-then-use sequence that is not atomic with a real resolution can be invalidated by a
+ * resolution landing in its own gap, no matter how narrow that gap is made (round 1: checked
+ * {@code resolutionVersion()} once before the whole 3x3 read; round 2: checked it again before each
+ * individual read, still not atomic with the read itself). The actual fix wraps the WHOLE
+ * Moore-neighborhood read in an optimistic-read/validate loop (the same pattern {@link
+ * java.util.concurrent.locks.StampedLock}'s {@code tryOptimisticRead} offers, applied by hand against
+ * {@link RoadTileSource#resolutionVersion()}): read the version before, do the whole read, read the
+ * version after; if unchanged, that is a PROOF nothing resolved during the entire read, not merely a
+ * narrow-window argument; if changed, discard everything and retry. See
+ * {@link RoadNetwork.ScopedLookupCache}'s own doc for the full reasoning.
  *
  * <p>{@link #pendingCellResolvedByARealFetchDuringTheSamePassIsObservedNotMasked} is the regression
  * the self-review required: it resolves the cell via a REAL {@link RoadTileSource#waysForCell} call
@@ -265,6 +269,60 @@ class RoadNetworkScopedLookupCacheTest {
             }
         } finally {
             stub.stop(0);
+        }
+    }
+
+    /**
+     * MINECRAFT-571 comment 56032 / Wroosbit's review (comment 56040): "show that the corrected code
+     * still reduces disk reads rather than just avoiding the regression" -- direct, exact evidence
+     * via {@link RoadTileSource#uncachedPendingReadCountForTests()} (not inferred from wall-clock
+     * timing), simulating {@code EarthGeneratorRoadMixin.nearestLowerSameRoadDistance}'s own real
+     * shape: a {@value RoadSurfaceLayering#MAX_NEIGHBOR_DISTANCE}-ring, {@code 8*distance}-per-ring
+     * Chebyshev scan (120 total column lookups), each a real {@code segmentCoveringColumn} call with
+     * its own 3x3 Moore-neighborhood read -- for a cell that never resolves (PENDING throughout,
+     * exactly the common case MINECRAFT-584 measured as the hottest leaf cost).
+     */
+    @Test
+    void scopedCacheStillSubstantiallyReducesUncachedPendingDiskReadsForARingScan(@TempDir Path tmp) throws Exception {
+        MercatorGrid grid = new MercatorGrid(1);
+        int centerX = 300_000, centerZ = 300_000;
+
+        Path regionsUncached = Files.createDirectories(tmp.resolve("regions-uncached"));
+        RoadNetwork.resetForTests(regionsUncached);
+        var tilesUncached = new RoadTileSource(URI.create("http://127.0.0.1:1/"), tmp.resolve("cache-uncached"), false, Duration.ofSeconds(1));
+        RoadNetwork.setTileSourceForTests(tilesUncached);
+        long beforeUncached = tilesUncached.uncachedPendingReadCountForTests();
+        runRingScan(grid, centerX, centerZ, null);
+        long uncachedReads = tilesUncached.uncachedPendingReadCountForTests() - beforeUncached;
+
+        Path regionsCached = Files.createDirectories(tmp.resolve("regions-cached"));
+        RoadNetwork.resetForTests(regionsCached);
+        var tilesCached = new RoadTileSource(URI.create("http://127.0.0.1:1/"), tmp.resolve("cache-cached"), false, Duration.ofSeconds(1));
+        RoadNetwork.setTileSourceForTests(tilesCached);
+        long beforeCached = tilesCached.uncachedPendingReadCountForTests();
+        runRingScan(grid, centerX, centerZ, RoadNetwork.freshScopedLookupCache());
+        long cachedReads = tilesCached.uncachedPendingReadCountForTests() - beforeCached;
+
+        assertTrue(uncachedReads > 500,
+                "Sanity check on the uncached baseline itself: expected close to the ticket's own up-to-~1089 "
+                        + "ceiling for a 120-lookup ring scan, got " + uncachedReads);
+        assertTrue(cachedReads <= 9,
+                "Expected the scoped cache to collapse this ring scan's up to 1089 uncached PENDING "
+                        + "reads down to at most the one real 3x3 neighborhood's worth (9), got " + cachedReads);
+        assertTrue(cachedReads < uncachedReads / 10,
+                "Expected at least a 10x reduction; uncached=" + uncachedReads + " cached=" + cachedReads);
+    }
+
+    /** {@code EarthGeneratorRoadMixin.nearestLowerSameRoadDistance}'s own ring-scan shape, reused here for measurement only. */
+    private static void runRingScan(MercatorGrid grid, int x, int z, RoadNetwork.ScopedLookupCache cache) {
+        RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
+        for (int distance = 1; distance <= RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE; distance++) {
+            for (int ddx = -distance; ddx <= distance; ddx++) {
+                for (int ddz = -distance; ddz <= distance; ddz++) {
+                    if (Math.max(Math.abs(ddx), Math.abs(ddz)) != distance) continue; // only this ring, not the filled square
+                    RoadNetwork.segmentCoveringColumn(grid, x + ddx, z + ddz, cache);
+                }
+            }
         }
     }
 }
