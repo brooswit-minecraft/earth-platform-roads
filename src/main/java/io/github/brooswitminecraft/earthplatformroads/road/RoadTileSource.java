@@ -131,15 +131,37 @@ public final class RoadTileSource {
      * complete, in which case {@link #resolutionVersion} has already moved too and {@code
      * ScopedLookupCache}'s own version check catches it independently. The two checks together cover
      * the whole timeline with no remaining gap between them.
+     *
+     * <p><b>Ref-counted, not a plain boolean flag</b> (an explicit ask reviewed alongside round 7,
+     * Jira comment 56065: "count overlapping writers"): every {@code attemptFetch}/{@code
+     * waysForCellDetailed}/{@code enqueueLookahead} call path already serializes on this exact cell's
+     * own {@link #cellLocks} entry before ever calling {@link #attemptFetch}, so two publications for
+     * the SAME cell overlapping in time should never actually happen today -- but a plain boolean
+     * {@code remove()} would be WRONG if that ever changed (a second, still-in-flight publication's
+     * own {@code add} would be masked by the first publication's {@code remove}, prematurely reporting
+     * "not in flight" while the second one is still running). A per-cell count removes that fragility
+     * for free: {@code increment} on entry, {@code decrement-and-remove-if-zero} on exit, so the key
+     * is only ever absent when the TRUE number of in-flight publications for that cell is zero,
+     * regardless of how many started and finished, in whatever order, overlapping or not.
      */
-    private final java.util.Set<Long> cellsCurrentlyPublishing = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Long, AtomicInteger> cellsCurrentlyPublishing = new ConcurrentHashMap<>();
 
-    /** Whether the cell covering {@code lat,lon} is actively publishing right now; see {@link #cellsCurrentlyPublishing}'s own doc. */
+    /** Marks this cell as having one more publication in flight; see {@link #cellsCurrentlyPublishing}'s own doc. */
+    private void beginPublication(long key) {
+        cellsCurrentlyPublishing.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+    }
+
+    /** Marks this cell as having one fewer publication in flight, removing the entry entirely once the count reaches zero. */
+    private void endPublication(long key) {
+        cellsCurrentlyPublishing.computeIfPresent(key, (k, count) -> count.decrementAndGet() <= 0 ? null : count);
+    }
+
+    /** Whether the cell covering {@code lat,lon} has one or more publications actively in flight right now; see {@link #cellsCurrentlyPublishing}'s own doc. */
     boolean isPublicationInFlight(double lat, double lon) {
         long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
         long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
-        return cellsCurrentlyPublishing.contains(key);
+        return cellsCurrentlyPublishing.containsKey(key);
     }
 
     /**
@@ -781,7 +803,7 @@ public final class RoadTileSource {
         // completes -- see cellsCurrentlyPublishing's own doc for why this, combined with
         // resolutionVersion, closes the gap round 6 found (a cached PENDING answer surviving a real
         // disk write that already landed but hadn't yet been counted).
-        cellsCurrentlyPublishing.add(key);
+        beginPublication(key);
         try {
             double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
             double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
@@ -811,7 +833,7 @@ public final class RoadTileSource {
             // Cleared LAST, after memory.put -- so any reader that observes "not in flight" has
             // either seen nothing start yet, or seen the ENTIRE publication (write, version bump,
             // memory.put) already complete, in which case resolutionVersion has already moved too.
-            cellsCurrentlyPublishing.remove(key);
+            endPublication(key);
         }
     }
 
