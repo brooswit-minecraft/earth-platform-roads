@@ -429,6 +429,114 @@ class RoadNetworkScopedLookupCacheTest {
         }
     }
 
+    /**
+     * MINECRAFT-586 round 7 (Jira comment 56064): a reader (R) that checks {@code
+     * isPublicationInFlight} once, BEFORE consulting an already-primed PENDING-derived cache entry,
+     * can observe it false (writer hasn't started yet), then have the writer start AND complete the
+     * disk move WHILE R is still between its check and its cache read -- a check-then-act gap the
+     * round-6 fix alone did not close, since a cache HIT performs no check of its own. Fixed in
+     * {@code ScopedLookupCache.readOneNeighborCell} by checking the flag AGAIN immediately after the
+     * cache read; this test forces exactly that interleaving deterministically, using two
+     * coordinating latches (one pausing the reader right after its first, false, in-flight check;
+     * one pausing the writer at the existing post-move/pre-bump latch) rather than racing them:
+     * <ol>
+     *   <li>Prime the cell as PENDING into one {@link RoadNetwork.ScopedLookupCache} (a real lookup
+     *       before any fetch exists).</li>
+     *   <li>Start the READER on its own thread; it reaches the first, false, in-flight check and
+     *       pauses there (via {@link RoadNetwork.ScopedLookupCache#setAfterFirstInFlightCheckHookForTests}),
+     *       BEFORE it ever touches the primed cache entry.</li>
+     *   <li>Only once the reader is confirmed paused there, start the WRITER on a separate thread: it
+     *       marks the cell in flight, performs the real atomic disk move, then pauses at the existing
+     *       {@link RoadTileSource#setPublicationHooksForTests} first boundary -- so the cell is
+     *       genuinely in flight, with the file already written, while R is still paused.</li>
+     *   <li>Release R: it proceeds to read the (stale) cache entry, then re-checks in-flight --
+     *       now true -- discards what it just read, loops, and this time takes the unconditionally-
+     *       correct in-flight branch, which must find the real, already-written way.</li>
+     *   <li>Release the writer to finish; join both threads.</li>
+     * </ol>
+     */
+    @Test
+    void readerPausedBetweenFirstInFlightCheckAndCacheReadStillFindsTheRealRoad(@TempDir Path tmp) throws Exception {
+        MercatorGrid grid = new MercatorGrid(1);
+        int x = 760_000, z = 760_000;
+        var here = grid.geographic(x + 0.5, z + 0.5);
+        long wayId = 850_000_222L;
+
+        String response = """
+                {"elements":[{"type":"way","id":%d,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Round 7 Street"},
+                  "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
+                """.formatted(wayId, here.latitude() - 0.0005, here.longitude(), here.latitude() + 0.0005, here.longitude());
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            Path regions = Files.createDirectories(tmp.resolve("regions"));
+            RoadNetwork.resetForTests(regions);
+            var tiles = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
+                    tmp.resolve("road-cache"), true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tiles);
+
+            RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+            assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
+                    "Priming read: cell must be genuinely PENDING before any fetch starts");
+
+            long hereCellLat = (long) Math.floor(here.latitude() / RoadNetwork.CELL_DEGREES);
+            long hereCellLon = (long) Math.floor(here.longitude() / RoadNetwork.CELL_DEGREES);
+            CountDownLatch readerAtFirstCheck = new CountDownLatch(1);
+            CountDownLatch releaseReader = new CountDownLatch(1);
+            cache.setAfterFirstInFlightCheckHookForTests((hookLat, hookLon) -> {
+                // The hook fires for all 9 Moore-neighborhood cells; only pause for the ONE cell the
+                // writer below is actually about to fetch -- the other 8 must proceed unaffected.
+                long hookCellLat = (long) Math.floor(hookLat / RoadNetwork.CELL_DEGREES);
+                long hookCellLon = (long) Math.floor(hookLon / RoadNetwork.CELL_DEGREES);
+                if (hookCellLat != hereCellLat || hookCellLon != hereCellLon) return;
+                readerAtFirstCheck.countDown();
+                awaitUninterruptibly(releaseReader);
+            });
+
+            CountDownLatch writerAtFirstPause = new CountDownLatch(1);
+            CountDownLatch releaseWriter = new CountDownLatch(1);
+            tiles.setPublicationHooksForTests(
+                    () -> { writerAtFirstPause.countDown(); awaitUninterruptibly(releaseWriter); },
+                    null);
+
+            java.util.concurrent.atomic.AtomicReference<RoadSegment> readerResult = new java.util.concurrent.atomic.AtomicReference<>();
+            Thread reader = new Thread(() -> readerResult.set(RoadNetwork.segmentCoveringColumn(grid, x, z, cache)));
+            reader.setDaemon(true);
+            reader.start();
+            assertTrue(readerAtFirstCheck.await(5, TimeUnit.SECONDS), "Reader never reached its first in-flight check");
+            cache.setAfterFirstInFlightCheckHookForTests(null); // only pause once, so the reader's own retry loop below can proceed freely
+
+            Thread writer = new Thread(() -> tiles.waysForCell(here.latitude(), here.longitude()));
+            writer.setDaemon(true);
+            writer.start();
+            assertTrue(writerAtFirstPause.await(5, TimeUnit.SECONDS), "Writer never reached its first pause");
+            // At this exact moment: the reader already observed "not in flight" (before the writer
+            // even started); the writer has since marked in-flight, written the real disk file, and
+            // is now paused before its own version bump. This is the precise round-7 interleaving.
+
+            releaseReader.countDown();
+            reader.join(5_000);
+            releaseWriter.countDown();
+            writer.join(5_000);
+
+            RoadSegment found = readerResult.get();
+            assertEquals(wayId, found == null ? -1 : found.wayId(),
+                    "The reader, paused between its first in-flight check and its cache read while the "
+                            + "writer completed the real disk move in that exact window, must still find the "
+                            + "real way -- not the stale PENDING entry primed before either thread started");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
     private static void awaitUninterruptibly(CountDownLatch latch) {
         boolean interrupted = false;
         try {

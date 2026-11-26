@@ -426,11 +426,22 @@ public final class RoadNetwork {
          * deterministic latch test found -- a resolution ACTIVELY IN PROGRESS for one of these 9
          * cells, where the real disk write already landed but {@link RoadTileSource#resolutionVersion}
          * has not bumped yet. For exactly that cell, {@link RoadTileSource#isPublicationInFlight}
-         * (checked per-cell, every time, never cached) forces a real, uncached disk read instead of
-         * trusting -- or even writing -- any cached entry; a real disk read has no lag at all relative
-         * to the filesystem, so it always sees the write the instant it lands. Every OTHER cell in the
-         * same 3x3 read, not in flight, still gets the full cache benefit -- this only ever costs a
-         * cache miss, never incorrectness, and only for the brief window a cell is genuinely resolving.
+         * forces a real, uncached disk read instead of trusting -- or even writing -- any cached
+         * entry; a real disk read has no lag at all relative to the filesystem, so it always sees the
+         * write the instant it lands. Every OTHER cell in the same 3x3 read, not in flight, still
+         * gets the full cache benefit -- this only ever costs a cache miss, never incorrectness, and
+         * only for the brief window a cell is genuinely resolving.
+         *
+         * <p><b>MINECRAFT-586 round 7:</b> checking {@code isPublicationInFlight} once, before
+         * deciding whether to trust/use the cache, is itself a check-then-act gap: the flag can flip
+         * from false to true in the instant between that check and the subsequent cache read, and a
+         * cache HIT (unlike a miss) performs no check of its own at all. {@link #readOneNeighborCell}
+         * closes this by checking the flag AGAIN immediately after consulting the cache, before the
+         * value is used -- if it changed in that exact window, the value just obtained is discarded
+         * and the check repeats (the next iteration sees the flag already true, forcing the
+         * unconditional fresh branch, which cannot itself be stale). If the flag is false both before
+         * and after, nothing could have started publishing at any point across that whole window, so
+         * the cache hit is provably accurate for this cell throughout it.
          */
         private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
             for (int attempt = 0; attempt < MAX_OPTIMISTIC_RETRIES; attempt++) {
@@ -442,16 +453,7 @@ public final class RoadNetwork {
                 for (int dLat = -1; dLat <= 1; dLat++) {
                     for (int dLon = -1; dLon <= 1; dLon++) {
                         double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
-                        if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
-                            // Actively resolving right now: never trust (or write) a cached entry for
-                            // this cell -- a real, uncached read always sees the current disk truth,
-                            // with zero lag, regardless of what the version counter says yet.
-                            result.addAll(tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon));
-                            continue;
-                        }
-                        long neighborKey = cellKey(neighborLat, neighborLon);
-                        result.addAll(perCellTileReads.computeIfAbsent(neighborKey,
-                                k -> tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon)));
+                        result.addAll(readOneNeighborCell(tiles, neighborLat, neighborLon));
                     }
                 }
                 long versionAfter = tiles.resolutionVersion();
@@ -475,6 +477,62 @@ public final class RoadNetwork {
                 }
             }
             return fallback;
+        }
+
+        /**
+         * MINECRAFT-586 round 7: one neighbor cell's own read, with {@link RoadTileSource#isPublicationInFlight}
+         * checked both BEFORE and AFTER consulting/populating {@link #perCellTileReads} -- never just
+         * once beforehand -- so a flag transition landing in the gap between that single check and the
+         * cache read it gated is itself detected and retried, never silently trusted. See {@link
+         * #readMooreNeighborhood}'s own round-7 doc for why a single before-only check is insufficient.
+         */
+        /**
+         * MINECRAFT-586 round 7 (Jira comment 56064): test-only hook fired immediately after the
+         * FIRST {@code isPublicationInFlight} check returns false, before the cache is consulted --
+         * the exact window round 7 found. {@code null} (the default) means no pause; production code
+         * never sets this. Package-private: the deterministic round-7 regression is the only intended
+         * caller.
+         */
+        private volatile java.util.function.BiConsumer<Double, Double> afterFirstInFlightCheckBeforeCacheReadHookForTests;
+
+        /**
+         * Test-only: install (or clear, with {@code null}) the hook documented above. Receives the
+         * exact neighbor cell's own {@code lat,lon} (not the rounded cell key) on every one of the 9
+         * Moore-neighborhood checks per {@code readMooreNeighborhood} call -- a test that only cares
+         * about one specific cell must filter by comparing against it itself.
+         */
+        void setAfterFirstInFlightCheckHookForTests(java.util.function.BiConsumer<Double, Double> hook) {
+            this.afterFirstInFlightCheckBeforeCacheReadHookForTests = hook;
+        }
+
+        private List<RoadSegment> readOneNeighborCell(RoadTileSource tiles, double neighborLat, double neighborLon) {
+            long neighborKey = cellKey(neighborLat, neighborLon);
+            while (true) {
+                if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
+                    // Already in flight: a real, uncached read right now is unconditionally correct --
+                    // there is no caching layer between it and the filesystem, so nothing can make it stale.
+                    return tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon);
+                }
+                if (afterFirstInFlightCheckBeforeCacheReadHookForTests != null) {
+                    afterFirstInFlightCheckBeforeCacheReadHookForTests.accept(neighborLat, neighborLon);
+                }
+                List<RoadSegment> value = perCellTileReads.containsKey(neighborKey)
+                        ? perCellTileReads.get(neighborKey)
+                        : tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon);
+                if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
+                    // Something started publishing for this exact cell in the window between the
+                    // check above and this one -- the value just obtained (cache hit or fresh read
+                    // alike) is suspect; do not cache it, do not use it, loop again. The next
+                    // iteration's own FIRST check above will see the flag still true (publication
+                    // cannot un-start) and take the unconditionally-correct branch.
+                    continue;
+                }
+                // Neither check observed anything in flight: nothing could have started publishing
+                // at any point across the whole window from the first check to this one, so `value`
+                // (whether a cache hit or a read just performed) is provably accurate for this cell.
+                perCellTileReads.put(neighborKey, value);
+                return value;
+            }
         }
     }
 
