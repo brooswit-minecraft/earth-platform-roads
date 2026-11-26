@@ -3,8 +3,12 @@ package io.github.brooswitminecraft.earthplatformroads.road;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import com.sun.net.httpserver.HttpServer;
 import io.earthplatform.geography.globe.MercatorGrid;
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -21,13 +25,19 @@ import org.junit.jupiter.api.io.TempDir;
  * RoadNetwork#segmentCoveringColumn(MercatorGrid, int, int, RoadNetwork.ScopedLookupCache)} calls
  * within ONE generation pass -- never across passes.
  *
- * <p>These tests prove the two things that actually matter for safety, not raw disk-stat counts
- * (not practically instrumentable without changing {@link RoadTileSource} itself, which this fix
- * deliberately does not touch): (1) a {@link RoadNetwork.ScopedLookupCache} produces the exact same
- * answer a direct, uncached lookup would, and (2) the bounded staleness window this introduces is
- * exactly what the design doc claims -- reusable only within the SAME cache instance, and never
- * masking a later pass's fresh read once a cell actually resolves (the exact "late-arrival
- * freshness" guarantee the ticket requires: no stale paint after data completes).
+ * <p>An earlier version of this cache memoized a PENDING miss unconditionally, which a review
+ * (self-review finding on PR #11) correctly rejected: it could mask a cell that resolves DURING the
+ * same pass (a concurrent background prefetch, e.g. {@code EarthGeneratorPrepareMixin}'s own
+ * fetch-ahead-of-generation path, completing mid-scan), violating the ticket's explicit "no stale
+ * paint after data completes" / "never treat pending as confirmed empty" constraints. The fix
+ * snapshots {@link RoadTileSource#resolutionVersion()} and self-invalidates the whole cache the
+ * moment that counter moves -- see {@link RoadNetwork.ScopedLookupCache}'s own doc.
+ *
+ * <p>{@link #pendingCellResolvedByARealFetchDuringTheSamePassIsObservedNotMasked} is the regression
+ * the self-review required: it resolves the cell via a REAL {@link RoadTileSource#waysForCell} call
+ * (the actual production fetch path {@code attemptFetch} runs, exactly what a concurrent prefetch
+ * thread would do) IN BETWEEN two lookups through the exact same {@link RoadNetwork.ScopedLookupCache},
+ * and proves the second lookup sees the resolution, not a masked PENDING answer.
  */
 class RoadNetworkScopedLookupCacheTest {
     @AfterEach
@@ -36,8 +46,56 @@ class RoadNetworkScopedLookupCacheTest {
     }
 
     @Test
-    void sameScopedCacheStaysStaleWithinOnePassButAFreshCacheSeesTheRealLateArrival(@TempDir Path tmp) throws Exception {
-        Path regions = Files.createDirectories(tmp.resolve("regions")); // no bundled fixture: isolate to the live-tile-source path
+    void pendingCellResolvedByARealFetchDuringTheSamePassIsObservedNotMasked(@TempDir Path tmp) throws Exception {
+        MercatorGrid grid = new MercatorGrid(1);
+        int x = 700_000, z = 700_000;
+        var here = grid.geographic(x + 0.5, z + 0.5);
+
+        // The way's geometry must actually cover column (x,z) under this exact grid for
+        // segmentCoveringColumn to find it -- same centerline-through-the-point shape every other
+        // fixture in this test file and RoadTileSourceTest's own sibling tests use.
+        String response = """
+                {"elements":[{"type":"way","id":777000111,"nodes":[1,2],
+                  "tags":{"highway":"secondary","name":"Mid-Pass Resolution Street"},
+                  "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
+                """.formatted(here.latitude() - 0.0005, here.longitude(), here.latitude() + 0.0005, here.longitude());
+        HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        stub.createContext("/", exchange -> {
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        stub.start();
+        try {
+            Path regions = Files.createDirectories(tmp.resolve("regions")); // no bundled fixture: isolate to the live-tile-source path
+            RoadNetwork.resetForTests(regions);
+            var tiles = new RoadTileSource(
+                    URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
+                    tmp.resolve("road-cache"), true, Duration.ofSeconds(5));
+            RoadNetwork.setTileSourceForTests(tiles);
+
+            RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+            assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
+                    "A genuinely never-fetched cell must report no covering segment");
+
+            // A REAL fetch, exactly the production path EarthGeneratorPrepareMixin's own
+            // fetch-ahead-of-generation hook uses -- standing in for that hook running concurrently
+            // on its own thread and completing in the middle of this column's own ring scan.
+            tiles.waysForCell(here.latitude(), here.longitude());
+
+            var found = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
+            assertEquals(777000111L, found == null ? -1 : found.wayId(),
+                    "A real fetch resolving this cell DURING the pass must be observed by the next "
+                            + "lookup through the SAME scoped cache, not masked as still-pending/empty");
+        } finally {
+            stub.stop(0);
+        }
+    }
+
+    @Test
+    void aFreshScopedCacheAlwaysSeesCurrentDiskStateIncludingAnExternalLateWrite(@TempDir Path tmp) throws Exception {
+        Path regions = Files.createDirectories(tmp.resolve("regions"));
         Path roadCache = tmp.resolve("road-cache");
         RoadNetwork.resetForTests(regions);
         var tiles = new RoadTileSource(URI.create("http://127.0.0.1:1/"), roadCache, false, Duration.ofSeconds(1));
@@ -51,9 +109,11 @@ class RoadNetworkScopedLookupCacheTest {
         assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
                 "A genuinely never-fetched cell must report no covering segment");
 
-        // The cell resolves later via some OTHER path entirely (mirrors RoadTileSourceTest's own
-        // "pendingIsNeverCachedAndAFreshInstanceStillReadsTheRealDiskStateAfterAnEarlierInstanceSawPending"
-        // -- written directly here to isolate this test from whatever mechanism would really do it).
+        // Written directly to disk, bypassing RoadTileSource entirely (unlike the test above, this
+        // is not a real production resolution path -- nothing else in this one JVM ever writes into
+        // this instance's own cache root -- but it is still useful as the strongest possible check
+        // that the NEXT pass's own fresh cache reads real, current disk state no matter how it got
+        // there).
         long cellLat = (long) Math.floor(here.latitude() / RoadNetwork.CELL_DEGREES);
         long cellLon = (long) Math.floor(here.longitude() / RoadNetwork.CELL_DEGREES);
         String cellId = cellLat + "_" + cellLon;
@@ -63,11 +123,6 @@ class RoadNetworkScopedLookupCacheTest {
                  "ways":[{"way_id":42424242,"way_tags":{"highway":"secondary","name":"Late Arrival Street"},
                    "centerline":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}],"node_ids":[1,2]}]}
                 """.formatted(here.latitude() - 0.0005, here.longitude(), here.latitude() + 0.0005, here.longitude()));
-
-        assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
-                "Reusing the SAME scoped cache within one pass must not retroactively see a cell that "
-                        + "resolved after this cache was created -- it is a cache of that one pass's own reads, "
-                        + "not a live view; this is the documented, bounded staleness window, not a bug");
 
         RoadNetwork.ScopedLookupCache freshCache = RoadNetwork.freshScopedLookupCache();
         var found = RoadNetwork.segmentCoveringColumn(grid, x, z, freshCache);

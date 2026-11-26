@@ -71,6 +71,25 @@ public final class RoadTileSource {
     private final HttpClient http;
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
     /**
+     * MINECRAFT-586: a monotonically increasing counter, bumped once every time ANY cell anywhere in
+     * this instance transitions from unresolved (PENDING) to resolved (READY or CONFIRMED_EMPTY) --
+     * i.e. once per every {@code memory.put} call below that newly resolves a cell. Never bumped for
+     * a PENDING miss itself (resolving nothing), and never decremented. This exists purely so a
+     * caller-owned, short-lived cache of {@link #cachedWaysForCellOrEmpty} reads (see {@code
+     * RoadNetwork.ScopedLookupCache}) can snapshot this value and cheaply tell, later, whether
+     * anything in this instance could possibly have resolved since -- without itself re-touching
+     * disk -- rather than ever assuming a snapshot taken once stays valid for an unbounded time.
+     * Deliberately coarse (instance-wide, not per-cell): correctness only requires never UNDER-
+     * reporting a resolution, so a caller that sees any change at all is free to simply treat its
+     * whole snapshot as invalidated, which is exactly what {@code ScopedLookupCache} does.
+     */
+    private final AtomicLong resolutionVersion = new AtomicLong();
+
+    /** The current value of {@link #resolutionVersion}; see that field's own doc. */
+    long resolutionVersion() {
+        return resolutionVersion.get();
+    }
+    /**
      * One lock object per cell ever requested from this instance, used only to deduplicate
      * concurrent fetch attempts FOR THE SAME CELL -- deliberately NOT a single global lock (that
      * was MINECRAFT-566 comment 55450's found bug: a global lock around disk reads meant an
@@ -721,6 +740,7 @@ public final class RoadTileSource {
             throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
         }
         memory.put(key, fetched);
+        resolutionVersion.incrementAndGet();
         consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
         return FetchOutcome.RESOLVED;
     }
@@ -852,10 +872,12 @@ public final class RoadTileSource {
                 telemetry.recordJsonPayloadRead(); // MINECRAFT-567: the actual .json payload read, not merely the isRegularFile metadata check above
                 List<RoadSegment> ways = readCachedCell(readyFile);
                 memory.put(key, ways);
+                resolutionVersion.incrementAndGet();
                 return ways;
             }
             if (Files.isRegularFile(emptyFile) && isValidEmptyMarker(emptyFile)) {
                 memory.put(key, List.of());
+                resolutionVersion.incrementAndGet();
                 return List.of();
             }
         } catch (IOException e) {

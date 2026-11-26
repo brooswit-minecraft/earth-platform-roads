@@ -353,22 +353,52 @@ public final class RoadNetwork {
      * ({@code RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case)
      * -- see that ticket's JFR findings.
      *
-     * <p>Deliberately NOT a persistent, cross-call cache (that would risk exactly the
-     * "never treat pending as confirmed empty" / stale-paint hazard {@link RoadTileSource}'s own
-     * {@code pendingIsNeverCachedAndAFreshInstanceStillReadsTheRealDiskStateAfterAnEarlierInstanceSawPending}
-     * test guards against, since a cell can resolve between arbitrary calls). This cache is instead
-     * created fresh per generation pass by {@link #freshScopedLookupCache()} and discarded once that
-     * pass returns -- nothing within a single synchronous pass over this cache's own reads can itself
-     * cause a cell covered by that SAME pass to resolve (none of {@link #candidatesNear}'s calls ever
-     * fetch), so reusing an answer within one pass carries no staleness risk the pass did not already
-     * have reading disk directly; the very next pass (the next column surfaced, the next section
-     * previewed) always calls {@link #freshScopedLookupCache()} again and sees the real, current
-     * state, including anything that resolved meanwhile. Passing {@code null} anywhere this is
-     * accepted below disables the cache entirely and reads through to {@link RoadTileSource} exactly
-     * as before -- used by every caller not on this measured hot path.
+     * <p><b>Why this is not simply a persistent, pass-long memo of every answer including PENDING
+     * ones.</b> An earlier version of this cache did exactly that, and review (MINECRAFT-586)
+     * correctly rejected it: {@link RoadTileSource#cachedWaysForCellOrEmpty} returns the identical
+     * empty list for both a genuinely confirmed-empty cell and a merely-PENDING one, so naively
+     * memoizing that return value for the rest of one pass would let a cell that resolves DURING that
+     * pass (e.g. a concurrent background prefetch dispatched by {@code EarthGeneratorPrepareMixin}
+     * for the same cell, finishing mid-scan) stay invisible to the remaining calls in that same pass
+     * -- a real "stale paint after data completes" violation, not merely a theoretical one, even
+     * though the window is ordinarily microseconds wide.
+     *
+     * <p><b>The fix: snapshot {@link RoadTileSource#resolutionVersion()}, and self-invalidate.</b>
+     * {@link #candidatesNear} checks that counter on every use of this cache: if it has moved at all
+     * since this cache's entries were written -- meaning SOMETHING, anywhere in that tile source, has
+     * newly resolved since -- every cached entry is dropped and re-read fresh (cheap: one
+     * {@code AtomicLong.get()} and a map clear, not a disk touch) rather than ever trusting a
+     * possibly-stale answer. This check is coarse (instance-wide, not per-cell) deliberately:
+     * correctness only needs to never UNDER-detect a resolution, and the ordinary case -- nothing
+     * resolves during one column's microsecond-scale scan -- pays the full dedupe benefit with the
+     * counter check costing nothing, while the rare case where something genuinely did resolve
+     * mid-pass is self-correcting instead of silently wrong.
+     *
+     * <p>Still never a persistent, CROSS-pass cache: created fresh per generation pass by
+     * {@link #freshScopedLookupCache()} and discarded once that pass returns. Passing {@code null}
+     * anywhere this is accepted below disables the cache entirely and reads through to
+     * {@link RoadTileSource} exactly as before -- used by every caller not on this measured hot path.
      */
     public static final class ScopedLookupCache {
         private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
+        private RoadTileSource snapshotOf;
+        private long snapshotVersion = -1;
+
+        /**
+         * Drops every cached entry if {@code tiles} has resolved anything (anywhere) since this
+         * cache's entries were written, or if this cache was never used against this exact
+         * {@code tiles} instance before. Must be called before every read/write of
+         * {@link #perCellTileReads} below -- never trust that map without first calling this for the
+         * CURRENT {@code tiles}.
+         */
+        private void invalidateIfAnythingResolvedSince(RoadTileSource tiles) {
+            long current = tiles.resolutionVersion();
+            if (tiles != snapshotOf || current != snapshotVersion) {
+                perCellTileReads.clear();
+                snapshotOf = tiles;
+                snapshotVersion = current;
+            }
+        }
     }
 
     /** A fresh, empty {@link ScopedLookupCache} for one generation pass; see that class's own doc. */
@@ -495,6 +525,7 @@ public final class RoadNetwork {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
+        if (cache != null) cache.invalidateIfAnythingResolvedSince(tiles); // never trust a snapshot across a resolution
 
         List<RoadSegment> fromTiles = new ArrayList<>();
         for (int dLat = -1; dLat <= 1; dLat++) {
