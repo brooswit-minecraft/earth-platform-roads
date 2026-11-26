@@ -420,6 +420,17 @@ public final class RoadNetwork {
          * {@link #validAtVersion} -- the version this cache's entries were last PROVEN valid as of --
          * not just against itself, so a resolution that happened between two separate calls (not
          * during either one's own read) is caught exactly the same way.
+         *
+         * <p><b>MINECRAFT-586 round 6:</b> the version check above closes resolutions that already
+         * fully completed by the time this call checks, but leaves one gap the round's own
+         * deterministic latch test found -- a resolution ACTIVELY IN PROGRESS for one of these 9
+         * cells, where the real disk write already landed but {@link RoadTileSource#resolutionVersion}
+         * has not bumped yet. For exactly that cell, {@link RoadTileSource#isPublicationInFlight}
+         * (checked per-cell, every time, never cached) forces a real, uncached disk read instead of
+         * trusting -- or even writing -- any cached entry; a real disk read has no lag at all relative
+         * to the filesystem, so it always sees the write the instant it lands. Every OTHER cell in the
+         * same 3x3 read, not in flight, still gets the full cache benefit -- this only ever costs a
+         * cache miss, never incorrectness, and only for the brief window a cell is genuinely resolving.
          */
         private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
             for (int attempt = 0; attempt < MAX_OPTIMISTIC_RETRIES; attempt++) {
@@ -431,6 +442,13 @@ public final class RoadNetwork {
                 for (int dLat = -1; dLat <= 1; dLat++) {
                     for (int dLon = -1; dLon <= 1; dLon++) {
                         double neighborLat = lat + dLat * CELL_DEGREES, neighborLon = lon + dLon * CELL_DEGREES;
+                        if (tiles.isPublicationInFlight(neighborLat, neighborLon)) {
+                            // Actively resolving right now: never trust (or write) a cached entry for
+                            // this cell -- a real, uncached read always sees the current disk truth,
+                            // with zero lag, regardless of what the version counter says yet.
+                            result.addAll(tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon));
+                            continue;
+                        }
                         long neighborKey = cellKey(neighborLat, neighborLon);
                         result.addAll(perCellTileReads.computeIfAbsent(neighborKey,
                                 k -> tiles.cachedWaysForCellOrEmpty(neighborLat, neighborLon)));

@@ -328,29 +328,26 @@ class RoadNetworkScopedLookupCacheTest {
     }
 
     /**
-     * MINECRAFT-586: Tayne's tie-break (Jira comment 56050) on the round-5 dispute -- the
-     * production publication sequence IS correct (disk write, then version bump, then {@code
-     * memory.put}), but the earlier stress test only raced it non-deterministically. This test
-     * pauses the REAL {@code attemptFetch} production path at the two exact boundaries review named,
-     * using {@link RoadTileSource#setPublicationHooksForTests}, rather than inferring correctness
-     * from timing:
+     * MINECRAFT-586 round 6 (Jira comment 56058, Tayne's ruling 56060): the round-5 version of this
+     * test asserted the scoped cache still returned {@code null} at the first pause (disk write done,
+     * {@code resolutionVersion} not yet bumped) -- that was WRONG: {@code LevelRoadPreview.apply()}
+     * shares one {@code ScopedLookupCache} across 256 columns, and a column's own lookup result is
+     * consumed as a PERMANENT paint-or-not decision, so a cell primed as PENDING by an earlier column
+     * and reused here, even briefly, is a real bug, not a tolerable transient. Fixed by
+     * {@code RoadTileSource#isPublicationInFlight} forcing a real, uncached read for any cell
+     * actively publishing, regardless of what {@code resolutionVersion} says yet -- this test now
+     * asserts the REAL road is found at every pause, per Tayne's explicit instruction:
      * <ol>
      *   <li>Prime a genuinely-PENDING entry into ONE {@link RoadNetwork.ScopedLookupCache}, reused
      *       for every check below ("the same scope").</li>
      *   <li>Start a real fetch on a background thread; pause it immediately after the atomic disk
-     *       move but before {@code resolutionVersion} bumps. At this pause, the SAME scoped cache
-     *       (deterministically, since the version has not moved) still reports no segment -- this is
-     *       the documented, bounded within-pass staleness window, not a bug. A DIRECT, uncached check
-     *       at this exact pause (bypassing the scoped cache) already finds {@link
-     *       RoadTileSource#cellState} reporting {@code READY}, confirming the real invariant: the
-     *       disk write always precedes the version bump, so the version counter never runs AHEAD of
-     *       the real data -- only the scoped cache's own primed, not-yet-invalidated copy is behind,
-     *       and only until the version it's gated on actually moves.</li>
+     *       move but before {@code resolutionVersion} bumps. At THIS pause, the cell is still marked
+     *       in-flight (cleared only after the full publication completes), so the SAME scoped cache
+     *       must already find the real resolved way -- {@code isPublicationInFlight} forces a fresh,
+     *       uncached disk read for this specific cell instead of trusting the primed cache entry.</li>
      *   <li>Release; pause again immediately after the version bump but before {@code memory.put}.
-     *       At THIS pause, the same scoped cache must already see the real, resolved way -- the
-     *       version change forces a fresh read, which falls through to a direct disk check (the
-     *       atomic move already happened) rather than waiting on {@code memory.put}.</li>
-     *   <li>Release; after the fetch fully completes, the lookup must still see the resolved way.</li>
+     *       Still in flight; still must find the real way, now via the version check too.</li>
+     *   <li>Release; after the fetch fully completes (no longer in flight), still finds the real way.</li>
      * </ol>
      */
     @Test
@@ -398,28 +395,21 @@ class RoadNetworkScopedLookupCacheTest {
             resolver.setDaemon(true);
             resolver.start();
 
-            // First pause: the atomic disk move has happened; resolutionVersion has NOT bumped yet.
+            // First pause: the atomic disk move has happened; resolutionVersion has NOT bumped yet;
+            // the cell is still marked in-flight (cleared only after memory.put, in attemptFetch's
+            // own finally block).
             assertTrue(atFirstPause.await(5, TimeUnit.SECONDS), "Resolver never reached the first pause");
-            assertNull(RoadNetwork.segmentCoveringColumn(grid, x, z, cache),
-                    "Before the version bump, the PRIMED scoped cache is expected to still report no "
-                            + "segment -- the documented, bounded within-pass staleness window, not a bug. "
-                            + "Critically this must never be a FINAL answer, proven by the direct cellState "
-                            + "check below (a fresh, uncached read) and by the post-bump/post-completion "
-                            + "checks that follow.");
-            // A DIRECT, uncached check (bypassing the scoped cache entirely) already sees READY here --
-            // the atomic disk move happened before this pause, and RoadTileSource's own cellState/
-            // cachedWaysForCellOrEmpty always do a fresh disk check on a memory miss, never gated by
-            // resolutionVersion. This is the real invariant the whole design leans on: the version
-            // counter is a conservative change-detection signal that never runs AHEAD of the real data,
-            // so it is safe for a cache to treat "version unchanged" as "nothing changed" -- the exact
-            // opposite order (version ahead of data) is what would be unsafe, and is not what happens.
-            assertEquals(RoadTileSource.CellState.READY, tiles.cellState(here.latitude(), here.longitude()),
-                    "A direct, uncached cellState check must already see READY here -- the disk write "
-                            + "happened before this pause -- confirming the real data is never behind the "
-                            + "version signal, only the scoped cache's OWN stale copy (primed earlier) is");
+            assertTrue(tiles.isPublicationInFlight(here.latitude(), here.longitude()),
+                    "The cell must still be marked in-flight at the first pause -- cleared only after memory.put");
+            var atFirstPauseResult = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
+            assertEquals(wayId, atFirstPauseResult == null ? -1 : atFirstPauseResult.wayId(),
+                    "Round 6's own finding: even before the version bump, the SAME scoped cache (primed "
+                            + "PENDING earlier) must already find the real, resolved way -- isPublicationInFlight "
+                            + "forces a real, uncached disk read for this specific cell, since LevelRoadPreview.apply() "
+                            + "treats this exact result as a PERMANENT paint-or-not decision, not a tolerable transient");
             releaseFirstPause.countDown();
 
-            // Second pause: resolutionVersion HAS bumped; memory.put has NOT happened yet.
+            // Second pause: resolutionVersion HAS bumped; memory.put has NOT happened yet; still in flight.
             assertTrue(atSecondPause.await(5, TimeUnit.SECONDS), "Resolver never reached the second pause");
             var atSecondPauseResult = RoadNetwork.segmentCoveringColumn(grid, x, z, cache);
             assertEquals(wayId, atSecondPauseResult == null ? -1 : atSecondPauseResult.wayId(),

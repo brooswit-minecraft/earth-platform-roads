@@ -103,6 +103,45 @@ public final class RoadTileSource {
     long resolutionVersion() {
         return resolutionVersion.get();
     }
+
+    /**
+     * MINECRAFT-586 round 6 (Tayne's ruling, Jira comment 56060): {@link #resolutionVersion} alone
+     * still leaves a real gap, found by that round's own deterministic latch test -- a reader can
+     * observe the write already landed (via a direct, uncached disk check) while {@code
+     * resolutionVersion} has NOT yet bumped, but {@code RoadNetwork.ScopedLookupCache}'s cross-call
+     * reuse of an EARLIER-cached PENDING answer for that same cell only consults the version counter,
+     * never a fresh disk check, so it can still serve the stale answer during that exact window. No
+     * reordering of {@link #resolutionVersion}/{@link #memory} closes this: whichever signal a reader
+     * trusts instead of the disk itself will always lag the real write by at least the instructions
+     * between them, because the filesystem is written by an uncoordinated background thread.
+     *
+     * <p>The actual fix: a cell whose attempt (see {@link #attemptFetch}) is ACTIVELY publishing is
+     * recorded here from before any state mutation until after the full publication ({@link #memory}
+     * included) completes. {@code RoadNetwork.ScopedLookupCache} checks this BEFORE trusting any
+     * cached PENDING-derived answer for a cell, and forces a real, uncached disk read instead whenever
+     * it is true -- a real disk read has no lag at all relative to the filesystem, so the gap closes
+     * completely for exactly the window it's open, at the cost of a cache miss (not incorrectness)
+     * only during that brief, genuinely-in-flight window. Steady state (nothing being fetched for a
+     * cell right now -- the common case this whole mechanism exists for) is untouched: an O(1)
+     * {@code Set.contains()} check, same cost class as the version-counter check it supplements.
+     *
+     * <p>Cleared LAST, strictly after {@link #memory} is updated (see {@link #attemptFetch}'s
+     * {@code finally} block) -- so a reader that observes "not in flight" has either seen nothing
+     * start yet (the cached answer, if any, is still accurate) or seen the ENTIRE publication
+     * complete, in which case {@link #resolutionVersion} has already moved too and {@code
+     * ScopedLookupCache}'s own version check catches it independently. The two checks together cover
+     * the whole timeline with no remaining gap between them.
+     */
+    private final java.util.Set<Long> cellsCurrentlyPublishing = ConcurrentHashMap.newKeySet();
+
+    /** Whether the cell covering {@code lat,lon} is actively publishing right now; see {@link #cellsCurrentlyPublishing}'s own doc. */
+    boolean isPublicationInFlight(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+        return cellsCurrentlyPublishing.contains(key);
+    }
+
     /**
      * One lock object per cell ever requested from this instance, used only to deduplicate
      * concurrent fetch attempts FOR THE SAME CELL -- deliberately NOT a single global lock (that
@@ -737,30 +776,43 @@ public final class RoadTileSource {
      */
     private FetchOutcome attemptFetch(long key, long cellLat, long cellLon, Path readyFile, Path emptyFile) {
         if (!allowNetwork) return FetchOutcome.DISPATCH_SUPPRESSED; // no live source at all: nothing was ever going to be dispatched
-        double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
-        double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
-        List<RoadSegment> fetched;
+        // MINECRAFT-586 round 6 (Tayne's ruling, Jira comment 56060): mark this cell as actively
+        // publishing from BEFORE any state mutation until AFTER the full publication (memory.put)
+        // completes -- see cellsCurrentlyPublishing's own doc for why this, combined with
+        // resolutionVersion, closes the gap round 6 found (a cached PENDING answer surviving a real
+        // disk write that already landed but hadn't yet been counted).
+        cellsCurrentlyPublishing.add(key);
         try {
-            fetched = fetchCell(minLat, minLon, maxLat, maxLon);
-        } catch (NotYetEligibleException e) {
-            return FetchOutcome.DISPATCH_SUPPRESSED; // free: no real request was ever sent; does not affect the outage streak
-        } catch (IOException | RuntimeException e) {
-            consecutiveAttemptedFailures.incrementAndGet();
-            return FetchOutcome.ATTEMPTED_FAILURE; // a real request WAS sent and failed (timeout, 5xx, remark, etc.)
+            double minLat = cellLat * RoadNetwork.CELL_DEGREES, maxLat = minLat + RoadNetwork.CELL_DEGREES;
+            double minLon = cellLon * RoadNetwork.CELL_DEGREES, maxLon = minLon + RoadNetwork.CELL_DEGREES;
+            List<RoadSegment> fetched;
+            try {
+                fetched = fetchCell(minLat, minLon, maxLat, maxLon);
+            } catch (NotYetEligibleException e) {
+                return FetchOutcome.DISPATCH_SUPPRESSED; // free: no real request was ever sent; does not affect the outage streak
+            } catch (IOException | RuntimeException e) {
+                consecutiveAttemptedFailures.incrementAndGet();
+                return FetchOutcome.ATTEMPTED_FAILURE; // a real request WAS sent and failed (timeout, 5xx, remark, etc.)
+            }
+            try {
+                writeCachedCell(fetched.isEmpty() ? emptyFile : readyFile, fetched, minLat, minLon, maxLat, maxLon);
+            } catch (IOException e) {
+                throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
+            }
+            if (afterAtomicMoveBeforeVersionBumpHookForTests != null) afterAtomicMoveBeforeVersionBumpHookForTests.run();
+            // MINECRAFT-586 round 4: increment BEFORE publishing into memory, not after -- see
+            // resolutionVersion's own doc for why this exact order matters.
+            resolutionVersion.incrementAndGet();
+            if (afterVersionBumpBeforeMemoryPutHookForTests != null) afterVersionBumpBeforeMemoryPutHookForTests.run();
+            memory.put(key, fetched);
+            consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
+            return FetchOutcome.RESOLVED;
+        } finally {
+            // Cleared LAST, after memory.put -- so any reader that observes "not in flight" has
+            // either seen nothing start yet, or seen the ENTIRE publication (write, version bump,
+            // memory.put) already complete, in which case resolutionVersion has already moved too.
+            cellsCurrentlyPublishing.remove(key);
         }
-        try {
-            writeCachedCell(fetched.isEmpty() ? emptyFile : readyFile, fetched, minLat, minLon, maxLat, maxLon);
-        } catch (IOException e) {
-            throw new IllegalStateException("Could not write road tile cache at " + cacheRoot, e);
-        }
-        if (afterAtomicMoveBeforeVersionBumpHookForTests != null) afterAtomicMoveBeforeVersionBumpHookForTests.run();
-        // MINECRAFT-586 round 4: increment BEFORE publishing into memory, not after -- see
-        // resolutionVersion's own doc for why this exact order matters.
-        resolutionVersion.incrementAndGet();
-        if (afterVersionBumpBeforeMemoryPutHookForTests != null) afterVersionBumpBeforeMemoryPutHookForTests.run();
-        memory.put(key, fetched);
-        consecutiveAttemptedFailures.set(0); // a real success anywhere clears the outage streak
-        return FetchOutcome.RESOLVED;
     }
 
     /**
