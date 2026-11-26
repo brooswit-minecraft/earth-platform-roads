@@ -70,6 +70,7 @@ public final class RoadTileSource {
     private final Duration minRequestInterval;
     private final HttpClient http;
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
+
     /**
      * One lock object per cell ever requested from this instance, used only to deduplicate
      * concurrent fetch attempts FOR THE SAME CELL -- deliberately NOT a single global lock (that
@@ -600,6 +601,32 @@ public final class RoadTileSource {
         return loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY;
     }
 
+    /** {@link #cellState} paired with the actual ways, from the one shared validated-load read; see {@link #cellRead}. */
+    record CellRead(CellState state, List<RoadSegment> ways) {}
+
+    /**
+     * MINECRAFT-586 (John Winstead's ruling, Jira comment 56072): {@code RoadNetwork.ScopedLookupCache}
+     * needs BOTH the actual ways AND whether this cell's answer is definitive (not {@code PENDING})
+     * to decide whether it may cache a result at all -- it must never cache (or reuse) a PENDING-
+     * derived answer, only ever a definitive one, since only a definitive answer is a stable fact that
+     * cannot later change. Calling {@link #cellState} and {@link #cachedWaysForCellOrEmpty} separately
+     * would each independently pay for their own disk read on a cold miss (since neither one by
+     * itself memoizes a PENDING result) -- doubling the real disk cost of every still-pending cell,
+     * exactly the cost MINECRAFT-584 flagged as the bottleneck in the first place. This instead shares
+     * the ONE underlying {@link #memory}/{@link #readDiskCacheUncached} read both of those methods
+     * already use, at the same one-check cost as either alone.
+     */
+    CellRead cellRead(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+        List<RoadSegment> warm = memory.get(key);
+        if (warm != null) telemetry.recordMemoryHit();
+        List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
+        if (loaded == null) return new CellRead(CellState.PENDING, List.of());
+        return new CellRead(loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY, loaded);
+    }
+
     /**
      * Every mapped way already cached for the cell covering {@code lat,lon} -- never fetches, never
      * blocks, never touches the network. This is what {@link RoadNetwork#candidatesNear} calls from
@@ -861,7 +888,22 @@ public final class RoadTileSource {
         } catch (IOException e) {
             throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
         }
+        uncachedPendingReadCount.incrementAndGet();
         return null;
+    }
+
+    /**
+     * MINECRAFT-586: counts every uncached disk check this method performs for a cell that is still
+     * PENDING -- MINECRAFT-584's own measured bottleneck ({@code readDiskCacheUncached} as the
+     * hottest leaf method, via exactly this never-memoized branch). Test-only; lets
+     * {@code RoadNetworkScopedLookupCacheTest} measure, directly and exactly, how many of these this
+     * class's own dedupe fix actually avoids, rather than only inferring it from wall-clock timing.
+     */
+    private final AtomicLong uncachedPendingReadCount = new AtomicLong();
+
+    /** The current value of {@link #uncachedPendingReadCount}; see that field's own doc. */
+    long uncachedPendingReadCountForTests() {
+        return uncachedPendingReadCount.get();
     }
 
     /**

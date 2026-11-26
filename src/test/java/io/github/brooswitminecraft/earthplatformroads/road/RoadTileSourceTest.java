@@ -918,4 +918,45 @@ class RoadTileSourceTest {
         assertEquals(RoadTileSource.CellState.PENDING, source.cellState(lat, lon),
                 "Expected a parseable-but-non-empty .empty marker to be rejected (treated as PENDING), never trusted as a real confirmation");
     }
+
+    /**
+     * MINECRAFT-586 (John Winstead's ruling, comment 56072): {@code cellRead} is the one shared
+     * validated-load read {@code RoadNetwork.ScopedLookupCache} uses to decide, in a single disk
+     * pass, both the actual ways AND whether this cell's answer is definitive -- so it must agree
+     * exactly with {@code cellState}/{@code cachedWaysForCellOrEmpty} for all three states, on both
+     * a cold (disk) read and a warm (memory) one.
+     */
+    @Test
+    void cellReadAgreesWithCellStateAndCachedWaysForEveryState(@TempDir Path cacheRoot) throws IOException {
+        double pendingLat = 66.0005, pendingLon = -176.0005; // never touched at all
+        double emptyLat = 66.0005, emptyLon = -175.9905; // adjacent cell, distinct key
+        double readyLat = 66.0205, readyLon = -176.0005; // another distinct cell
+        java.nio.file.Files.createDirectories(cacheRoot);
+        java.nio.file.Files.writeString(cacheRoot.resolve("6600_-17600.empty"), "");
+        java.nio.file.Files.writeString(cacheRoot.resolve("6602_-17601.json"), """
+                {"schema_version":1,"region_id":"cell-read-test","fetched_at":"2026-01-01T00:00:00Z",
+                 "bbox":{"min_lat":66.02,"min_lon":-176.01,"max_lat":66.03,"max_lon":-176.0},
+                 "ways":[{"way_id":555400,"way_tags":{"highway":"secondary","name":"Cell Read Street"},
+                 "centerline":[{"lat":66.024,"lon":-176.005},{"lat":66.026,"lon":-176.005}],
+                 "node_ids":[1,2],"bridge":false,"tunnel":false}]}
+                """);
+
+        RoadTileSource source = new RoadTileSource(URI.create("http://127.0.0.1:1/"), cacheRoot, false, Duration.ofSeconds(5));
+
+        // Cold (first, disk-backed) reads.
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellRead(pendingLat, pendingLon).state());
+        assertTrue(source.cellRead(pendingLat, pendingLon).ways().isEmpty());
+        assertEquals(RoadTileSource.CellState.CONFIRMED_EMPTY, source.cellRead(emptyLat, emptyLon).state());
+        assertTrue(source.cellRead(emptyLat, emptyLon).ways().isEmpty());
+        assertEquals(RoadTileSource.CellState.READY, source.cellRead(readyLat, readyLon).state());
+        assertEquals(555400L, source.cellRead(readyLat, readyLon).ways().get(0).wayId());
+
+        // Warm (memory-backed) re-reads must agree, matching cellState/cachedWaysForCellOrEmpty.
+        assertEquals(source.cellState(emptyLat, emptyLon), source.cellRead(emptyLat, emptyLon).state());
+        assertEquals(source.cachedWaysForCellOrEmpty(emptyLat, emptyLon), source.cellRead(emptyLat, emptyLon).ways());
+        assertEquals(source.cellState(readyLat, readyLon), source.cellRead(readyLat, readyLon).state());
+        assertEquals(source.cachedWaysForCellOrEmpty(readyLat, readyLon), source.cellRead(readyLat, readyLon).ways());
+        assertEquals(RoadTileSource.CellState.PENDING, source.cellRead(pendingLat, pendingLon).state(),
+                "A still-pending cell must keep reporting PENDING on a later call too -- never cached as confirmed-anything");
+    }
 }

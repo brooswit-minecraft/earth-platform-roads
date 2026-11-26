@@ -342,6 +342,87 @@ public final class RoadNetwork {
     }
 
     /**
+     * MINECRAFT-586: a short-lived, caller-owned cache of {@link #candidatesNear}'s per-neighbor-cell
+     * {@link RoadTileSource#cellRead} reads, scoped to ONE generation pass over many columns that
+     * repeatedly re-derive the same cell -- e.g. {@code EarthGeneratorRoadMixin}'s {@code
+     * nearestLowerSameRoadDistance} (up to 120 {@link #segmentCoveringColumn} calls for one column,
+     * heavily overlapping Moore neighborhoods between adjacent ring positions) and {@link
+     * LevelRoadPreview#apply}'s 256-column section loop (every column in one 16x16 section typically
+     * falls in the same {@value #CELL_DEGREES}-degree cell, so 256 calls would otherwise repeat the
+     * exact same disk-cache reads). MINECRAFT-584 measured this as the hottest leaf cost ({@code
+     * RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case) -- see
+     * that ticket's JFR findings.
+     *
+     * <p><b>Only ever caches a DEFINITIVE answer (John Winstead's ruling, MINECRAFT-586 comment
+     * 56072, superseding every earlier round's own version-counter/in-flight-flag machinery):</b> a
+     * cell is cached here if and only if {@link RoadTileSource#cellRead} reports it as {@code READY}
+     * or {@code CONFIRMED_EMPTY} -- never {@code PENDING}. Those two states are stable facts about
+     * this cell for the rest of this {@link RoadTileSource} instance's life (see {@link
+     * RoadTileSource.CellState}'s own doc and the long-standing invariants {@code RoadTileSourceTest}
+     * already proves: a confirmed-empty or ready result, once validated from disk, never reverts),
+     * so once cached here it can never go stale within this one generation pass either, with no
+     * invalidation logic of any kind needed. A still-PENDING cell is never written into this cache at
+     * all -- every access to it reads straight through to {@link RoadTileSource#cellRead} again, every
+     * time, exactly like the no-cache path below.
+     *
+     * <p>Several earlier rounds (version counters, optimistic-read/validate retry loops, a ref-counted
+     * publication-in-flight tracker, checked at ever-narrower points around each cache access) each
+     * patched one race only for review to find the next-narrower one hiding in the gap it left behind
+     * -- all of them were trying to make it safe to reuse a PENDING-derived answer across a window a
+     * real resolution could land in. 56072's ruling cuts that off at the root instead: don't reuse (or
+     * even store) a PENDING-derived answer at all, so there is no window to close, because there is no
+     * stored answer to call unsafe. The tradeoff, explicitly accepted by that ruling ("do not chase
+     * 1089->9 on pending cells at the expense of correctness"): a cell that stays genuinely pending
+     * for an entire pass gets NO dedupe benefit at all here (same disk cost as before this whole fix
+     * existed -- every access reads straight through). A cell that resolves to READY or
+     * CONFIRMED_EMPTY -- the common case once a region has actually been fetched, e.g. "most of the
+     * world has no roads" (MINECRAFT-566 comment 55562) -- is cached here too, but {@link
+     * RoadTileSource}'s own PRE-EXISTING {@code memory} layer (also MINECRAFT-566, predating this
+     * ticket entirely) already memoizes that exact same answer with zero disk I/O after its first
+     * validating read, with or without this cache -- so there is no disk-read reduction left for
+     * THIS cache to additionally claim credit for on that side. What this cache still buys for a
+     * resolved cell is avoiding a repeat call into {@link RoadTileSource} at all (one {@code HashMap}
+     * lookup here instead of one {@code ConcurrentHashMap} lookup plus the cell-key arithmetic
+     * there) -- real, but a CPU micro-saving, not a disk one.
+     */
+    public static final class ScopedLookupCache {
+        private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
+
+        /**
+         * The Moore-neighborhood (3x3, including {@code lat,lon}'s own cell) read {@link #candidatesNear}
+         * needs, reusing this pass's own cache where already known (definitive answers only -- see
+         * this class's own doc) and otherwise reading fresh.
+         */
+        private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
+            List<RoadSegment> result = new ArrayList<>();
+            for (int dLat = -1; dLat <= 1; dLat++) {
+                for (int dLon = -1; dLon <= 1; dLon++) {
+                    result.addAll(readOneNeighborCell(tiles, lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+                }
+            }
+            return result;
+        }
+
+        private List<RoadSegment> readOneNeighborCell(RoadTileSource tiles, double neighborLat, double neighborLon) {
+            long neighborKey = cellKey(neighborLat, neighborLon);
+            List<RoadSegment> cached = perCellTileReads.get(neighborKey);
+            if (cached != null) return cached;
+            RoadTileSource.CellRead read = tiles.cellRead(neighborLat, neighborLon);
+            if (read.state() != RoadTileSource.CellState.PENDING) {
+                // Definitive (READY or CONFIRMED_EMPTY): a stable fact for the rest of this pass --
+                // see this class's own doc for why that makes this safe with no invalidation at all.
+                perCellTileReads.put(neighborKey, read.ways());
+            }
+            return read.ways();
+        }
+    }
+
+    /** A fresh, empty {@link ScopedLookupCache} for one generation pass; see that class's own doc. */
+    public static ScopedLookupCache freshScopedLookupCache() {
+        return new ScopedLookupCache();
+    }
+
+    /**
      * The first mapped at-grade way covering this column, or {@code null} if none does. A mapped
      * bridge or tunnel way never matches here -- this mod cannot yet render a grade-separated
      * crossing correctly, and the ticket is explicit that an unsupported gap must be reported, not
@@ -349,8 +430,13 @@ public final class RoadNetwork {
      * {@link #excludedBridgesAndTunnels()} for the explicit list of what that excludes).
      */
     public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z) {
+        return segmentCoveringColumn(grid, x, z, null);
+    }
+
+    /** {@link #segmentCoveringColumn(MercatorGrid, int, int)}, reusing {@code cache} (see {@link ScopedLookupCache}) across repeated calls within one generation pass; {@code null} behaves exactly like the no-cache overload. */
+    public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z, ScopedLookupCache cache) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), cache)) {
             if (segment.bridge() || segment.tunnel()) continue;
             if (segment.coversColumn(grid, x, z)) return segment;
         }
@@ -388,7 +474,7 @@ public final class RoadNetwork {
     public static ColumnDiagnosis diagnoseColumn(MercatorGrid grid, int x, int z) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
         boolean anyBridgeOrTunnelCovers = false;
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), null)) {
             if (segment.coversColumn(grid, x, z)) {
                 if (segment.bridge() || segment.tunnel()) {
                     anyBridgeOrTunnelCovers = true;
@@ -451,22 +537,35 @@ public final class RoadNetwork {
      * never exercised that deadline. This version needs no additional network calls at all, so it
      * cannot run into that problem.
      */
-    private static List<RoadSegment> candidatesNear(double lat, double lon) {
+    private static List<RoadSegment> candidatesNear(double lat, double lon, ScopedLookupCache cache) {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
 
-        List<RoadSegment> fromTiles = new ArrayList<>();
-        for (int dLat = -1; dLat <= 1; dLat++) {
-            for (int dLon = -1; dLon <= 1; dLon++) {
-                fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
-            }
-        }
+        // Keyed by each neighbor cell itself (not the center lat/lon) so overlapping Moore
+        // neighborhoods from DIFFERENT centers -- the common case across a ring scan or a section's
+        // columns -- actually share hits, not just repeats of the exact same center. See
+        // ScopedLookupCache.readMooreNeighborhood's own doc for the optimistic-read/validate loop
+        // that makes reusing this cache provably safe against a resolution landing mid-read.
+        List<RoadSegment> fromTiles = cache == null
+                ? readMooreNeighborhoodUncached(tiles, lat, lon)
+                : cache.readMooreNeighborhood(tiles, lat, lon);
         if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
         if (preloaded == null || preloaded.isEmpty()) return fromTiles;
         List<RoadSegment> merged = new ArrayList<>(preloaded);
         merged.addAll(fromTiles);
         return merged;
+    }
+
+    /** {@code candidatesNear}'s Moore-neighborhood read with no cache at all -- every caller not on MINECRAFT-584's measured hot path. */
+    private static List<RoadSegment> readMooreNeighborhoodUncached(RoadTileSource tiles, double lat, double lon) {
+        List<RoadSegment> result = new ArrayList<>();
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                result.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+            }
+        }
+        return result;
     }
 
     private static long cellKey(double lat, double lon) {
