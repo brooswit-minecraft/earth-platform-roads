@@ -918,4 +918,67 @@ class RoadTileSourceTest {
         assertEquals(RoadTileSource.CellState.PENDING, source.cellState(lat, lon),
                 "Expected a parseable-but-non-empty .empty marker to be rejected (treated as PENDING), never trusted as a real confirmation");
     }
+
+    /**
+     * MINECRAFT-586: the exact invariant {@code RoadNetwork.ScopedLookupCache}'s optimistic-read/
+     * validate loop depends on -- {@code resolutionVersion()} never advances for a cell before that
+     * cell's real disk write (and {@code memory} publish) are already visible -- exercised here
+     * directly against {@link #cachedWaysForCellOrEmpty}, bypassing {@code ScopedLookupCache}
+     * entirely, against the REAL {@code attemptFetch} writer path (a real HTTP fetch, a real disk
+     * write) racing a reader thread that busy-polls {@link #resolutionVersion()} and, the INSTANT it
+     * observes the bump, immediately re-checks the cell -- the tightest rendezvous achievable without
+     * adding a pause seam to production code (round-5 review's own ask, see MINECRAFT-586 comment
+     * history): if a reader could ever observe the new version while the cell is still reported
+     * PENDING, this test would catch it. Repeated across many trials for confidence this isn't luck.
+     */
+    @Test
+    void resolutionVersionNeverAdvancesBeforeTheRealDataIsAlreadyVisible(@TempDir Path cacheRoot) throws Exception {
+        int trials = 200;
+        for (int trial = 0; trial < trials; trial++) {
+            double lat = 70.0 + trial * 0.02, lon = -140.0 - trial * 0.02; // a fresh, never-touched cell each trial
+            String response = """
+                    {"elements":[{"type":"way","id":%d,"nodes":[1,2],
+                      "tags":{"highway":"secondary","name":"Rendezvous Street %d"},
+                      "geometry":[{"lat":%s,"lon":%s},{"lat":%s,"lon":%s}]}]}
+                    """.formatted(800_000_000L + trial, trial, lat - 0.0005, lon, lat + 0.0005, lon);
+            HttpServer stub = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            stub.createContext("/", exchange -> {
+                byte[] body = response.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+                exchange.close();
+            });
+            stub.start();
+            try {
+                RoadTileSource source = new RoadTileSource(
+                        URI.create("http://127.0.0.1:" + stub.getAddress().getPort() + "/"),
+                        cacheRoot.resolve("trial" + trial), true, Duration.ofSeconds(5));
+
+                long versionBefore = source.resolutionVersion();
+                java.util.concurrent.atomic.AtomicReference<List<RoadSegment>> observedAtBump = new java.util.concurrent.atomic.AtomicReference<>();
+                java.util.concurrent.atomic.AtomicBoolean bumpSeen = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+                Thread reader = new Thread(() -> {
+                    while (source.resolutionVersion() == versionBefore) {
+                        // tight busy-poll: no sleep, catch the earliest possible instant the version moves
+                    }
+                    bumpSeen.set(true);
+                    observedAtBump.set(source.cachedWaysForCellOrEmpty(lat, lon));
+                });
+                reader.start();
+
+                List<RoadSegment> fetched = source.waysForCell(lat, lon); // the real attemptFetch path: real HTTP, real disk write, then the version bump
+                reader.join(5_000);
+
+                assertTrue(bumpSeen.get(), "Trial " + trial + ": reader never observed the version bump within the join timeout");
+                assertTrue(!fetched.isEmpty(), "Trial " + trial + ": the real fetch itself must have found the way");
+                List<RoadSegment> atBump = observedAtBump.get();
+                assertTrue(atBump != null && !atBump.isEmpty(),
+                        "Trial " + trial + ": the instant the reader observed resolutionVersion advance, "
+                                + "cachedWaysForCellOrEmpty must already reflect the resolved way, never PENDING/empty");
+            } finally {
+                stub.stop(0);
+            }
+        }
+    }
 }
