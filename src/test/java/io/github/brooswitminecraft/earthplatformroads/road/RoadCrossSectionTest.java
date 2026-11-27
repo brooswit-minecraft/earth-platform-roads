@@ -28,11 +28,14 @@ class RoadCrossSectionTest {
     }
 
     @Test
-    void serviceRoadsAreTheOneClassWithoutACenterline() {
+    void serviceAndTrackRoadsAreTheClassesWithoutACenterline() {
+        // MINECRAFT-568 adds TRACK (an eligible motor track, narrow and unstriped, same as SERVICE)
+        // alongside the original single exception this test asserted.
         assertFalse(RoadClass.SERVICE.hasCenterline, "Expected SERVICE (narrow, path-like) to stay unstriped");
+        assertFalse(RoadClass.TRACK.hasCenterline, "Expected TRACK (narrow, path-like) to stay unstriped");
         for (RoadClass roadClass : RoadClass.values()) {
-            if (roadClass != RoadClass.SERVICE) {
-                assertTrue(roadClass.hasCenterline, "Expected every class other than SERVICE to have a centerline, got false for " + roadClass);
+            if (roadClass != RoadClass.SERVICE && roadClass != RoadClass.TRACK) {
+                assertTrue(roadClass.hasCenterline, "Expected every class other than SERVICE/TRACK to have a centerline, got false for " + roadClass);
             }
         }
     }
