@@ -61,11 +61,26 @@ class RoadSurfaceRenderingTest {
 
         BlockState dirtTop = RoadSurfaceRendering.topSurfaceFor(
                 RoadSegment.CrossSection.PAVED, LayerMath.MIN_LAYERS, RoadSurfaceMaterial.DIRT_GROUND);
-        assertTrue(dirtTop.is(LayeredSlopesCompat.LAYERED_DIRT.get()), "Expected the layered DIRT compat block, got " + dirtTop);
+        assertTrue(dirtTop.is(LayeredSlopesCompat.layeredDirtFromLayeredSlopes()),
+                "Expected Layered Slopes' own dynamicterrain:layered_dirt (reused, not a new registration), got " + dirtTop);
+        assertEquals(LayerMath.MIN_LAYERS, dirtTop.getValue(LayeredBlock.LAYERS));
 
         BlockState sandTop = RoadSurfaceRendering.topSurfaceFor(
                 RoadSegment.CrossSection.PAVED, LayerMath.MIN_LAYERS, RoadSurfaceMaterial.SAND);
-        assertTrue(sandTop.is(LayeredSlopesCompat.LAYERED_SAND.get()), "Expected the layered SAND compat block, got " + sandTop);
+        assertTrue(sandTop.is(LayeredSlopesCompat.layeredSandFromLayeredSlopes()),
+                "Expected Layered Slopes' own dynamicterrain:layered_sand (reused, not a new registration), got " + sandTop);
+        assertEquals(LayerMath.MIN_LAYERS, sandTop.getValue(LayeredBlock.LAYERS));
+    }
+
+    /** John's review (56315): "inventory and reuse the compatible Layered Slopes palette first" -- confirms no duplicate block id was registered for either material. */
+    @Test
+    void dirtAndSandReuseLayeredSlopesOwnBlocksRatherThanRegisteringNewOnes() {
+        assertEquals(
+                net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("dynamicterrain", "layered_dirt"),
+                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(LayeredSlopesCompat.layeredDirtFromLayeredSlopes()));
+        assertEquals(
+                net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("dynamicterrain", "layered_sand"),
+                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(LayeredSlopesCompat.layeredSandFromLayeredSlopes()));
     }
 
     @Test

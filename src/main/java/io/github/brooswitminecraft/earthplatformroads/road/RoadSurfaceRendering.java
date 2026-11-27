@@ -4,9 +4,9 @@ import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.Layer
 import io.github.brooswitminecraft.layeredslopes.Anchor;
 import io.github.brooswitminecraft.layeredslopes.LayerMath;
 import io.github.brooswitminecraft.layeredslopes.LayeredBlock;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
-import net.neoforged.neoforge.registries.DeferredBlock;
 
 /**
  * Pure {@link BlockState} selection for a road column's top/under surface, by {@link
@@ -60,12 +60,12 @@ public final class RoadSurfaceRendering {
         if (crossSection == RoadSegment.CrossSection.SHOULDER) {
             return layers >= LayerMath.MAX_LAYERS
                     ? Blocks.GRAVEL.defaultBlockState()
-                    : layered(LayeredSlopesCompat.LAYERED_GRAVEL, layers);
+                    : layered(LayeredSlopesCompat.LAYERED_GRAVEL.get(), layers);
         }
         if (crossSection == RoadSegment.CrossSection.CENTERLINE && material.hasCenterlineMarking()) {
             return layers >= LayerMath.MAX_LAYERS
                     ? Blocks.YELLOW_TERRACOTTA.defaultBlockState()
-                    : layered(LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA, layers);
+                    : layered(LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA.get(), layers);
         }
         return layers >= LayerMath.MAX_LAYERS ? fullBlockFor(material) : layered(layeredBlockFor(material), layers);
     }
@@ -80,17 +80,22 @@ public final class RoadSurfaceRendering {
         };
     }
 
-    /** This family's own {@link LayeredBlock} registration -- see {@link LayeredSlopesCompat}. */
-    private static DeferredBlock<LayeredBlock> layeredBlockFor(RoadSurfaceMaterial material) {
+    /**
+     * This family's own layered block. PAVED/GRAVEL_COMPACTED are this mod's own {@link
+     * LayeredSlopesCompat} registrations (pre-existing, MINECRAFT-566); DIRT_GROUND/SAND instead
+     * reuse Layered Slopes' own already-registered {@code dynamicterrain:layered_dirt}/{@code
+     * layered_sand} directly -- see {@link LayeredSlopesCompat}'s own class doc for why.
+     */
+    private static Block layeredBlockFor(RoadSurfaceMaterial material) {
         return switch (material) {
-            case PAVED -> LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE;
-            case GRAVEL_COMPACTED -> LayeredSlopesCompat.LAYERED_GRAVEL;
-            case DIRT_GROUND -> LayeredSlopesCompat.LAYERED_DIRT;
-            case SAND -> LayeredSlopesCompat.LAYERED_SAND;
+            case PAVED -> LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get();
+            case GRAVEL_COMPACTED -> LayeredSlopesCompat.LAYERED_GRAVEL.get();
+            case DIRT_GROUND -> LayeredSlopesCompat.layeredDirtFromLayeredSlopes();
+            case SAND -> LayeredSlopesCompat.layeredSandFromLayeredSlopes();
         };
     }
 
-    private static BlockState layered(DeferredBlock<LayeredBlock> block, int layers) {
-        return block.get().defaultBlockState().setValue(LayeredBlock.ANCHOR, Anchor.FLOOR).setValue(LayeredBlock.LAYERS, layers);
+    private static BlockState layered(Block block, int layers) {
+        return block.defaultBlockState().setValue(LayeredBlock.ANCHOR, Anchor.FLOOR).setValue(LayeredBlock.LAYERS, layers);
     }
 }
