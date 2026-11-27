@@ -6,10 +6,9 @@ import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.Layer
 import io.github.brooswitminecraft.earthplatformroads.road.RoadNetwork;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadSegment;
 import io.github.brooswitminecraft.earthplatformroads.road.RoadSurfaceLayering;
-import io.github.brooswitminecraft.layeredslopes.Anchor;
-import io.github.brooswitminecraft.layeredslopes.LayerMath;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadSurfaceMaterial;
+import io.github.brooswitminecraft.earthplatformroads.road.RoadSurfaceRendering;
 import io.github.brooswitminecraft.layeredslopes.LayeredBlock;
-import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -68,42 +67,21 @@ public abstract class EarthGeneratorRoadMixin {
         // mixin paints an at-grade road, not a causeway or ford.
         if (water != SurfaceGenerator.DRY && water >= y) return;
         EarthGenerator self = (EarthGenerator) (Object) this;
-        RoadSegment segment = RoadNetwork.segmentCoveringColumn(self.grid(), x, z);
+        // MINECRAFT-586: one scoped cache for this single column's whole surface() call, including
+        // the up-to-120-lookup ring scan below -- see RoadNetwork.ScopedLookupCache's own doc for why
+        // reusing it only within this one synchronous call carries no staleness risk.
+        RoadNetwork.ScopedLookupCache cache = RoadNetwork.freshScopedLookupCache();
+        RoadSegment segment = RoadNetwork.segmentCoveringColumn(self.grid(), x, z, cache);
         if (segment == null) return;
         RoadSegment.CrossSection crossSection = segment.crossSectionAt(self.grid(), x, z);
         if (crossSection == RoadSegment.CrossSection.OFF_ROAD) return; // excluded (bridge/tunnel) way's own footprint check already ran in segmentCoveringColumn
         SurfaceGenerator.Surface original = cir.getReturnValue();
-        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y);
+        int distance = nearestLowerSameRoadDistance(self, segment, x, z, y, cache);
         int layers = RoadSurfaceLayering.layersForNearestLowerNeighbor(distance);
-        BlockState under = underSurfaceFor(crossSection);
-        BlockState top = topSurfaceFor(crossSection, layers);
+        RoadSurfaceMaterial material = RoadSurfaceMaterial.fromOsmSurfaceTag(segment.surface());
+        BlockState under = RoadSurfaceRendering.underSurfaceFor(crossSection, material);
+        BlockState top = RoadSurfaceRendering.topSurfaceFor(crossSection, layers, material);
         cir.setReturnValue(new SurfaceGenerator.Surface(original.biome(), top, under, 0, 0, 0, 0, 0, false));
-    }
-
-    /** The full-depth material under this zone's top surface -- blackstone under a painted centerline, gravel under a gravel shoulder. */
-    private static BlockState underSurfaceFor(RoadSegment.CrossSection crossSection) {
-        return crossSection == RoadSegment.CrossSection.SHOULDER
-                ? Blocks.GRAVEL.defaultBlockState()
-                : Blocks.POLISHED_BLACKSTONE.defaultBlockState();
-    }
-
-    /** Full block when no same-road neighbor within range is lower; a fractional layered block of this zone's own material that decays by distance to one that is. */
-    private static BlockState topSurfaceFor(RoadSegment.CrossSection crossSection, int layers) {
-        var layeredBlock = switch (crossSection) {
-            case CENTERLINE -> LayeredSlopesCompat.LAYERED_YELLOW_TERRACOTTA;
-            case SHOULDER -> LayeredSlopesCompat.LAYERED_GRAVEL;
-            case PAVED, OFF_ROAD -> LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE;
-        };
-        if (layers >= LayerMath.MAX_LAYERS) {
-            return switch (crossSection) {
-                case CENTERLINE -> Blocks.YELLOW_TERRACOTTA.defaultBlockState();
-                case SHOULDER -> Blocks.GRAVEL.defaultBlockState();
-                case PAVED, OFF_ROAD -> Blocks.POLISHED_BLACKSTONE.defaultBlockState();
-            };
-        }
-        return layeredBlock.get().defaultBlockState()
-                .setValue(LayeredBlock.ANCHOR, Anchor.FLOOR)
-                .setValue(LayeredBlock.LAYERS, layers);
     }
 
     /**
@@ -125,14 +103,15 @@ public abstract class EarthGeneratorRoadMixin {
      * terrain or someone else's road, neither of which this column's own surface should try to
      * match.
      */
-    private static int nearestLowerSameRoadDistance(EarthGenerator self, RoadSegment segment, int x, int z, int y) {
+    private static int nearestLowerSameRoadDistance(
+            EarthGenerator self, RoadSegment segment, int x, int z, int y, RoadNetwork.ScopedLookupCache cache) {
         var grid = self.grid();
         for (int distance = 1; distance <= RoadSurfaceLayering.MAX_NEIGHBOR_DISTANCE; distance++) {
             for (int ddx = -distance; ddx <= distance; ddx++) {
                 for (int ddz = -distance; ddz <= distance; ddz++) {
                     if (Math.max(Math.abs(ddx), Math.abs(ddz)) != distance) continue; // only this ring, not the filled square
                     int nx = x + ddx, nz = z + ddz;
-                    RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz);
+                    RoadSegment neighborSegment = RoadNetwork.segmentCoveringColumn(grid, nx, nz, cache);
                     if (neighborSegment == null || neighborSegment.wayId() != segment.wayId()) continue;
                     if (self.surfaceY(nx, nz) < y) return distance;
                 }

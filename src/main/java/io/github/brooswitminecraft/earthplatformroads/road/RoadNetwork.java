@@ -9,7 +9,9 @@ import io.earthplatform.geography.globe.MercatorGrid;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -101,6 +103,8 @@ public final class RoadNetwork {
      */
     private static final Duration TILE_FETCH_TIMEOUT = Duration.ofSeconds(20);
     private static final long DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS = 5000;
+    /** MINECRAFT-567: default cadence for the opt-in, off-by-default low-frequency fetch-telemetry report log line. */
+    private static final long DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS = 300;
 
     private static volatile RoadNetwork instance;
 
@@ -195,6 +199,49 @@ public final class RoadNetwork {
      * this per-save would mean resolving the active save's own directory from inside a mixin on
      * {@code EarthGenerator} (which does not expose one), not attempted here.
      */
+    /**
+     * MINECRAFT-567 (butchr reviews 55604, and the follow-up DNS-rebinding finding on GitHub comment
+     * 7085974767): the loopback-proxy slice's whole safety story depends on this switch only ever
+     * sending requests to the local machine. {@code URI.create} alone accepts any well-formed URI,
+     * including a real remote host, so this validates scheme (HTTP(S) only, no credentials leak via
+     * other schemes) and resolves the configured host to confirm it is actually a loopback address.
+     *
+     * <p>Resolving the hostname here is not enough by itself: if the returned URI still carried the
+     * original hostname, {@code HttpClient} would resolve it AGAIN at connection time, and a hostname
+     * that happened to answer loopback during this check (DNS rebinding, or a resolver/hosts change
+     * in between) could then connect off-box after validation -- a classic check-then-use gap. So
+     * this returns a rewritten URI whose host is the validated literal loopback address itself
+     * (scheme/port/path/query preserved); {@code HttpClient} connects to that literal address
+     * directly, with no second hostname resolution able to redirect it anywhere else.
+     *
+     * <p>Returns {@code null} for anything not usable as a loopback endpoint (bad syntax, non-HTTP(S)
+     * scheme, missing host, DNS failure, or a host that resolves off-box) -- the caller then falls
+     * through to the same network-disabled {@code about:blank} source as an unconfigured switch,
+     * never to the real direct-provider endpoint.
+     */
+    static URI pinnedLoopbackHttpEndpoint(String endpointProperty) {
+        try {
+            URI uri = URI.create(endpointProperty);
+            String scheme = uri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+                return null;
+            }
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return null;
+            InetAddress[] resolved = InetAddress.getAllByName(host);
+            if (resolved.length == 0) return null;
+            for (InetAddress address : resolved) {
+                if (!address.isLoopbackAddress()) return null;
+            }
+            String literalHost = resolved[0].getHostAddress();
+            if (resolved[0] instanceof java.net.Inet6Address) literalHost = "[" + literalHost + "]";
+            return new URI(uri.getScheme(), uri.getUserInfo(), literalHost, uri.getPort(), uri.getPath(),
+                    uri.getQuery(), uri.getFragment());
+        } catch (IllegalArgumentException | UnknownHostException | java.net.URISyntaxException e) {
+            return null;
+        }
+    }
+
     private static RoadTileSource buildDefaultTileSource() {
         try {
             Path cacheRoot = tileCacheRootOverride != null
@@ -203,6 +250,46 @@ public final class RoadNetwork {
 
             if (tileEndpointOverride != null) {
                 return new RoadTileSource(tileEndpointOverride, cacheRoot, true, TILE_FETCH_TIMEOUT);
+            }
+
+            // MINECRAFT-567 (John comments 55588/55593): a SEPARATE, opt-in, credential-free
+            // loopback-proxy mode, checked strictly BEFORE the ordinary direct-Overpass.ch opt-in
+            // chain below so that chain's own code path stays byte-for-byte unchanged whenever this
+            // switch is off (the ordinary, unmodified state of a real install: both
+            // Boolean.getBoolean and System.getProperty below return false/null with nothing set).
+            // Not a save-file/world setting -- gated on a JVM -D system property only, exactly like
+            // the existing previewProvider/previewEndpoint switches it sits beside.
+            boolean loopbackProxyEnabled = Boolean.getBoolean("earthplatformroads.loopbackProxyEnabled");
+            if (loopbackProxyEnabled) {
+                String loopbackEndpointProperty = System.getProperty("earthplatformroads.loopbackProxyEndpoint");
+                URI pinnedLoopbackEndpoint = loopbackEndpointProperty == null || loopbackEndpointProperty.isEmpty()
+                        ? null : pinnedLoopbackHttpEndpoint(loopbackEndpointProperty);
+                if (pinnedLoopbackEndpoint == null) {
+                    // Enabled but not configured, or configured with a non-HTTP(S)/non-loopback
+                    // target: a network-disabled source, exactly like the ordinary "opted in but
+                    // under-provisioned" case below -- never a silent fallback to the real
+                    // Overpass.ch direct endpoint, and never a send to a destination outside this
+                    // slice's loopback-only safety boundary (butchr reviews 55604 and the
+                    // DNS-rebinding follow-up on GitHub comment 7085974767).
+                    return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
+                }
+                long loopbackMinIntervalMs = Long.getLong("earthplatformroads.loopbackProxyMinRequestIntervalMs", 0L);
+                boolean telemetryReportingEnabledForLoopback = Boolean.getBoolean("earthplatformroads.fetchTelemetryReportingEnabled");
+                long telemetryReportIntervalSecondsForLoopback = Long.getLong(
+                        "earthplatformroads.fetchTelemetryReportIntervalSeconds", DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS);
+                // Credential-free by design (John comment 55588: "do not send keys to the proxy from
+                // Roads"): apiKey is always null here, regardless of whether
+                // EARTHPLATFORMROADS_PREVIEW_API_KEY happens to be set for direct mode. This is also
+                // structurally enforced one layer down -- RoadTileSource.shouldSendApiKeyTo only ever
+                // attaches a key when the configured endpoint exactly equals the Overpass.ch
+                // CREDENTIAL_BOUND_ENDPOINT, which a loopback URL never does -- but passing null here
+                // too means the key is never even held by a loopback-mode RoadTileSource instance.
+                // pinnedLoopbackEndpoint's host is the validated literal loopback address itself
+                // (never the original hostname), so HttpClient has no hostname left to resolve a
+                // second time -- it connects to that literal address directly.
+                return new RoadTileSource(pinnedLoopbackEndpoint, cacheRoot, true, TILE_FETCH_TIMEOUT,
+                        null, Duration.ofMillis(loopbackMinIntervalMs),
+                        telemetryReportingEnabledForLoopback, Duration.ofSeconds(telemetryReportIntervalSecondsForLoopback));
             }
 
             boolean optedIntoPreview = "overpass-ch".equals(System.getProperty("earthplatformroads.previewProvider"));
@@ -219,8 +306,16 @@ public final class RoadNetwork {
                 return new RoadTileSource(URI.create("about:blank"), cacheRoot, false, TILE_FETCH_TIMEOUT);
             }
             long minIntervalMs = Long.getLong("earthplatformroads.previewMinRequestIntervalMs", DEFAULT_PREVIEW_MIN_REQUEST_INTERVAL_MS);
+            // MINECRAFT-567: "optional low-frequency local reporting ... opt-in flag, off by
+            // default." Neither property below enables a network fetch on its own -- they only
+            // ever take effect once the live preview provider above is already fully
+            // provisioned; see RoadFetchTelemetry's own doc for exactly what the log line (never
+            // more than once per telemetryReportIntervalSeconds) contains.
+            boolean telemetryReportingEnabled = Boolean.getBoolean("earthplatformroads.fetchTelemetryReportingEnabled");
+            long telemetryReportIntervalSeconds = Long.getLong(
+                    "earthplatformroads.fetchTelemetryReportIntervalSeconds", DEFAULT_TELEMETRY_REPORT_INTERVAL_SECONDS);
             return new RoadTileSource(URI.create(previewEndpointProperty), cacheRoot, true, TILE_FETCH_TIMEOUT,
-                    apiKey, Duration.ofMillis(minIntervalMs));
+                    apiKey, Duration.ofMillis(minIntervalMs), telemetryReportingEnabled, Duration.ofSeconds(telemetryReportIntervalSeconds));
         } catch (RuntimeException e) {
             return null;
         }
@@ -247,6 +342,87 @@ public final class RoadNetwork {
     }
 
     /**
+     * MINECRAFT-586: a short-lived, caller-owned cache of {@link #candidatesNear}'s per-neighbor-cell
+     * {@link RoadTileSource#cellRead} reads, scoped to ONE generation pass over many columns that
+     * repeatedly re-derive the same cell -- e.g. {@code EarthGeneratorRoadMixin}'s {@code
+     * nearestLowerSameRoadDistance} (up to 120 {@link #segmentCoveringColumn} calls for one column,
+     * heavily overlapping Moore neighborhoods between adjacent ring positions) and {@link
+     * LevelRoadPreview#apply}'s 256-column section loop (every column in one 16x16 section typically
+     * falls in the same {@value #CELL_DEGREES}-degree cell, so 256 calls would otherwise repeat the
+     * exact same disk-cache reads). MINECRAFT-584 measured this as the hottest leaf cost ({@code
+     * RoadTileSource.readDiskCacheUncached}, via the uncached, never-memoized PENDING case) -- see
+     * that ticket's JFR findings.
+     *
+     * <p><b>Only ever caches a DEFINITIVE answer (John Winstead's ruling, MINECRAFT-586 comment
+     * 56072, superseding every earlier round's own version-counter/in-flight-flag machinery):</b> a
+     * cell is cached here if and only if {@link RoadTileSource#cellRead} reports it as {@code READY}
+     * or {@code CONFIRMED_EMPTY} -- never {@code PENDING}. Those two states are stable facts about
+     * this cell for the rest of this {@link RoadTileSource} instance's life (see {@link
+     * RoadTileSource.CellState}'s own doc and the long-standing invariants {@code RoadTileSourceTest}
+     * already proves: a confirmed-empty or ready result, once validated from disk, never reverts),
+     * so once cached here it can never go stale within this one generation pass either, with no
+     * invalidation logic of any kind needed. A still-PENDING cell is never written into this cache at
+     * all -- every access to it reads straight through to {@link RoadTileSource#cellRead} again, every
+     * time, exactly like the no-cache path below.
+     *
+     * <p>Several earlier rounds (version counters, optimistic-read/validate retry loops, a ref-counted
+     * publication-in-flight tracker, checked at ever-narrower points around each cache access) each
+     * patched one race only for review to find the next-narrower one hiding in the gap it left behind
+     * -- all of them were trying to make it safe to reuse a PENDING-derived answer across a window a
+     * real resolution could land in. 56072's ruling cuts that off at the root instead: don't reuse (or
+     * even store) a PENDING-derived answer at all, so there is no window to close, because there is no
+     * stored answer to call unsafe. The tradeoff, explicitly accepted by that ruling ("do not chase
+     * 1089->9 on pending cells at the expense of correctness"): a cell that stays genuinely pending
+     * for an entire pass gets NO dedupe benefit at all here (same disk cost as before this whole fix
+     * existed -- every access reads straight through). A cell that resolves to READY or
+     * CONFIRMED_EMPTY -- the common case once a region has actually been fetched, e.g. "most of the
+     * world has no roads" (MINECRAFT-566 comment 55562) -- is cached here too, but {@link
+     * RoadTileSource}'s own PRE-EXISTING {@code memory} layer (also MINECRAFT-566, predating this
+     * ticket entirely) already memoizes that exact same answer with zero disk I/O after its first
+     * validating read, with or without this cache -- so there is no disk-read reduction left for
+     * THIS cache to additionally claim credit for on that side. What this cache still buys for a
+     * resolved cell is avoiding a repeat call into {@link RoadTileSource} at all (one {@code HashMap}
+     * lookup here instead of one {@code ConcurrentHashMap} lookup plus the cell-key arithmetic
+     * there) -- real, but a CPU micro-saving, not a disk one.
+     */
+    public static final class ScopedLookupCache {
+        private final Map<Long, List<RoadSegment>> perCellTileReads = new HashMap<>();
+
+        /**
+         * The Moore-neighborhood (3x3, including {@code lat,lon}'s own cell) read {@link #candidatesNear}
+         * needs, reusing this pass's own cache where already known (definitive answers only -- see
+         * this class's own doc) and otherwise reading fresh.
+         */
+        private List<RoadSegment> readMooreNeighborhood(RoadTileSource tiles, double lat, double lon) {
+            List<RoadSegment> result = new ArrayList<>();
+            for (int dLat = -1; dLat <= 1; dLat++) {
+                for (int dLon = -1; dLon <= 1; dLon++) {
+                    result.addAll(readOneNeighborCell(tiles, lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+                }
+            }
+            return result;
+        }
+
+        private List<RoadSegment> readOneNeighborCell(RoadTileSource tiles, double neighborLat, double neighborLon) {
+            long neighborKey = cellKey(neighborLat, neighborLon);
+            List<RoadSegment> cached = perCellTileReads.get(neighborKey);
+            if (cached != null) return cached;
+            RoadTileSource.CellRead read = tiles.cellRead(neighborLat, neighborLon);
+            if (read.state() != RoadTileSource.CellState.PENDING) {
+                // Definitive (READY or CONFIRMED_EMPTY): a stable fact for the rest of this pass --
+                // see this class's own doc for why that makes this safe with no invalidation at all.
+                perCellTileReads.put(neighborKey, read.ways());
+            }
+            return read.ways();
+        }
+    }
+
+    /** A fresh, empty {@link ScopedLookupCache} for one generation pass; see that class's own doc. */
+    public static ScopedLookupCache freshScopedLookupCache() {
+        return new ScopedLookupCache();
+    }
+
+    /**
      * The first mapped at-grade way covering this column, or {@code null} if none does. A mapped
      * bridge or tunnel way never matches here -- this mod cannot yet render a grade-separated
      * crossing correctly, and the ticket is explicit that an unsupported gap must be reported, not
@@ -254,8 +430,13 @@ public final class RoadNetwork {
      * {@link #excludedBridgesAndTunnels()} for the explicit list of what that excludes).
      */
     public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z) {
+        return segmentCoveringColumn(grid, x, z, null);
+    }
+
+    /** {@link #segmentCoveringColumn(MercatorGrid, int, int)}, reusing {@code cache} (see {@link ScopedLookupCache}) across repeated calls within one generation pass; {@code null} behaves exactly like the no-cache overload. */
+    public static RoadSegment segmentCoveringColumn(MercatorGrid grid, int x, int z, ScopedLookupCache cache) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), cache)) {
             if (segment.bridge() || segment.tunnel()) continue;
             if (segment.coversColumn(grid, x, z)) return segment;
         }
@@ -293,7 +474,7 @@ public final class RoadNetwork {
     public static ColumnDiagnosis diagnoseColumn(MercatorGrid grid, int x, int z) {
         GeoPoint here = grid.geographic(x + 0.5, z + 0.5);
         boolean anyBridgeOrTunnelCovers = false;
-        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude())) {
+        for (RoadSegment segment : candidatesNear(here.latitude(), here.longitude(), null)) {
             if (segment.coversColumn(grid, x, z)) {
                 if (segment.bridge() || segment.tunnel()) {
                     anyBridgeOrTunnelCovers = true;
@@ -356,22 +537,35 @@ public final class RoadNetwork {
      * never exercised that deadline. This version needs no additional network calls at all, so it
      * cannot run into that problem.
      */
-    private static List<RoadSegment> candidatesNear(double lat, double lon) {
+    private static List<RoadSegment> candidatesNear(double lat, double lon, ScopedLookupCache cache) {
         List<RoadSegment> preloaded = instance().cellIndex.get(cellKey(lat, lon));
         RoadTileSource tiles = tileSource();
         if (tiles == null) return preloaded == null ? List.of() : preloaded;
 
-        List<RoadSegment> fromTiles = new ArrayList<>();
-        for (int dLat = -1; dLat <= 1; dLat++) {
-            for (int dLon = -1; dLon <= 1; dLon++) {
-                fromTiles.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
-            }
-        }
+        // Keyed by each neighbor cell itself (not the center lat/lon) so overlapping Moore
+        // neighborhoods from DIFFERENT centers -- the common case across a ring scan or a section's
+        // columns -- actually share hits, not just repeats of the exact same center. See
+        // ScopedLookupCache.readMooreNeighborhood's own doc for the optimistic-read/validate loop
+        // that makes reusing this cache provably safe against a resolution landing mid-read.
+        List<RoadSegment> fromTiles = cache == null
+                ? readMooreNeighborhoodUncached(tiles, lat, lon)
+                : cache.readMooreNeighborhood(tiles, lat, lon);
         if (fromTiles.isEmpty()) return preloaded == null ? List.of() : preloaded;
         if (preloaded == null || preloaded.isEmpty()) return fromTiles;
         List<RoadSegment> merged = new ArrayList<>(preloaded);
         merged.addAll(fromTiles);
         return merged;
+    }
+
+    /** {@code candidatesNear}'s Moore-neighborhood read with no cache at all -- every caller not on MINECRAFT-584's measured hot path. */
+    private static List<RoadSegment> readMooreNeighborhoodUncached(RoadTileSource tiles, double lat, double lon) {
+        List<RoadSegment> result = new ArrayList<>();
+        for (int dLat = -1; dLat <= 1; dLat++) {
+            for (int dLon = -1; dLon <= 1; dLon++) {
+                result.addAll(tiles.cachedWaysForCellOrEmpty(lat + dLat * CELL_DEGREES, lon + dLon * CELL_DEGREES));
+            }
+        }
+        return result;
     }
 
     private static long cellKey(double lat, double lon) {
@@ -474,7 +668,8 @@ public final class RoadNetwork {
         checkSchemaVersion(root, source);
         List<RoadSegment> ways = new ArrayList<>();
         for (JsonElement wayElement : root.getAsJsonArray("ways")) {
-            ways.add(parseWay(wayElement.getAsJsonObject()));
+            RoadSegment way = parseWay(wayElement.getAsJsonObject());
+            if (way != null) ways.add(way); // null: an eligible-looking way tag that a motor_vehicle=no check excluded -- see parseWay
         }
         return ways;
     }
@@ -496,7 +691,12 @@ public final class RoadNetwork {
         }
     }
 
-    /** Package-private (not private) so {@code RoadNetworkLoaderTest} can exercise it directly against a constructed way, without a bundled resource file. */
+    /**
+     * Package-private (not private) so {@code RoadNetworkLoaderTest} can exercise it directly against a
+     * constructed way, without a bundled resource file. {@code null} only for an otherwise-eligible
+     * {@code highway=track} way explicitly tagged {@code motor_vehicle=no} -- see
+     * {@link #excludedAsFootOnlyTrack}; MINECRAFT-568's "include eligible motor tracks carefully."
+     */
     static RoadSegment parseWay(JsonObject way) {
         JsonObject tags = way.getAsJsonObject("way_tags");
         String name = tags.has("name") ? tags.get("name").getAsString() : ("way " + way.get("way_id").getAsLong());
@@ -507,8 +707,10 @@ public final class RoadNetwork {
                     "Bundled way " + way.get("way_id").getAsLong() + " has non-vehicular highway=" + highway
                             + "; foot trails must not be ingested as roads");
         }
+        if (excludedAsFootOnlyTrack(roadClass, tags)) return null;
         int lanes = tags.has("lanes") ? parseLanes(tags.get("lanes").getAsString()) : 0;
         double halfWidth = roadClass.pavedHalfWidthBlocks(lanes);
+        String surface = tags.has("surface") ? tags.get("surface").getAsString() : null;
 
         JsonArray centerlineJson = way.getAsJsonArray("centerline");
         GeoPoint[] centerline = new GeoPoint[centerlineJson.size()];
@@ -528,7 +730,19 @@ public final class RoadNetwork {
         boolean tunnel = way.has("tunnel") && way.get("tunnel").getAsBoolean();
         int layer = way.has("layer") ? way.get("layer").getAsInt() : 0;
 
-        return new RoadSegment(way.get("way_id").getAsLong(), name, roadClass, centerline, nodeIds, halfWidth, bridge, tunnel, layer);
+        return new RoadSegment(way.get("way_id").getAsLong(), name, roadClass, centerline, nodeIds, halfWidth, bridge, tunnel, layer, surface);
+    }
+
+    /**
+     * MINECRAFT-568: {@code highway=track} is a mapped vehicular way by default (unlike the other
+     * foot-only values this mod never ingests at all -- see {@link RoadClass}'s own class doc), but
+     * an explicit {@code motor_vehicle=no} on that same way means it is foot/animal-only despite the
+     * {@code track} value, exactly like the foot-only highway values this mod has always excluded.
+     * Checked only for {@link RoadClass#TRACK} -- a non-track class carrying {@code motor_vehicle=no}
+     * (e.g. a residential street closed to cars) is not this ticket's scope and is left unchanged.
+     */
+    private static boolean excludedAsFootOnlyTrack(RoadClass roadClass, JsonObject tags) {
+        return roadClass == RoadClass.TRACK && tags.has("motor_vehicle") && "no".equals(tags.get("motor_vehicle").getAsString());
     }
 
     /** OSM {@code lanes} is free text in principle; a non-numeric value (e.g. a bad import) falls back to the class default. */

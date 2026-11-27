@@ -35,7 +35,17 @@ public enum RoadClass {
     /** Narrow, path-like, deliberately unstriped per MINECRAFT-566's styling ask -- see this enum's own class doc. */
     SERVICE(3.0, false),
     /** OSM's generic "a road exists here, not yet classified" value; rare, but still a mapped vehicular way. */
-    ROAD(4.0, true);
+    ROAD(4.0, true),
+    /**
+     * MINECRAFT-568: an eligible motor track (not excluded by {@code motor_vehicle=no} -- see the
+     * parsers that check that tag before ever constructing this class). Narrow and unstriped, like
+     * {@link #SERVICE}: a track is included here carefully, as a real vehicular way when mapped as
+     * one, never because this mod assumes a track implies any particular surface -- its material
+     * still comes from the explicit {@code surface} tag (or the same {@link RoadSurfaceMaterial#PAVED}
+     * class default as everything else when that tag is missing), per {@link RoadSurfaceMaterial}'s
+     * own class doc.
+     */
+    TRACK(3.0, false);
 
     /** Default PAVED half-width in blocks (not counting the gravel shoulder) when the way carries no usable {@code lanes} tag. */
     public final double defaultPavedHalfWidthBlocks;
@@ -62,7 +72,8 @@ public enum RoadClass {
             Map.entry("secondary_link", SECONDARY_LINK),
             Map.entry("tertiary_link", TERTIARY_LINK),
             Map.entry("service", SERVICE),
-            Map.entry("road", ROAD));
+            Map.entry("road", ROAD),
+            Map.entry("track", TRACK));
 
     /** {@code null} for any {@code highway} value this mod does not treat as a vehicular road. */
     public static RoadClass fromOsmHighway(String highway) {

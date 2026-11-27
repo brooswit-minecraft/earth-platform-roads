@@ -33,6 +33,15 @@ import java.util.List;
  * what guarantees the centerline can never land outside the paved surface (a John-named acceptance
  * requirement) regardless of how a curve or junction's nearest-segment geometry behaves -- there is
  * no separate, independently-computed centerline check that could disagree with the paved one.
+ *
+ * <p><b>{@code surface} (MINECRAFT-568)</b>: the raw, lowercase-normalized OSM {@code surface} tag
+ * value as mapped, or {@code null} when the way carried no {@code surface} tag at all -- kept raw,
+ * not pre-resolved to a {@link RoadSurfaceMaterial}, so "never tagged" stays distinguishable from
+ * "tagged with a value this build doesn't recognize" for provenance, even though
+ * {@link RoadSurfaceMaterial#fromOsmSurfaceTag} currently renders both identically ({@link
+ * RoadSurfaceMaterial#PAVED}). Optional in the on-disk region/tile JSON (see {@code toWayJson}/
+ * {@code RoadNetwork#parseWay}): an older cached or bundled file with no {@code "surface"} key parses
+ * exactly as before, with this field {@code null} -- no schema version bump, no cache flush.
  */
 public record RoadSegment(
         long wayId,
@@ -43,7 +52,8 @@ public record RoadSegment(
         double pavedHalfWidthBlocks,
         boolean bridge,
         boolean tunnel,
-        int layer) {
+        int layer,
+        String surface) {
     /** Thin stripe astride the centerline itself -- "a centerline, not a whole lane" per John's styling ask. */
     public static final double CENTERLINE_HALF_WIDTH_BLOCKS = 0.5;
     /** Narrow gravel shoulder immediately outside the paved surface, on both edges. */
@@ -60,9 +70,15 @@ public record RoadSegment(
         }
     }
 
-    /** Minimal constructor for geometry that predates class/junction/bridge tracking (MINECRAFT-564's pinned fixture, and tests). */
+    /** Minimal constructor for geometry that predates class/junction/bridge/surface tracking (MINECRAFT-564's pinned fixture, and tests). */
     public RoadSegment(String name, GeoPoint[] centerline, double pavedHalfWidthBlocks) {
-        this(0L, name, RoadClass.SECONDARY, centerline, new long[0], pavedHalfWidthBlocks, false, false, 0);
+        this(0L, name, RoadClass.SECONDARY, centerline, new long[0], pavedHalfWidthBlocks, false, false, 0, null);
+    }
+
+    /** 9-arg constructor predating MINECRAFT-568's surface tracking: defaults {@code surface} to {@code null} (never mapped), same as not writing the tag at all. */
+    public RoadSegment(long wayId, String name, RoadClass roadClass, GeoPoint[] centerline, long[] nodeIds,
+            double pavedHalfWidthBlocks, boolean bridge, boolean tunnel, int layer) {
+        this(wayId, name, roadClass, centerline, nodeIds, pavedHalfWidthBlocks, bridge, tunnel, layer, null);
     }
 
     /** The full footprint's own half-width, paved surface plus the gravel shoulder on each side. */
@@ -156,6 +172,7 @@ public record RoadSegment(
         JsonObject tags = new JsonObject();
         tags.addProperty("highway", roadClass.name().toLowerCase(java.util.Locale.ROOT));
         tags.addProperty("name", name);
+        if (surface != null) tags.addProperty("surface", surface); // omitted entirely when never mapped -- see this record's own doc
         json.add("way_tags", tags);
         JsonArray centerlineJson = new JsonArray();
         for (GeoPoint point : centerline) {

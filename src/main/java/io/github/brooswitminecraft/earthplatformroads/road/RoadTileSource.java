@@ -70,6 +70,7 @@ public final class RoadTileSource {
     private final Duration minRequestInterval;
     private final HttpClient http;
     private final ConcurrentHashMap<Long, List<RoadSegment>> memory = new ConcurrentHashMap<>();
+
     /**
      * One lock object per cell ever requested from this instance, used only to deduplicate
      * concurrent fetch attempts FOR THE SAME CELL -- deliberately NOT a single global lock (that
@@ -493,6 +494,20 @@ public final class RoadTileSource {
         return apiKey != null && !apiKey.isEmpty() && CREDENTIAL_BOUND_ENDPOINT.equals(endpoint);
     }
 
+    /**
+     * MINECRAFT-567: this instance's own local aggregate fetch/cache counters -- see
+     * {@link RoadFetchTelemetry}'s own doc for the exact six categories and the call sites below
+     * that feed each one. Low-frequency reporting defaults off (see the single-arg
+     * {@link RoadFetchTelemetry} constructor this falls back to); the final constructor overload
+     * below lets a caller opt into reporting explicitly.
+     */
+    private final RoadFetchTelemetry telemetry;
+
+    /** This instance's own {@link RoadFetchTelemetry} -- pure read-only instrumentation, never consulted for any caching/fetch decision. */
+    public RoadFetchTelemetry telemetry() {
+        return telemetry;
+    }
+
     public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout) {
         this(endpoint, cacheRoot, allowNetwork, timeout, null, Duration.ZERO);
     }
@@ -518,6 +533,23 @@ public final class RoadTileSource {
      *                           serialization {@link #networkLock} already provides.
      */
     public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout, String apiKey, Duration minRequestInterval) {
+        this(endpoint, cacheRoot, allowNetwork, timeout, apiKey, minRequestInterval, false, null);
+    }
+
+    /**
+     * MINECRAFT-567: the same production wiring as the six-arg constructor above, with an
+     * explicit opt-in to {@link RoadFetchTelemetry}'s own low-frequency local reporting --
+     * {@code telemetryReportingEnabled} defaults to {@code false} on every OTHER constructor in
+     * this class, matching the ticket's "off by default" requirement; only a caller that reaches
+     * THIS overload explicitly can turn it on.
+     *
+     * @param telemetryReportIntervalOverride Minimum real-world time between one low-frequency
+     *                                        telemetry report log line and the next; {@code null}
+     *                                        keeps {@link RoadFetchTelemetry}'s own 300-second
+     *                                        default.
+     */
+    public RoadTileSource(URI endpoint, Path cacheRoot, boolean allowNetwork, Duration timeout, String apiKey,
+            Duration minRequestInterval, boolean telemetryReportingEnabled, Duration telemetryReportIntervalOverride) {
         this.endpoint = endpoint;
         this.cacheRoot = cacheRoot;
         this.allowNetwork = allowNetwork;
@@ -525,6 +557,7 @@ public final class RoadTileSource {
         this.apiKey = apiKey;
         this.minRequestInterval = minRequestInterval == null ? Duration.ZERO : minRequestInterval;
         this.http = HttpClient.newBuilder().connectTimeout(timeout).followRedirects(HttpClient.Redirect.NEVER).build();
+        this.telemetry = new RoadFetchTelemetry(telemetryReportingEnabled, telemetryReportIntervalOverride);
     }
 
     /**
@@ -562,9 +595,36 @@ public final class RoadTileSource {
         // lookup, matching the original zero-allocation warm path, rather than always paying for a
         // String concat and two Path.resolve calls regardless of whether they end up needed.
         List<RoadSegment> warm = memory.get(key);
+        if (warm != null) telemetry.recordMemoryHit();
         List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
         if (loaded == null) return CellState.PENDING;
         return loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY;
+    }
+
+    /** {@link #cellState} paired with the actual ways, from the one shared validated-load read; see {@link #cellRead}. */
+    record CellRead(CellState state, List<RoadSegment> ways) {}
+
+    /**
+     * MINECRAFT-586 (John Winstead's ruling, Jira comment 56072): {@code RoadNetwork.ScopedLookupCache}
+     * needs BOTH the actual ways AND whether this cell's answer is definitive (not {@code PENDING})
+     * to decide whether it may cache a result at all -- it must never cache (or reuse) a PENDING-
+     * derived answer, only ever a definitive one, since only a definitive answer is a stable fact that
+     * cannot later change. Calling {@link #cellState} and {@link #cachedWaysForCellOrEmpty} separately
+     * would each independently pay for their own disk read on a cold miss (since neither one by
+     * itself memoizes a PENDING result) -- doubling the real disk cost of every still-pending cell,
+     * exactly the cost MINECRAFT-584 flagged as the bottleneck in the first place. This instead shares
+     * the ONE underlying {@link #memory}/{@link #readDiskCacheUncached} read both of those methods
+     * already use, at the same one-check cost as either alone.
+     */
+    CellRead cellRead(double lat, double lon) {
+        long cellLat = (long) Math.floor(lat / RoadNetwork.CELL_DEGREES);
+        long cellLon = (long) Math.floor(lon / RoadNetwork.CELL_DEGREES);
+        long key = (cellLat << 32) ^ (cellLon & 0xFFFFFFFFL);
+        List<RoadSegment> warm = memory.get(key);
+        if (warm != null) telemetry.recordMemoryHit();
+        List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
+        if (loaded == null) return new CellRead(CellState.PENDING, List.of());
+        return new CellRead(loaded.isEmpty() ? CellState.CONFIRMED_EMPTY : CellState.READY, loaded);
     }
 
     /**
@@ -595,6 +655,7 @@ public final class RoadTileSource {
         // MINECRAFT-566 comment 55567: same warm-path allocation concern as cellState's own doc --
         // check memory before building cellId/Path objects at all.
         List<RoadSegment> warm = memory.get(key);
+        if (warm != null) telemetry.recordMemoryHit();
         List<RoadSegment> loaded = warm != null ? warm : readDiskCacheUncached(key, cellLat, cellLon);
         return loaded != null ? loaded : List.of();
     }
@@ -766,7 +827,10 @@ public final class RoadTileSource {
      */
     private List<RoadSegment> readDiskCacheIfPresent(long key, Path readyFile, Path emptyFile) {
         List<RoadSegment> cached = memory.get(key);
-        if (cached != null) return cached;
+        if (cached != null) {
+            telemetry.recordMemoryHit();
+            return cached;
+        }
         return readDiskCacheUncached(key, readyFile, emptyFile);
     }
 
@@ -812,6 +876,7 @@ public final class RoadTileSource {
     private List<RoadSegment> readDiskCacheUncached(long key, Path readyFile, Path emptyFile) {
         try {
             if (Files.isRegularFile(readyFile)) {
+                telemetry.recordJsonPayloadRead(); // MINECRAFT-567: the actual .json payload read, not merely the isRegularFile metadata check above
                 List<RoadSegment> ways = readCachedCell(readyFile);
                 memory.put(key, ways);
                 return ways;
@@ -823,7 +888,22 @@ public final class RoadTileSource {
         } catch (IOException e) {
             throw new IllegalStateException("Could not read road tile cache at " + cacheRoot, e);
         }
+        uncachedPendingReadCount.incrementAndGet();
         return null;
+    }
+
+    /**
+     * MINECRAFT-586: counts every uncached disk check this method performs for a cell that is still
+     * PENDING -- MINECRAFT-584's own measured bottleneck ({@code readDiskCacheUncached} as the
+     * hottest leaf method, via exactly this never-memoized branch). Test-only; lets
+     * {@code RoadNetworkScopedLookupCacheTest} measure, directly and exactly, how many of these this
+     * class's own dedupe fix actually avoids, rather than only inferring it from wall-clock timing.
+     */
+    private final AtomicLong uncachedPendingReadCount = new AtomicLong();
+
+    /** The current value of {@link #uncachedPendingReadCount}; see that field's own doc. */
+    long uncachedPendingReadCountForTests() {
+        return uncachedPendingReadCount.get();
     }
 
     /**
@@ -838,7 +918,13 @@ public final class RoadTileSource {
      * either uniformly as "not a valid marker," never a hard failure of this whole lookup.
      */
     private boolean isValidEmptyMarker(Path emptyFile) throws IOException {
-        if (Files.size(emptyFile) == 0) return true;
+        if (Files.size(emptyFile) == 0) {
+            // MINECRAFT-567: this is the metadata-only check -- a stat-sized zero-byte file is
+            // trusted outright with no payload read at all, counted distinctly from the real
+            // payload read just below.
+            telemetry.recordMetadataZeroByteCheck();
+            return true;
+        }
         try {
             // MINECRAFT-566 comment 55572: parsing successfully is not, on its own, proof this is
             // genuinely a CONFIRMED-EMPTY marker -- a non-empty ways array under a ".empty" name
@@ -846,6 +932,7 @@ public final class RoadTileSource {
             // extension) would otherwise be silently trusted and its real ways DISCARDED (the
             // caller always returns List.of() for a ".empty" hit, regardless of what was actually
             // parsed). Require the parsed ways list to actually BE empty, not merely parseable.
+            telemetry.recordEmptyMarkerPayloadRead(); // MINECRAFT-567: an actual non-zero-byte .empty payload read, not a metadata-only check
             return readCachedCell(emptyFile).isEmpty();
         } catch (IOException | RuntimeException malformed) {
             return false;
@@ -879,6 +966,7 @@ public final class RoadTileSource {
         String body;
         synchronized (networkLock) {
             if (clock.instant().isBefore(nextEligibleRequestAt)) {
+                telemetry.recordSuppressedRequest(); // MINECRAFT-567: declined before ever reaching the network -- never counted as a send
                 throw new NotYetEligibleException();
             }
             String query = """
@@ -897,6 +985,7 @@ public final class RoadTileSource {
             }
             HttpResponse<String> response;
             try {
+                telemetry.recordHttpSend(); // MINECRAFT-567: one real outbound send, including a genuine retry -- never a suppressed request
                 response = http.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
