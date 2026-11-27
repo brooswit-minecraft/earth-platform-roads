@@ -28,6 +28,12 @@ final class OverpassWayParser {
             String highway = tags.get("highway").getAsString();
             RoadClass roadClass = RoadClass.fromOsmHighway(highway);
             if (roadClass == null) continue; // a foot-only or otherwise non-vehicular way: not ingested, same as a bundled extract
+            // MINECRAFT-568: an eligible motor track is ingested, but one explicitly closed to motor
+            // vehicles is foot/animal-only despite the highway=track value -- see RoadNetwork.parseWay's
+            // own doc on the identical check applied to bundled/external/cached region data.
+            if (roadClass == RoadClass.TRACK && tags.has("motor_vehicle") && "no".equals(tags.get("motor_vehicle").getAsString())) {
+                continue;
+            }
 
             JsonArray geometry = obj.getAsJsonArray("geometry");
             GeoPoint[] centerline = new GeoPoint[geometry.size()];
@@ -49,9 +55,10 @@ final class OverpassWayParser {
             boolean bridge = tags.has("bridge") && !"no".equals(tags.get("bridge").getAsString());
             boolean tunnel = tags.has("tunnel") && !"no".equals(tags.get("tunnel").getAsString());
             int layer = tags.has("layer") ? parseLayer(tags.get("layer").getAsString()) : 0;
+            String surface = tags.has("surface") ? tags.get("surface").getAsString() : null;
 
             ways.add(new RoadSegment(obj.get("id").getAsLong(), name(tags, obj), roadClass, centerline, nodeIds,
-                    roadClass.pavedHalfWidthBlocks(lanes), bridge, tunnel, layer));
+                    roadClass.pavedHalfWidthBlocks(lanes), bridge, tunnel, layer, surface));
         }
         return ways;
     }

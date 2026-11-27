@@ -668,7 +668,8 @@ public final class RoadNetwork {
         checkSchemaVersion(root, source);
         List<RoadSegment> ways = new ArrayList<>();
         for (JsonElement wayElement : root.getAsJsonArray("ways")) {
-            ways.add(parseWay(wayElement.getAsJsonObject()));
+            RoadSegment way = parseWay(wayElement.getAsJsonObject());
+            if (way != null) ways.add(way); // null: an eligible-looking way tag that a motor_vehicle=no check excluded -- see parseWay
         }
         return ways;
     }
@@ -690,7 +691,12 @@ public final class RoadNetwork {
         }
     }
 
-    /** Package-private (not private) so {@code RoadNetworkLoaderTest} can exercise it directly against a constructed way, without a bundled resource file. */
+    /**
+     * Package-private (not private) so {@code RoadNetworkLoaderTest} can exercise it directly against a
+     * constructed way, without a bundled resource file. {@code null} only for an otherwise-eligible
+     * {@code highway=track} way explicitly tagged {@code motor_vehicle=no} -- see
+     * {@link #excludedAsFootOnlyTrack}; MINECRAFT-568's "include eligible motor tracks carefully."
+     */
     static RoadSegment parseWay(JsonObject way) {
         JsonObject tags = way.getAsJsonObject("way_tags");
         String name = tags.has("name") ? tags.get("name").getAsString() : ("way " + way.get("way_id").getAsLong());
@@ -701,8 +707,10 @@ public final class RoadNetwork {
                     "Bundled way " + way.get("way_id").getAsLong() + " has non-vehicular highway=" + highway
                             + "; foot trails must not be ingested as roads");
         }
+        if (excludedAsFootOnlyTrack(roadClass, tags)) return null;
         int lanes = tags.has("lanes") ? parseLanes(tags.get("lanes").getAsString()) : 0;
         double halfWidth = roadClass.pavedHalfWidthBlocks(lanes);
+        String surface = tags.has("surface") ? tags.get("surface").getAsString() : null;
 
         JsonArray centerlineJson = way.getAsJsonArray("centerline");
         GeoPoint[] centerline = new GeoPoint[centerlineJson.size()];
@@ -722,7 +730,19 @@ public final class RoadNetwork {
         boolean tunnel = way.has("tunnel") && way.get("tunnel").getAsBoolean();
         int layer = way.has("layer") ? way.get("layer").getAsInt() : 0;
 
-        return new RoadSegment(way.get("way_id").getAsLong(), name, roadClass, centerline, nodeIds, halfWidth, bridge, tunnel, layer);
+        return new RoadSegment(way.get("way_id").getAsLong(), name, roadClass, centerline, nodeIds, halfWidth, bridge, tunnel, layer, surface);
+    }
+
+    /**
+     * MINECRAFT-568: {@code highway=track} is a mapped vehicular way by default (unlike the other
+     * foot-only values this mod never ingests at all -- see {@link RoadClass}'s own class doc), but
+     * an explicit {@code motor_vehicle=no} on that same way means it is foot/animal-only despite the
+     * {@code track} value, exactly like the foot-only highway values this mod has always excluded.
+     * Checked only for {@link RoadClass#TRACK} -- a non-track class carrying {@code motor_vehicle=no}
+     * (e.g. a residential street closed to cars) is not this ticket's scope and is left unchanged.
+     */
+    private static boolean excludedAsFootOnlyTrack(RoadClass roadClass, JsonObject tags) {
+        return roadClass == RoadClass.TRACK && tags.has("motor_vehicle") && "no".equals(tags.get("motor_vehicle").getAsString());
     }
 
     /** OSM {@code lanes} is free text in principle; a non-numeric value (e.g. a bad import) falls back to the class default. */

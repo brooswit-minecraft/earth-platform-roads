@@ -50,6 +50,22 @@ public final class LayeredSlopesCompat {
             LayeredBlock::new,
             BlockBehaviour.Properties.ofFullCopy(Blocks.GRAVEL).noOcclusion());
 
+    /**
+     * MINECRAFT-568's first-slice dirt/ground road surface fallback -- {@link LayeredBlock} extends
+     * plain {@code Block}, not {@code FallingBlock}, so unlike vanilla dirt-adjacent falling blocks
+     * this never has falling-block physics, exactly like {@link #LAYERED_GRAVEL} above.
+     */
+    public static final DeferredBlock<LayeredBlock> LAYERED_DIRT = BLOCKS.registerBlock(
+            "layered_dirt",
+            LayeredBlock::new,
+            BlockBehaviour.Properties.ofFullCopy(Blocks.DIRT).noOcclusion());
+
+    /** MINECRAFT-568's sand road surface family; never falls, by the same {@link LayeredBlock}-is-not-{@code FallingBlock} reasoning as {@link #LAYERED_GRAVEL}/{@link #LAYERED_DIRT}. */
+    public static final DeferredBlock<LayeredBlock> LAYERED_SAND = BLOCKS.registerBlock(
+            "layered_sand",
+            LayeredBlock::new,
+            BlockBehaviour.Properties.ofFullCopy(Blocks.SAND).noOcclusion());
+
     public static final DeferredItem<BlockItem> LAYERED_POLISHED_BLACKSTONE_ITEM =
             ITEMS.registerSimpleBlockItem(LAYERED_POLISHED_BLACKSTONE);
 
@@ -58,6 +74,12 @@ public final class LayeredSlopesCompat {
 
     public static final DeferredItem<BlockItem> LAYERED_GRAVEL_ITEM =
             ITEMS.registerSimpleBlockItem(LAYERED_GRAVEL);
+
+    public static final DeferredItem<BlockItem> LAYERED_DIRT_ITEM =
+            ITEMS.registerSimpleBlockItem(LAYERED_DIRT);
+
+    public static final DeferredItem<BlockItem> LAYERED_SAND_ITEM =
+            ITEMS.registerSimpleBlockItem(LAYERED_SAND);
 
     private LayeredSlopesCompat() {}
 
