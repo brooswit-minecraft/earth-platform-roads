@@ -5,17 +5,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mojang.serialization.Lifecycle;
 import io.earthplatform.geography.GeoPoint;
+import io.earthplatform.geography.globe.MercatorGrid;
 import io.earthplatform.geography.globe.TerrariumTileSource;
 import io.earthplatform.minecraft.cubic.earth.EarthGenerator;
 import io.earthplatform.minecraft.cubic.earth.EarthSettings;
 import io.github.brooswitminecraft.earthplatformroads.compat.layeredslopes.LayeredSlopesCompat;
 import io.github.brooswitminecraft.layeredslopes.LayerMath;
+import io.github.brooswitminecraft.layeredslopes.LayeredBlock;
+import java.awt.image.BufferedImage;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import javax.imageio.ImageIO;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.MappedRegistry;
@@ -32,19 +36,22 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Review follow-up (Wroosbit comment 56339, CHANGES_REQUESTED on PR #12 @ e906078): {@code
+ * Review follow-up (Wroosbit 56339, then 56351 on this file's own first version): {@code
  * RoadSurfaceRenderingTest} only ever calls {@code RoadSurfaceRendering.topSurfaceFor} directly --
  * real block selection, but never through the applied {@code EarthGeneratorRoadMixin}, a real {@code
  * EarthGenerator.generate}, or a real generated {@code LevelChunkSection}. This fixture closes that
- * gap: every test here writes an actual on-disk road-tile cache file (the same disk format {@code
- * RoadTileSource} reads in production, network disabled so no provider request ever happens --
- * same offline pattern {@code RoadTilePrefetchMixinTest} already uses), builds a REAL {@link
- * EarthGenerator} (real DEM-backed ground height, same as {@code RoadGenerationTest}), and reads
- * back the ACTUAL generated {@link BlockState} at the real column the road covers.
+ * gap -- and 56351 additionally found the first version's DEM source was NOT offline (real
+ * {@code TerrariumTileSource.AWS_TERRAIN_TILES} with {@code allowNetwork=true}), even though the
+ * road tile source was. Both sources are offline here: every test writes an actual on-disk road
+ * tile-cache file (production format, network disabled, same pattern {@code RoadTilePrefetchMixinTest}
+ * already uses) AND seeds a synthetic, network-disabled {@link TerrariumTileSource} cache directly
+ * (same technique {@code LevelRoadPreviewOfflineTest} already uses for a fully offline real
+ * generator), builds a REAL {@link EarthGenerator}, and reads back the ACTUAL generated {@link
+ * BlockState}.
  *
- * <p>Every fixture here uses a brand-new, never-bundled real-world coordinate (never the pinned
- * Yosemite Southside Drive extract {@code RoadGenerationTest} already covers), so there is no
- * ambiguity between this test's own road and the bundled one at the same column.
+ * <p>Every fixture here uses its own fresh block-coordinate anchor (never the pinned Yosemite
+ * Southside Drive extract {@code RoadGenerationTest} covers), so there is no ambiguity between this
+ * test's own road and the bundled one at the same column.
  */
 class RoadSurfaceMaterialGenerationTest {
     @AfterEach
@@ -52,6 +59,7 @@ class RoadSurfaceMaterialGenerationTest {
         RoadNetwork.setTileSourceForTests(null);
     }
 
+    /** A real generator over a fully synthetic, network-disabled DEM -- {@code seedElevation} must be called before any height/generate call reaches {@code tiles}. */
     private static EarthGenerator bootAndBuildGenerator(Path demCache) throws Exception {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
@@ -70,10 +78,47 @@ class RoadSurfaceMaterialGenerationTest {
                         biome, RegistrationInfo.BUILT_IN);
             }
         }
+        // Invalid, never-dialed URI + allowNetwork=false: exactly LevelRoadPreviewOfflineTest's own
+        // offline DEM pattern. Any cell not pre-seeded on disk would throw/fail closed, never fetch.
         TerrariumTileSource tiles = new TerrariumTileSource(
-                TerrariumTileSource.AWS_TERRAIN_TILES, demCache.resolve(TerrariumTileSource.DATASET_ID), true, 512, 6, Duration.ofSeconds(20));
-        EarthSettings settings = EarthSettings.at(EarthSettings.DEFAULT_LATITUDE, EarthSettings.DEFAULT_LONGITUDE);
+                URI.create("https://example.invalid/"), demCache, false, 128, 2, Duration.ofSeconds(1));
+        EarthSettings settings = EarthSettings.at(0, 0);
         return new EarthGenerator(4747L, biomes, settings, tiles, null, null, null);
+    }
+
+    /**
+     * Writes a synthetic Terrarium-encoded elevation tile set covering a small area around
+     * {@code (anchorX, anchorZ)} (block coordinates), with a fully deterministic, known elevation at
+     * every point: {@code base + slopeXPerBlock*(worldX-anchorX) + slopeZPerBlock*(worldZ-anchorZ)}.
+     * Same pixel encoding and tile layout {@code LevelRoadPreviewOfflineTest} already uses (AWS
+     * Terrarium: {@code round((32768+elevation)*256)} packed into the RGB channels as one 24-bit
+     * integer) -- this is the exact on-disk cache format {@link TerrariumTileSource} reads, so no
+     * code under test needs to know this data is synthetic.
+     */
+    private static void seedElevation(Path demCacheRoot, MercatorGrid grid, int anchorX, int anchorZ,
+            double base, double slopeXPerBlock, double slopeZPerBlock) throws Exception {
+        for (int zoom = 9; zoom <= TerrariumTileSource.MAX_ZOOM; zoom++) {
+            double pixels = 256.0 * (1 << zoom);
+            int tx = (int) (grid.pixelX(anchorX, zoom) / 256);
+            int tz = (int) (grid.pixelY(anchorZ, zoom) / 256);
+            for (int i = tx - 2; i <= tx + 2; i++) {
+                for (int j = tz - 2; j <= tz + 2; j++) {
+                    var image = new BufferedImage(256, 256, BufferedImage.TYPE_INT_RGB);
+                    for (int px = 0; px < 256; px++) {
+                        for (int pz = 0; pz < 256; pz++) {
+                            double worldX = ((i * 256 + px + .5) / pixels - .5) * grid.worldWidthBlocks();
+                            double worldZ = ((j * 256 + pz + .5) / pixels - .5) * grid.worldWidthBlocks();
+                            double elevation = Math.clamp(
+                                    base + slopeXPerBlock * (worldX - anchorX) + slopeZPerBlock * (worldZ - anchorZ), 80, 360);
+                            image.setRGB(px, pz, (int) Math.round((32768 + elevation) * 256));
+                        }
+                    }
+                    Path tile = demCacheRoot.resolve(zoom + "/" + i + "/" + j + ".png");
+                    Files.createDirectories(tile.getParent());
+                    assertTrue(ImageIO.write(image, "png", tile.toFile()));
+                }
+            }
+        }
     }
 
     /** Writes a single-way, network-never-needed tile cache entry for every cell the way's bounding box (plus margin) touches, exactly like a real fetched/pinned region. */
@@ -113,39 +158,42 @@ class RoadSurfaceMaterialGenerationTest {
 
     @Test
     void explicitGravelSurfaceGeneratesRealGravelNotBlackstone(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        GeoPoint a = new GeoPoint(39.1000, -120.0400), b = new GeoPoint(39.1002, -120.0398);
+        int anchorX = 200_000, anchorZ = 100;
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        seedElevation(demCache, generator.grid(), anchorX, anchorZ, 200, 0, 0); // flat: no partial layering here
+        GeoPoint a = generator.grid().geographic(anchorX, anchorZ), b = generator.grid().geographic(anchorX + 2, anchorZ + 2);
         writeTileCacheWay(roadCache, 900001L, "secondary", "gravel", a, b);
         RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
-        EarthGenerator generator = bootAndBuildGenerator(demCache);
-        int[] block = generator.block(a.latitude(), a.longitude());
-        assertTrue(RoadNetwork.coversColumn(generator.grid(), block[0], block[1]), "Sanity: fixture way must actually cover its own first endpoint's column");
-        BlockState state = topBlockAt(generator, block[0], block[1]);
+        assertTrue(RoadNetwork.coversColumn(generator.grid(), anchorX, anchorZ), "Sanity: fixture way must actually cover its own first endpoint's column");
+        BlockState state = topBlockAt(generator, anchorX, anchorZ);
         assertTrue(state.is(Blocks.GRAVEL) || state.is(LayeredSlopesCompat.LAYERED_GRAVEL.get()),
                 "Expected a real generated column on an explicit surface=gravel way to be gravel (full or layered), got " + state);
     }
 
     @Test
     void explicitDirtSurfaceGeneratesRealDirtReusingLayeredSlopesOwnBlock(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        GeoPoint a = new GeoPoint(39.2000, -120.1400), b = new GeoPoint(39.2002, -120.1398);
+        int anchorX = 210_000, anchorZ = 100;
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        seedElevation(demCache, generator.grid(), anchorX, anchorZ, 200, 0, 0);
+        GeoPoint a = generator.grid().geographic(anchorX, anchorZ), b = generator.grid().geographic(anchorX + 2, anchorZ + 2);
         writeTileCacheWay(roadCache, 900002L, "secondary", "dirt", a, b);
         RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
-        EarthGenerator generator = bootAndBuildGenerator(demCache);
-        int[] block = generator.block(a.latitude(), a.longitude());
-        assertTrue(RoadNetwork.coversColumn(generator.grid(), block[0], block[1]), "Sanity: fixture way must actually cover its own first endpoint's column");
-        BlockState state = topBlockAt(generator, block[0], block[1]);
+        assertTrue(RoadNetwork.coversColumn(generator.grid(), anchorX, anchorZ), "Sanity: fixture way must actually cover its own first endpoint's column");
+        BlockState state = topBlockAt(generator, anchorX, anchorZ);
         assertTrue(state.is(Blocks.DIRT) || state.is(LayeredSlopesCompat.layeredDirtFromLayeredSlopes()),
                 "Expected a real generated column on an explicit surface=dirt way to be dirt (full or layered, reusing Layered Slopes' own block), got " + state);
     }
 
     @Test
     void explicitSandSurfaceGeneratesRealSandReusingLayeredSlopesOwnBlock(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        GeoPoint a = new GeoPoint(39.3000, -120.2400), b = new GeoPoint(39.3002, -120.2398);
+        int anchorX = 220_000, anchorZ = 100;
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        seedElevation(demCache, generator.grid(), anchorX, anchorZ, 200, 0, 0);
+        GeoPoint a = generator.grid().geographic(anchorX, anchorZ), b = generator.grid().geographic(anchorX + 2, anchorZ + 2);
         writeTileCacheWay(roadCache, 900003L, "secondary", "sand", a, b);
         RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
-        EarthGenerator generator = bootAndBuildGenerator(demCache);
-        int[] block = generator.block(a.latitude(), a.longitude());
-        assertTrue(RoadNetwork.coversColumn(generator.grid(), block[0], block[1]), "Sanity: fixture way must actually cover its own first endpoint's column");
-        BlockState state = topBlockAt(generator, block[0], block[1]);
+        assertTrue(RoadNetwork.coversColumn(generator.grid(), anchorX, anchorZ), "Sanity: fixture way must actually cover its own first endpoint's column");
+        BlockState state = topBlockAt(generator, anchorX, anchorZ);
         assertTrue(state.is(Blocks.SAND) || state.is(LayeredSlopesCompat.layeredSandFromLayeredSlopes()),
                 "Expected a real generated column on an explicit surface=sand way to be sand (full or layered, reusing Layered Slopes' own block), got " + state);
     }
@@ -159,68 +207,54 @@ class RoadSurfaceMaterialGenerationTest {
     @Test
     void legacyTileCacheWithNoSurfaceFieldReopensAsPlainBlackstoneThroughTheRealGenerator(
             @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        GeoPoint a = new GeoPoint(39.4000, -120.3400), b = new GeoPoint(39.4002, -120.3398);
+        int anchorX = 230_000, anchorZ = 100;
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        seedElevation(demCache, generator.grid(), anchorX, anchorZ, 200, 0, 0);
+        var grid = generator.grid();
+        GeoPoint a = grid.geographic(anchorX, anchorZ), b = grid.geographic(anchorX + 2, anchorZ + 2);
         writeTileCacheWay(roadCache, 900004L, "secondary", null, a, b);
         RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
-        EarthGenerator generator = bootAndBuildGenerator(demCache);
-        var grid = generator.grid();
-        int[] block = generator.block(a.latitude(), a.longitude());
-        int x = block[0], z = block[1];
-        RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, x, z);
+        RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, anchorX, anchorZ);
         assertTrue(segment != null, "Sanity: fixture way must actually cover its own first endpoint's column");
         // The endpoint itself is the centerline (SECONDARY has a centerline stripe) -- walk off it
         // to a genuine PAVED-zone column, exactly where today's existing plain blackstone applies.
         int dz = 0;
-        while (segment.crossSectionAt(grid, x, z + dz) != RoadSegment.CrossSection.PAVED && dz < 40) dz++;
+        while (segment.crossSectionAt(grid, anchorX, anchorZ + dz) != RoadSegment.CrossSection.PAVED && dz < 40) dz++;
         assertTrue(dz < 40, "Expected to actually reach a PAVED column by geometry, off the centerline stripe");
-        BlockState state = topBlockAt(generator, x, z + dz);
+        BlockState state = topBlockAt(generator, anchorX, anchorZ + dz);
         assertTrue(state.is(Blocks.POLISHED_BLACKSTONE) || state.is(LayeredSlopesCompat.LAYERED_POLISHED_BLACKSTONE.get()),
                 "Expected a legacy (no surface tag) cached way's PAVED zone to still reopen as today's existing plain blackstone, got " + state);
     }
 
     /**
      * "Actual generated material ... in-place geometry" for a PARTIAL layer count, not just a full
-     * block: scans a real, never-bundled stretch of real DEM for a genuine adjacent-column
-     * elevation step (same technique {@code RoadGenerationTest}'s own class doc describes using for
-     * its pinned fixture), then writes the fixture way across exactly that stretch with an explicit
-     * {@code surface=dirt} tag and confirms at least one covered column actually generates the
-     * PARTIAL layered dirt block (layers below {@link LayerMath#MAX_LAYERS}), not just a full block.
+     * block: seeds a deterministic, known elevation GRADE along the road (unlike the other tests'
+     * flat fixture) so a genuine adjacent-column elevation step is guaranteed by construction, then
+     * confirms at least one covered column actually generates the PARTIAL layered dirt block
+     * (layers below {@link LayerMath#MAX_LAYERS}), not just a full block.
      */
     @Test
     void explicitDirtSurfaceGeneratesAPartialLayeredBlockAtARealElevationStep(
             @TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        EarthGenerator probe = bootAndBuildGenerator(demCache);
-        var grid = probe.grid();
-        int[] origin = probe.block(39.5000, -120.4400); // never-bundled, real high-Sierra terrain
-        int scanLength = 80;
-        int stepDx = -1, bestGapAbs = 0;
-        int previousGround = probe.surfaceY(origin[0], origin[1]);
-        for (int dx = 1; dx <= scanLength; dx++) {
-            int ground = probe.surfaceY(origin[0] + dx, origin[1]);
-            int gap = Math.abs(ground - previousGround);
-            if (gap > bestGapAbs) {
-                bestGapAbs = gap;
-                stepDx = dx;
-            }
-            previousGround = ground;
-        }
-        assertTrue(stepDx > 0 && bestGapAbs > 0,
-                "Expected to find at least one real adjacent-column elevation step scanning 80 real columns; "
-                        + "if the real DEM at this location changed, re-pick a location rather than adjusting this test to fit");
-
-        GeoPoint start = grid.geographic(origin[0], origin[1]);
-        GeoPoint end = grid.geographic(origin[0] + scanLength, origin[1]);
+        int anchorX = 240_000, anchorZ = 100;
+        int scanLength = 40;
+        EarthGenerator generator = bootAndBuildGenerator(demCache);
+        var grid = generator.grid();
+        // .6 blocks of rise per block of run: guarantees a same-or-adjacent-column integer-height
+        // step (not a smooth ramp this heuristic's own fractional-layer decay would fully absorb)
+        // along the whole stretch, by construction -- no DEM-change risk like a real-world scan.
+        seedElevation(demCache, grid, anchorX, anchorZ, 200, 0.6, 0);
+        GeoPoint start = grid.geographic(anchorX, anchorZ), end = grid.geographic(anchorX + scanLength, anchorZ);
         writeTileCacheWay(roadCache, 900005L, "secondary", "dirt", start, end);
         RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
-        EarthGenerator generator = bootAndBuildGenerator(demCache);
 
         boolean sawPartialLayeredDirt = false;
-        for (int dx = Math.max(0, stepDx - 1); dx <= Math.min(scanLength, stepDx + 1); dx++) {
-            int x = origin[0] + dx, z = origin[1];
-            if (!RoadNetwork.coversColumn(generator.grid(), x, z)) continue;
+        for (int dx = 0; dx <= scanLength; dx++) {
+            int x = anchorX + dx, z = anchorZ;
+            if (!RoadNetwork.coversColumn(grid, x, z)) continue;
             BlockState state = topBlockAt(generator, x, z);
             if (state.is(LayeredSlopesCompat.layeredDirtFromLayeredSlopes())) {
-                int layers = state.getValue(io.github.brooswitminecraft.layeredslopes.LayeredBlock.LAYERS);
+                int layers = state.getValue(LayeredBlock.LAYERS);
                 if (layers < LayerMath.MAX_LAYERS) {
                     sawPartialLayeredDirt = true;
                     break;
@@ -228,8 +262,8 @@ class RoadSurfaceMaterialGenerationTest {
             }
         }
         assertTrue(sawPartialLayeredDirt,
-                "Expected at least one column near the real elevation step (dx=" + stepDx + ", gap=" + bestGapAbs
-                        + ") to generate a PARTIAL layered dirt block through the real generator/mixin path");
+                "Expected at least one column along the seeded elevation grade to generate a PARTIAL layered dirt block "
+                        + "through the real generator/mixin path");
     }
 
     /**
@@ -241,21 +275,21 @@ class RoadSurfaceMaterialGenerationTest {
      */
     @Test
     void explicitSurfaceTagNeverChangesGeometryThroughTheRealGenerator(@TempDir Path demCache, @TempDir Path roadCache) throws Exception {
-        GeoPoint a = new GeoPoint(39.6000, -120.5400), b = new GeoPoint(39.6002, -120.5398);
-        writeTileCacheWay(roadCache, 900006L, "secondary", "gravel", a, b);
-        RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
+        int anchorX = 250_000, anchorZ = 100;
         EarthGenerator generator = bootAndBuildGenerator(demCache);
         var grid = generator.grid();
-        int[] block = generator.block(a.latitude(), a.longitude());
-        int x = block[0], z = block[1];
-        RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, x, z);
+        seedElevation(demCache, grid, anchorX, anchorZ, 200, 0, 0);
+        GeoPoint a = grid.geographic(anchorX, anchorZ), b = grid.geographic(anchorX + 2, anchorZ + 2);
+        writeTileCacheWay(roadCache, 900006L, "secondary", "gravel", a, b);
+        RoadNetwork.setTileSourceForTests(offlineTileSource(roadCache));
+        RoadSegment segment = RoadNetwork.segmentCoveringColumn(grid, anchorX, anchorZ);
         assertEquals(RoadClass.SECONDARY.defaultPavedHalfWidthBlocks, segment.pavedHalfWidthBlocks(),
                 "Expected an explicit surface tag to leave the class's existing default paved half-width unchanged");
 
         int dz = 0;
-        while (segment.crossSectionAt(grid, x, z + dz) != RoadSegment.CrossSection.SHOULDER && dz < 40) dz++;
+        while (segment.crossSectionAt(grid, anchorX, anchorZ + dz) != RoadSegment.CrossSection.SHOULDER && dz < 40) dz++;
         assertTrue(dz < 40, "Expected to actually reach a SHOULDER column by geometry, same as the pre-existing (paved) cross-section shape");
-        BlockState shoulderState = topBlockAt(generator, x, z + dz);
+        BlockState shoulderState = topBlockAt(generator, anchorX, anchorZ + dz);
         assertTrue(shoulderState.is(Blocks.GRAVEL) || shoulderState.is(LayeredSlopesCompat.LAYERED_GRAVEL.get()),
                 "Expected the shoulder zone to still generate gravel regardless of this way's own gravel surface tag, got " + shoulderState);
     }
